@@ -16,6 +16,7 @@ import type { Construct } from 'constructs';
 import { config, egressConnectorArn, executionRoleArn, imageArn, ingressConnectorArn } from './config';
 
 const microvmSourceArn = `arn:aws:lambda:${config.microvmRegion}:${config.account}:microvm-image:*` as const;
+const microvmInstanceArn = `arn:aws:lambda:${config.microvmRegion}:${config.account}:microvm:*` as const;
 
 function hardenMicrovmRoleTrust(role: iam.Role): void {
   const cfnRole = role.node.defaultChild as iam.CfnRole;
@@ -185,6 +186,15 @@ export class OmpCloudIdeEdgeStack extends cdk.Stack {
         // CreateMicrovmAuthToken authorizes against the source image ARN,
         // even though the API input is a running MicroVM identifier.
         resources: [imageArn],
+      }),
+    );
+    edgeRole.addToPolicy(
+      new iam.PolicyStatement({
+        actions: ['lambda:GetMicrovm', 'lambda:SuspendMicrovm', 'lambda:ResumeMicrovm'],
+        // Current MicroVM lifecycle authorization can evaluate the source
+        // image while running and the instance ARN while suspended. Keep both
+        // scopes account-local instead of granting these actions on "*".
+        resources: [imageArn, microvmInstanceArn],
       }),
     );
     edgeRole.addToPolicy(

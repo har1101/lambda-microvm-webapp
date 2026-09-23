@@ -7,6 +7,7 @@ ARG GH_VERSION=2.96.0
 ARG AWS_CLI_VERSION=2.34.45
 ARG NODE_VERSION=24.21.0
 ARG UV_VERSION=0.12.18
+ARG RIPGREP_VERSION=15.2.0
 
 RUN dnf install -y \
       shadow-utils \
@@ -23,6 +24,13 @@ RUN dnf install -y \
       python3 python3-pip \
     && dnf clean all \
     && rm -rf /var/cache/dnf
+
+RUN curl -fsSL "https://github.com/BurntSushi/ripgrep/releases/download/${RIPGREP_VERSION}/ripgrep-${RIPGREP_VERSION}-aarch64-unknown-linux-musl.tar.gz" \
+      -o /tmp/ripgrep.tar.gz \
+    && echo "800b1e7206afe799dfb5a6901f23147cfaabe0e52210538100f61e86e1740915  /tmp/ripgrep.tar.gz" | sha256sum -c - \
+    && tar -xzf /tmp/ripgrep.tar.gz -C /tmp \
+    && install -m 0755 "/tmp/ripgrep-${RIPGREP_VERSION}-aarch64-unknown-linux-musl/rg" /usr/local/bin/rg \
+    && rm -rf /tmp/ripgrep.tar.gz "/tmp/ripgrep-${RIPGREP_VERSION}-aarch64-unknown-linux-musl"
 
 RUN curl -fsSL "https://github.com/coder/code-server/releases/download/v${CODE_SERVER_VERSION}/code-server-${CODE_SERVER_VERSION}-arm64.rpm" \
       -o /tmp/code-server.rpm \
@@ -92,6 +100,7 @@ RUN mkdir -p \
 
 COPY settings.json ${USER_DATA_DIR}/User/settings.json
 COPY omp-config.yml ${PI_CODING_AGENT_DIR}/config.yml
+COPY omp-cloud-ide-controls ${EXTENSIONS_DIR}/har1101.omp-cloud-ide-controls-0.1.0
 COPY lifecycle.py /opt/cloud-ide/lifecycle.py
 COPY start-cloud-ide.sh /usr/local/bin/start-cloud-ide
 COPY persist-auth-state /usr/local/bin/persist-auth-state

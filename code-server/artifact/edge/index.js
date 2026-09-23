@@ -1,9 +1,12 @@
 const cfg = require('./config.json');
 
 const {
-  LambdaMicrovmsClient,
-  RunMicrovmCommand,
   CreateMicrovmAuthTokenCommand,
+  GetMicrovmCommand,
+  LambdaMicrovmsClient,
+  ResumeMicrovmCommand,
+  RunMicrovmCommand,
+  SuspendMicrovmCommand,
 } = require('@aws-sdk/client-lambda-microvms');
 const { DynamoDBClient, GetItemCommand, PutItemCommand, UpdateItemCommand } = require('@aws-sdk/client-dynamodb');
 const { GetSecretValueCommand, SecretsManagerClient } = require('@aws-sdk/client-secrets-manager');
@@ -31,12 +34,18 @@ exports.handler = async (event) => {
 
   const cookies = parseCookies(request.headers.cookie);
   const sessionId = cookies['mvm-session'];
+  const isControlRoute = request.uri === '/session/control';
+  const isSuspendRoute = request.uri === '/session/suspend';
+  const isResumeRoute = request.uri === '/session/resume';
 
   if (request.uri === '/session/start') {
     return startSession();
   }
 
   if (!sessionId) {
+    if (isControlRoute || isSuspendRoute || isResumeRoute) {
+      return sessionControlResponse({ hasSession: false });
+    }
     return redirectToStart();
   }
 
@@ -44,10 +53,28 @@ exports.handler = async (event) => {
     new GetItemCommand({
       TableName: cfg.TABLE,
       Key: { sessionId: { S: sessionId } },
+      ConsistentRead: true,
     }),
   );
   if (!result.Item) {
+    if (isControlRoute || isSuspendRoute || isResumeRoute) {
+      return sessionControlResponse({ hasSession: false, clearSessionCookie: true });
+    }
     return redirectToStart(true);
+  }
+
+  const paused = result.Item.paused?.BOOL === true;
+  if (isControlRoute) {
+    return sessionControlResponse({ hasSession: true, paused });
+  }
+  if (isSuspendRoute) {
+    return suspendSession(request, sessionId, result.Item);
+  }
+  if (isResumeRoute) {
+    return resumeSession(request, sessionId, result.Item);
+  }
+  if (paused) {
+    return pausedSessionResponse(request.headers);
   }
 
   let token = result.Item.token.S;
@@ -135,6 +162,7 @@ async function startSession() {
         endpoint: { S: run.endpoint },
         token: { S: token },
         tokenExpiry: { N: String(now + cfg.TOKEN_DURATION_MIN * 60000) },
+        paused: { BOOL: false },
         ttl: { N: String(ttl) },
       },
     }),
@@ -156,6 +184,7 @@ async function startSession() {
     body: [
       "<!DOCTYPE html><html><head><meta charset='utf-8'>",
       '<meta name="viewport" content="width=device-width,initial-scale=1">',
+      '<meta http-equiv="refresh" content="8;url=/">',
       '<title>Starting OMP Cloud IDE...</title>',
       '<style>body{font-family:system-ui;display:flex;flex-direction:column;justify-content:center;',
       'align-items:center;height:100vh;margin:0;background:#1e1e1e;color:#ccc}',
@@ -165,10 +194,81 @@ async function startSession() {
       "<body><div class='spinner'></div>",
       '<p>Starting your OMP Cloud IDE...</p>',
       "<p style='font-size:0.8em;color:#888'>Usually ready in 5–15 seconds</p>",
-      "<script>setTimeout(()=>location.href='/',8000)</script>",
       '</body></html>',
     ].join(''),
   };
+}
+
+async function suspendSession(request, sessionId, item) {
+  if (request.method !== 'POST') {
+    return postOnlyResponse();
+  }
+
+  await setSessionPaused(sessionId, true);
+  try {
+    const state = await getMicrovmState(item.microvmId.S);
+    if (state === 'TERMINATED' || state === 'TERMINATING') {
+      await setSessionPaused(sessionId, false);
+      return sessionControlResponse({ hasSession: false, clearSessionCookie: true });
+    }
+    if (state !== 'SUSPENDED' && state !== 'SUSPENDING') {
+      await mvm.send(new SuspendMicrovmCommand({ microvmIdentifier: item.microvmId.S }));
+    }
+    return sessionControlResponse({
+      hasSession: true,
+      paused: true,
+      message: 'Suspend requested. Editor traffic is now blocked until you explicitly resume.',
+    });
+  } catch (error) {
+    await setSessionPaused(sessionId, false);
+    console.error('MicroVM suspend failed', error?.name);
+    return sessionOperationErrorResponse('Could not suspend the Cloud IDE. Please retry.');
+  }
+}
+
+async function resumeSession(request, sessionId, item) {
+  if (request.method !== 'POST') {
+    return postOnlyResponse();
+  }
+
+  try {
+    const state = await getMicrovmState(item.microvmId.S);
+    if (state === 'TERMINATED' || state === 'TERMINATING') {
+      await setSessionPaused(sessionId, false);
+      return sessionControlResponse({ hasSession: false, clearSessionCookie: true });
+    }
+    if (state === 'SUSPENDING') {
+      return sessionControlResponse({
+        hasSession: true,
+        paused: true,
+        message: 'The Cloud IDE is still suspending. Wait a few seconds, then resume again.',
+      });
+    }
+    if (state === 'SUSPENDED') {
+      await mvm.send(new ResumeMicrovmCommand({ microvmIdentifier: item.microvmId.S }));
+    }
+    await setSessionPaused(sessionId, false);
+    return resumingPageResponse();
+  } catch (error) {
+    console.error('MicroVM resume failed', error?.name);
+    return sessionOperationErrorResponse('Could not resume the Cloud IDE. Please retry.');
+  }
+}
+
+async function getMicrovmState(microvmId) {
+  const result = await mvm.send(new GetMicrovmCommand({ microvmIdentifier: microvmId }));
+  return result.state;
+}
+
+async function setSessionPaused(sessionId, paused) {
+  await ddb.send(
+    new UpdateItemCommand({
+      TableName: cfg.TABLE,
+      Key: { sessionId: { S: sessionId } },
+      UpdateExpression: 'SET paused = :paused',
+      ExpressionAttributeValues: { ':paused': { BOOL: paused } },
+    }),
+  );
 }
 
 async function isAuthorized(headers) {
@@ -351,6 +451,135 @@ function loginPageResponse(errorMessage = '', status = '200') {
   };
 }
 
+function sessionControlResponse({
+  hasSession,
+  paused = false,
+  message = '',
+  error = false,
+  clearSessionCookie = false,
+}) {
+  let controls;
+  if (!hasSession) {
+    controls = [
+      '<p class="hint">No active Cloud IDE session is associated with this browser.</p>',
+      '<a class="button primary" href="/">Start editor</a>',
+    ].join('');
+  } else if (paused) {
+    controls = [
+      `<p class="status paused">${escapeHtml(message || 'The Cloud IDE is paused.')}</p>`,
+      '<form method="post" action="/session/resume">',
+      '<button class="primary" type="submit">Resume editor</button></form>',
+    ].join('');
+  } else {
+    controls = [
+      `<p class="status ${error ? 'error' : 'running'}">${escapeHtml(message || 'The Cloud IDE is running.')}</p>`,
+      '<p class="hint">Suspending blocks editor reconnects and stops MicroVM compute charges after the snapshot completes.</p>',
+      '<form method="post" action="/session/suspend">',
+      '<button class="danger" type="submit">Suspend Cloud IDE</button></form>',
+      '<a class="button secondary" href="/">Back to editor</a>',
+    ].join('');
+  }
+
+  const headers = {
+    'cache-control': [{ key: 'Cache-Control', value: 'no-store' }],
+    'content-type': [{ key: 'Content-Type', value: 'text/html; charset=utf-8' }],
+    'x-content-type-options': [{ key: 'X-Content-Type-Options', value: 'nosniff' }],
+    'content-security-policy': [
+      {
+        key: 'Content-Security-Policy',
+        value:
+          "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'self'",
+      },
+    ],
+  };
+  if (clearSessionCookie) {
+    headers['set-cookie'] = [{ key: 'Set-Cookie', value: expiredSessionCookie() }];
+  }
+
+  return {
+    status: '200',
+    statusDescription: 'OK',
+    headers,
+    body: [
+      '<!doctype html><html lang="ja"><head><meta charset="utf-8">',
+      '<meta name="viewport" content="width=device-width,initial-scale=1">',
+      '<title>OMP Cloud IDE Control</title>',
+      '<style>html{color-scheme:dark}body{font-family:system-ui,sans-serif;background:#111827;color:#e5e7eb;',
+      'min-height:100vh;margin:0;display:grid;place-items:center}.card{width:min(28rem,calc(100% - 2rem));',
+      'background:#1f2937;border:1px solid #374151;border-radius:12px;padding:2rem;box-shadow:0 20px 40px #0006}',
+      'h1{font-size:1.35rem;margin:0 0 .75rem}.hint{color:#9ca3af;line-height:1.5}.status{font-weight:600}',
+      '.running{color:#86efac}.paused{color:#fde68a}.error{color:#fca5a5}form{margin-top:1.25rem}button,.button{box-sizing:border-box;',
+      'display:block;width:100%;padding:.75rem;border:0;border-radius:6px;color:#fff;font-weight:600;cursor:pointer;',
+      'text-align:center;text-decoration:none}.primary{background:#2563eb}.danger{background:#b91c1c}.secondary{background:#374151;',
+      'margin-top:.75rem}</style></head><body><main class="card"><h1>OMP Cloud IDE Control</h1>',
+      controls,
+      '</main></body></html>',
+    ].join(''),
+  };
+}
+
+function pausedSessionResponse(headers) {
+  if (isHtmlNavigation(headers)) {
+    return redirectToControl();
+  }
+  return {
+    status: '409',
+    statusDescription: 'Conflict',
+    headers: {
+      'cache-control': [{ key: 'Cache-Control', value: 'no-store' }],
+      'content-type': [{ key: 'Content-Type', value: 'text/plain; charset=utf-8' }],
+      'retry-after': [{ key: 'Retry-After', value: '5' }],
+    },
+    body: 'Cloud IDE is paused. Open /session/control to resume.',
+  };
+}
+
+function resumingPageResponse() {
+  return {
+    status: '200',
+    statusDescription: 'OK',
+    headers: {
+      'cache-control': [{ key: 'Cache-Control', value: 'no-store' }],
+      'content-type': [{ key: 'Content-Type', value: 'text/html; charset=utf-8' }],
+      'content-security-policy': [
+        {
+          key: 'Content-Security-Policy',
+          value: "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'",
+        },
+      ],
+    },
+    body: [
+      '<!doctype html><html lang="ja"><head><meta charset="utf-8">',
+      '<meta name="viewport" content="width=device-width,initial-scale=1">',
+      '<meta http-equiv="refresh" content="5;url=/">',
+      '<title>Resuming OMP Cloud IDE...</title>',
+      '<style>html{color-scheme:dark}body{font-family:system-ui,sans-serif;background:#111827;color:#e5e7eb;',
+      'min-height:100vh;margin:0;display:grid;place-items:center}</style></head>',
+      '<body><p>Resuming the Cloud IDE. The editor will open shortly...</p></body></html>',
+    ].join(''),
+  };
+}
+
+function sessionOperationErrorResponse(message) {
+  const response = sessionControlResponse({ hasSession: true, paused: false, message, error: true });
+  response.status = '502';
+  response.statusDescription = 'Bad Gateway';
+  return response;
+}
+
+function postOnlyResponse() {
+  return {
+    status: '405',
+    statusDescription: 'Method Not Allowed',
+    headers: {
+      allow: [{ key: 'Allow', value: 'POST' }],
+      'cache-control': [{ key: 'Cache-Control', value: 'no-store' }],
+      'content-type': [{ key: 'Content-Type', value: 'text/plain; charset=utf-8' }],
+    },
+    body: 'Method not allowed',
+  };
+}
+
 function methodNotAllowedResponse() {
   return {
     status: '405',
@@ -375,6 +604,21 @@ function redirectToLogin() {
   };
 }
 
+function redirectToControl() {
+  return {
+    status: '302',
+    statusDescription: 'Found',
+    headers: {
+      location: [{ key: 'Location', value: '/session/control' }],
+      'cache-control': [{ key: 'Cache-Control', value: 'no-store' }],
+    },
+  };
+}
+
+function isHtmlNavigation(headers) {
+  return (headers.accept || []).some((header) => header.value.includes('text/html'));
+}
+
 function escapeHtml(value) {
   return String(value)
     .replaceAll('&', '&amp;')
@@ -393,11 +637,15 @@ function redirectToStart(clearCookie = false) {
     headers['set-cookie'] = [
       {
         key: 'Set-Cookie',
-        value: 'mvm-session=; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=0',
+        value: expiredSessionCookie(),
       },
     ];
   }
   return { status: '302', headers };
+}
+
+function expiredSessionCookie() {
+  return 'mvm-session=; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=0';
 }
 
 function parseCookies(cookieHeader) {
@@ -416,7 +664,11 @@ exports.__test = {
   escapeHtml,
   isAccessCookieValidForPassword,
   loginPageResponse,
+  pausedSessionResponse,
   parseCookies,
   parseLoginForm,
+  postOnlyResponse,
+  resumingPageResponse,
+  sessionControlResponse,
   signAccessCookie,
 };

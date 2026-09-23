@@ -1,0 +1,36 @@
+{
+  "name": "omp-cloud-ide-controls",
+  "displayName": "OMP Cloud IDE Controls",
+  "description": "Adds a status-bar shortcut to suspend or resume the personal OMP Cloud IDE.",
+  "version": "0.1.0",
+  "publisher": "har1101",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished",
+    "onCommand:ompCloudIde.openControl"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "ompCloudIde.openControl",
+        "title": "Open Suspend / Resume Controls"
+      }
+    ],
+    "configuration": {
+      "title": "OMP Cloud IDE",
+      "properties": {
+        "ompCloudIde.controlUrl": {
+          "type": "string",
+          "default": "https://dmwv39galzn4v.cloudfront.net/session/control",
+          "description": "HTTPS URL embedded in the Cloud IDE suspend/resume control tab."
+        }
+      }
+    }
+  }
+}

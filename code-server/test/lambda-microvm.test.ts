@@ -19,6 +19,27 @@ type EdgeTestHelpers = {
     username: string;
     password: string;
   } | null;
+  pausedSessionResponse: (headers: Record<string, Array<{ key: string; value: string }>>) => {
+    status: string;
+    headers: Record<string, Array<{ key: string; value: string }>>;
+    body?: string;
+  };
+  postOnlyResponse: () => {
+    status: string;
+    headers: Record<string, Array<{ key: string; value: string }>>;
+  };
+  resumingPageResponse: () => { status: string; body: string };
+  sessionControlResponse: (options: {
+    hasSession: boolean;
+    paused?: boolean;
+    message?: string;
+    error?: boolean;
+    clearSessionCookie?: boolean;
+  }) => {
+    status: string;
+    headers: Record<string, Array<{ key: string; value: string }>>;
+    body: string;
+  };
   signAccessCookie: (payload: string, password: string) => string;
 };
 
@@ -127,6 +148,14 @@ describe('OMP Cloud IDE infrastructure', () => {
             Resource: 'arn:aws:lambda:ap-northeast-1:123456789012:microvm-image:omp-cloud-ide',
           }),
           Match.objectLike({
+            Action: Match.arrayWith(['lambda:GetMicrovm', 'lambda:SuspendMicrovm', 'lambda:ResumeMicrovm']),
+            Effect: 'Allow',
+            Resource: [
+              'arn:aws:lambda:ap-northeast-1:123456789012:microvm-image:omp-cloud-ide',
+              'arn:aws:lambda:ap-northeast-1:123456789012:microvm:*',
+            ],
+          }),
+          Match.objectLike({
             Action: 'iam:PassRole',
             Effect: 'Allow',
             Resource: 'arn:aws:iam::123456789012:role/omp-cloud-ide-microvm-execution',
@@ -192,17 +221,81 @@ describe('OMP Cloud IDE infrastructure', () => {
     expect(response.headers['www-authenticate']).toBeUndefined();
   });
 
+  test('renders explicit suspend and resume controls without starting a session', () => {
+    const helpers = getEdgeModule().__test;
+
+    const noSession = helpers.sessionControlResponse({ hasSession: false });
+    expect(noSession.body).toContain('No active Cloud IDE session');
+    expect(noSession.body).toContain('href="/">Start editor</a>');
+    expect(noSession.body).not.toContain('action="/session/suspend"');
+
+    const running = helpers.sessionControlResponse({ hasSession: true });
+    expect(running.body).toContain('method="post" action="/session/suspend"');
+    expect(running.body).toContain('Suspend Cloud IDE');
+    expect(running.headers['content-security-policy'][0].value).toContain("frame-ancestors 'self'");
+
+    const paused = helpers.sessionControlResponse({ hasSession: true, paused: true });
+    expect(paused.body).toContain('method="post" action="/session/resume"');
+    expect(paused.body).toContain('Resume editor');
+
+    const error = helpers.sessionControlResponse({ hasSession: true, error: true, message: '<failed>' });
+    expect(error.body).toContain('class="status error"');
+    expect(error.body).toContain('&lt;failed&gt;');
+  });
+
+  test('uses a CSP-compatible start-page redirect', () => {
+    const source = fs.readFileSync(path.join(__dirname, '..', 'artifact', 'edge', 'index.js'), 'utf8');
+    expect(source).toContain('<meta http-equiv="refresh" content="8;url=/">');
+    expect(source).not.toContain("<script>setTimeout(()=>location.href='/',8000)</script>");
+  });
+
+  test('blocks paused editor traffic and only permits POST lifecycle actions', () => {
+    const helpers = getEdgeModule().__test;
+    const navigation = helpers.pausedSessionResponse({ accept: [{ key: 'Accept', value: 'text/html' }] });
+    expect(navigation.status).toBe('302');
+    expect(navigation.headers.location).toEqual([{ key: 'Location', value: '/session/control' }]);
+
+    const websocket = helpers.pausedSessionResponse({});
+    expect(websocket.status).toBe('409');
+    expect(websocket.headers['retry-after']).toEqual([{ key: 'Retry-After', value: '5' }]);
+
+    const method = helpers.postOnlyResponse();
+    expect(method.status).toBe('405');
+    expect(method.headers.allow).toEqual([{ key: 'Allow', value: 'POST' }]);
+
+    expect(helpers.resumingPageResponse().body).toContain('content="5;url=/"');
+  });
+
   test('pins OMP and runs code-server as an unprivileged user', () => {
     const dockerfile = fs.readFileSync(path.join(__dirname, '..', 'artifact', 'base-image', 'Dockerfile'), 'utf8');
     const ompConfig = fs.readFileSync(path.join(__dirname, '..', 'artifact', 'base-image', 'omp-config.yml'), 'utf8');
+    const settings = fs.readFileSync(path.join(__dirname, '..', 'artifact', 'base-image', 'settings.json'), 'utf8');
+    const controlsPackage = fs.readFileSync(
+      path.join(__dirname, '..', 'artifact', 'base-image', 'omp-cloud-ide-controls', 'package.json'),
+      'utf8',
+    );
+    const controlsExtension = fs.readFileSync(
+      path.join(__dirname, '..', 'artifact', 'base-image', 'omp-cloud-ide-controls', 'extension.js'),
+      'utf8',
+    );
     expect(dockerfile).toContain('ARG OMP_VERSION=18.2.11');
     expect(dockerfile).toContain('useradd --uid 1000');
     expect(dockerfile).toContain('USER vscode');
+    expect(dockerfile).toContain('ripgrep');
+    expect(dockerfile).toContain(
+      ['COPY omp-cloud-ide-controls $', '{EXTENSIONS_DIR}/har1101.omp-cloud-ide-controls-0.1.0'].join(''),
+    );
     expect(dockerfile).not.toContain('useradd -o -u 0');
     expect(ompConfig).toContain('approvalMode: yolo');
     expect(ompConfig).toContain('continuationModes:\n    - interactive');
     expect(ompConfig).toContain('ask:\n  enabled: true');
     expect(ompConfig).toContain('- match: "rm -rf *"\n      approval: deny');
     expect(ompConfig).toContain('- match: "git push --force*"\n      approval: deny');
+    expect(settings).toContain('"ompCloudIde.controlUrl"');
+    expect(controlsPackage).toContain('"onCommand:ompCloudIde.openControl"');
+    expect(controlsExtension).toContain("status.text = '$(debug-pause) Suspend Cloud IDE'");
+    expect(controlsExtension).toContain("controlUrl?.protocol !== 'https:'");
+    expect(controlsExtension).toContain("command: 'vscode.open'");
+    expect(controlsExtension).not.toContain('vscode.env.openExternal');
   });
 });

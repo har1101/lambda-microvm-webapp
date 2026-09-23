@@ -8,6 +8,7 @@ Personal browser IDE for `har1101`. CloudFront authenticates the browser before 
 Browser
   -> CloudFront + Lambda@Edge password form (us-east-1)
      -> signed, HttpOnly access cookie
+     -> suspend/resume control page
   -> Lambda MicroVM endpoint token injection
   -> code-server :8080 (ap-northeast-1)
   -> OMP / gh / development toolchain
@@ -79,6 +80,26 @@ The normal deploy uses `--full-wait` so the MicroVM image build and CloudFront d
 Later MicroVMs restore OMP's `agent.db`, its installation ID, and GitHub CLI's OAuth credential file before code-server traffic is served.
 
 The image also installs a global OMP configuration with interactive goal continuation and the ask tool enabled. Tool approvals default to `yolo`, while `rm -rf *` and `git push --force*` are denied by `bash.patterns`. These patterns govern OMP's `bash` tool; they are approval rules rather than operating-system sandboxing.
+
+Opening `/login` only renders the access form; it does not call `RunMicrovm`. A MicroVM starts after successful login when the browser first enters `/` without an active `mvm-session` cookie.
+
+## Suspend and resume
+
+The editor status bar contains **Suspend Cloud IDE**. It opens `/session/control` through code-server's HTTPS URL opener; press **Suspend Cloud IDE** there to suspend the current browser's MicroVM. This two-step control is deliberate: the suspend API must be called outside the MicroVM, and the control plane marks the session paused before requesting the snapshot so code-server WebSocket reconnects cannot immediately wake it again.
+
+While paused, regular editor requests are blocked at Lambda@Edge. Press **Resume editor** on the control page to resume explicitly. A suspended MicroVM incurs snapshot storage and snapshot operation charges, but no compute charge. The current idle policy also automatically suspends a session after five minutes without endpoint traffic and terminates it after eight suspended hours; an open code-server tab can generate traffic, so use the explicit button when you are finished for now.
+
+## Implementation status
+
+The deployable personal-IDE path is implemented: Tokyo MicroVM image, CloudFront/Lambda@Edge access control, code-server, pinned OMP, Bun/Node/Python/uv, GitHub CLI OAuth without PAT, AWS CLI, language servers, `ripgrep`, encrypted lifecycle persistence, explicit suspend/resume, and `cdkd` deployment.
+
+The original design document is not implemented literally in these intentionally superseded areas:
+
+- The Auth Broker and its always-on EC2 host were replaced by lifecycle-hook snapshots of the single-user OMP `agent.db` in KMS-encrypted S3.
+- GitHub Enterprise support was replaced by normal `github.com` OAuth using `gh auth login --web`.
+- The workspace remains MicroVM-local and ephemeral. Clone a repository after startup; authentication state persists, repository contents do not.
+
+OMP sign-in for Anthropic and OpenAI Codex and the code-server browser flow have been exercised. OpenCode Go login/model calls and a full private-repository clone/edit/test/push/PR workflow are still manual verification items. Base-image dependency updates are pinned and deployed manually; no recurring image-update automation is configured.
 
 ## Operations
 
