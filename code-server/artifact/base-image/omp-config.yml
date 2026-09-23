@@ -1,0 +1,29 @@
+modelRoles:
+  default: openai-codex/gpt-5.6-sol:high
+  slow: anthropic/claude-opus-5-5:max
+  plan: anthropic/claude-opus-5-5:high
+  smol: opencode-go/deepseek-v4-flash:low
+  advisor: opencode-go/deepseek-v4-flash:high
+
+retry:
+  fallbackChains:
+    default:
+      - anthropic/claude-opus-5-5:high
+      - opencode-go/deepseek-v4-flash:high
+    slow:
+      - openai-codex/gpt-5.6-sol:high
+      - opencode-go/deepseek-v4-pro:high
+    plan:
+      - openai-codex/gpt-5.6-sol:high
+    smol:
+      - openai-codex/gpt-5.6-luna:medium
+    advisor:
+      - openai-codex/gpt-5.6-luna:high
+
+cycleOrder:
+  - smol
+  - default
+  - slow
+
+tools:
+  approvalMode: write

@@ -1,32 +1,36 @@
 {
-  "name": "lambda-microvm",
+  "name": "omp-cloud-ide-lambda-microvm",
   "version": "0.1.0",
   "scripts": {
     "build": "tsc",
     "watch": "tsc -w",
     "test": "jest",
     "cdk": "cdk",
-    "synth": "cdk synth",
-    "diff": "cdk diff",
-    "deploy": "cdk deploy --all",
-    "destroy": "cdk destroy --all",
-    "bootstrap": "cdk bootstrap",
+    "cdkd": "cdkd",
+    "synth": "cdkd synth",
+    "synth:cdk": "cdk synth",
+    "diff": "cdkd diff --all",
+    "deploy": "cdkd deploy --all --full-wait",
+    "deploy:dry-run": "cdkd deploy --all --dry-run",
+    "destroy": "cdkd destroy --all",
+    "bootstrap": "cdkd bootstrap --region ap-northeast-1 && cdkd bootstrap --region us-east-1",
     "lint": "biome lint .",
     "format": "biome format --write .",
     "check": "biome check --write ."
   },
   "devDependencies": {
     "@biomejs/biome": "^2.5.1",
+    "@go-to-k/cdkd": "0.291.0",
     "@types/jest": "^30",
     "@types/node": "^24.10.1",
-    "aws-cdk": "2.1128.1",
+    "aws-cdk": "2.1142.0",
+    "aws-cdk-lib": "2.270.0",
     "jest": "^30",
     "ts-jest": "^29",
     "ts-node": "^10.9.2",
     "typescript": "~5.9.3"
   },
   "dependencies": {
-    "aws-cdk-lib": "^2.260.0",
     "constructs": "^10.5.0"
   }
 }

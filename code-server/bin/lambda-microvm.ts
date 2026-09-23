@@ -1,12 +1,24 @@
 #!/usr/bin/env node
 import * as cdk from 'aws-cdk-lib/core';
 import { config } from '../lib/config';
-import { LambdaMicrovmStack } from '../lib/lambda-microvm-stack';
+import { OmpCloudIdeEdgeStack, OmpCloudIdeMicrovmStack } from '../lib/lambda-microvm-stack';
 
 const app = new cdk.App();
-new LambdaMicrovmStack(app, config.stackName, {
+
+const microvmStack = new OmpCloudIdeMicrovmStack(app, config.microvmStackName, {
   env: {
-    account: process.env.CDK_DEFAULT_ACCOUNT,
-    region: config.region,
+    account: config.account,
+    region: config.microvmRegion,
   },
+  description: 'Tokyo-region Lambda MicroVM image and encrypted OAuth state',
 });
+
+const edgeStack = new OmpCloudIdeEdgeStack(app, config.edgeStackName, {
+  env: {
+    account: config.account,
+    region: config.edgeRegion,
+  },
+  description: 'CloudFront, Lambda@Edge authentication, and IDE session control plane',
+});
+
+edgeStack.addStackDependency(microvmStack);

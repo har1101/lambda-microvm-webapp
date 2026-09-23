@@ -9,4 +9,7 @@ artifact/edge/config.json
 
 # CDK asset staging directory
 .cdk.staging
-cdk.out
+cdk.out*
+
+__pycache__/
+*.pyc
