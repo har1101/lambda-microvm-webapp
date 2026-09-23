@@ -182,7 +182,9 @@ export class OmpCloudIdeEdgeStack extends cdk.Stack {
     edgeRole.addToPolicy(
       new iam.PolicyStatement({
         actions: ['lambda:CreateMicrovmAuthToken'],
-        resources: [`arn:aws:lambda:${config.microvmRegion}:${config.account}:microvm:*`],
+        // CreateMicrovmAuthToken authorizes against the source image ARN,
+        // even though the API input is a running MicroVM identifier.
+        resources: [imageArn],
       }),
     );
     edgeRole.addToPolicy(
@@ -195,7 +197,6 @@ export class OmpCloudIdeEdgeStack extends cdk.Stack {
       new iam.PolicyStatement({
         actions: ['iam:PassRole'],
         resources: [executionRoleArn],
-        conditions: { StringEquals: { 'iam:PassedToService': 'lambda.amazonaws.com' } },
       }),
     );
     table.grant(edgeRole, 'dynamodb:GetItem', 'dynamodb:PutItem', 'dynamodb:UpdateItem');

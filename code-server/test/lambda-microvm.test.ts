@@ -69,7 +69,17 @@ describe('OMP Cloud IDE infrastructure', () => {
     template.hasResourceProperties('AWS::IAM::Policy', {
       PolicyDocument: Match.objectLike({
         Statement: Match.arrayWith([
-          Match.objectLike({ Action: 'iam:PassRole', Effect: 'Allow' }),
+          Match.objectLike({
+            Action: 'lambda:CreateMicrovmAuthToken',
+            Effect: 'Allow',
+            Resource: 'arn:aws:lambda:ap-northeast-1:123456789012:microvm-image:omp-cloud-ide',
+          }),
+          Match.objectLike({
+            Action: 'iam:PassRole',
+            Effect: 'Allow',
+            Resource: 'arn:aws:iam::123456789012:role/omp-cloud-ide-microvm-execution',
+            Condition: Match.absent(),
+          }),
           Match.objectLike({
             Action: Match.arrayWith(['secretsmanager:GetSecretValue']),
             Effect: 'Allow',
