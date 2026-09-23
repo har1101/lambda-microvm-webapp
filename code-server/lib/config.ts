@@ -28,6 +28,8 @@ export const config = {
     tableName: 'omp-cloud-ide-sessions',
     accessSecretName: 'omp-cloud-ide/access-password',
     basicAuthUsername: 'har1101',
+    accessCookieName: 'omp-cloud-ide-auth',
+    accessCookieMaxAgeSec: 28800,
     tokenDurationMin: 60,
     tokenRefreshThresholdMin: 15,
     maxDurationSec: 28800,

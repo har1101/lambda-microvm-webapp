@@ -6,7 +6,8 @@ Personal browser IDE for `har1101`. CloudFront authenticates the browser before 
 
 ```text
 Browser
-  -> CloudFront + Lambda@Edge Basic auth (us-east-1)
+  -> CloudFront + Lambda@Edge password form (us-east-1)
+     -> signed, HttpOnly access cookie
   -> Lambda MicroVM endpoint token injection
   -> code-server :8080 (ap-northeast-1)
   -> OMP / gh / development toolchain
@@ -52,7 +53,7 @@ The normal deploy uses `--full-wait` so the MicroVM image build and CloudFront d
 
 1. Read `DistributionUrl`, `BasicAuthUsername`, and `AccessPasswordSecretArn` from the edge stack outputs.
 2. Open the distribution URL.
-3. Enter the output username and reveal the access password manually in the AWS Secrets Manager console. Do not print it into build logs or commit it.
+3. Enter the output username and reveal the access password manually in the AWS Secrets Manager console. The form issues a signed, `HttpOnly`, `SameSite=Strict` access cookie for the MicroVM session lifetime. Do not print the password into build logs or commit it.
 4. In the code-server terminal, start OMP and log in:
 
    ```text
@@ -77,6 +78,8 @@ The normal deploy uses `--full-wait` so the MicroVM image build and CloudFront d
 
 Later MicroVMs restore OMP's `agent.db`, its installation ID, and GitHub CLI's OAuth credential file before code-server traffic is served.
 
+The image also installs a global OMP configuration with interactive goal continuation and the ask tool enabled. Tool approvals default to `yolo`, while `rm -rf *` and `git push --force*` are denied by `bash.patterns`. These patterns govern OMP's `bash` tool; they are approval rules rather than operating-system sandboxing.
+
 ## Operations
 
 Inspect cdkd state and deployment events:
@@ -92,7 +95,7 @@ The S3 bucket and KMS key use `Retain`; destroying the stacks does not delete pe
 
 ## Security notes
 
-- The browser must pass Basic auth before `RunMicrovm` is called.
+- The browser must pass the Lambda@Edge password form before `RunMicrovm` is called. Legacy HTTP Basic credentials remain accepted for non-browser smoke checks, but unauthenticated browsers are redirected to `/login` instead of relying on a native Basic-auth dialog.
 - code-server has no independent password because it is reachable only through the AWS MicroVM proxy token injected by the authenticated edge function.
 - The MicroVM execution role can access only its auth-state prefix and its log group.
 - OMP, GitHub, and access credentials are not included in the Docker image or Git repository.

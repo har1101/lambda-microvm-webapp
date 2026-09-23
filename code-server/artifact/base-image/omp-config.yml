@@ -26,4 +26,19 @@ cycleOrder:
   - slow
 
 tools:
-  approvalMode: write
+  approvalMode: yolo
+
+goal:
+  enabled: true
+  continuationModes:
+    - interactive
+
+ask:
+  enabled: true
+
+bash:
+  patterns:
+    - match: "rm -rf *"
+      approval: deny
+    - match: "git push --force*"
+      approval: deny

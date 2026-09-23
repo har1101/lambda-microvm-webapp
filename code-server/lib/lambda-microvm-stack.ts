@@ -151,7 +151,7 @@ export class OmpCloudIdeEdgeStack extends cdk.Stack {
 
     const accessPassword = new secretsmanager.Secret(this, 'AccessPassword', {
       secretName: config.edge.accessSecretName,
-      description: 'HTTP Basic password checked before a MicroVM can be started',
+      description: 'Edge login password checked before a MicroVM can be started',
       generateSecretString: {
         passwordLength: 32,
         excludePunctuation: true,
@@ -223,6 +223,8 @@ export class OmpCloudIdeEdgeStack extends cdk.Stack {
       AUTH_SECRET_ID: config.edge.accessSecretName,
       AUTH_SECRET_REGION: config.edgeRegion,
       BASIC_AUTH_USERNAME: config.edge.basicAuthUsername,
+      ACCESS_COOKIE_NAME: config.edge.accessCookieName,
+      ACCESS_COOKIE_MAX_AGE_SEC: config.edge.accessCookieMaxAgeSec,
       TOKEN_DURATION_MIN: config.edge.tokenDurationMin,
       TOKEN_REFRESH_THRESHOLD: config.edge.tokenRefreshThresholdMin,
       MAX_DURATION_SEC: config.edge.maxDurationSec,
@@ -288,6 +290,34 @@ export class OmpCloudIdeEdgeStack extends cdk.Stack {
     edgeVersion.applyRemovalPolicy(cdk.RemovalPolicy.RETAIN);
     edgeResponseVersion.applyRemovalPolicy(cdk.RemovalPolicy.RETAIN);
 
+    const responseHeadersPolicy = new cloudfront.ResponseHeadersPolicy(this, 'ResponseHeadersPolicy', {
+      responseHeadersPolicyName: 'omp-cloud-ide-security-headers',
+      securityHeadersBehavior: {
+        contentSecurityPolicy: {
+          contentSecurityPolicy:
+            "default-src 'self' blob: data:; script-src 'self' 'unsafe-eval' blob:; " +
+            "style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https:; " +
+            "font-src 'self' data:; connect-src 'self' wss: https:; worker-src 'self' blob:; " +
+            "frame-src 'self' https:; base-uri 'self'; frame-ancestors 'self'",
+          // Preserve a more specific CSP emitted by code-server when present.
+          override: false,
+        },
+        contentTypeOptions: { override: true },
+        frameOptions: { frameOption: cloudfront.HeadersFrameOption.SAMEORIGIN, override: true },
+        referrerPolicy: {
+          referrerPolicy: cloudfront.HeadersReferrerPolicy.NO_REFERRER,
+          override: true,
+        },
+        strictTransportSecurity: {
+          accessControlMaxAge: cdk.Duration.days(365),
+          includeSubdomains: true,
+          preload: true,
+          override: true,
+        },
+        xssProtection: { protection: true, modeBlock: true, override: true },
+      },
+    });
+
     const distribution = new cloudfront.Distribution(this, 'Distribution', {
       comment: config.imageDescription,
       httpVersion: cloudfront.HttpVersion.HTTP2_AND_3,
@@ -303,11 +333,14 @@ export class OmpCloudIdeEdgeStack extends cdk.Stack {
         allowedMethods: cloudfront.AllowedMethods.ALLOW_ALL,
         cachePolicy: cloudfront.CachePolicy.CACHING_DISABLED,
         originRequestPolicy: cloudfront.OriginRequestPolicy.ALL_VIEWER_EXCEPT_HOST_HEADER,
+        responseHeadersPolicy,
         edgeLambdas: [
           {
             functionVersion: edgeVersion,
             eventType: cloudfront.LambdaEdgeEventType.ORIGIN_REQUEST,
-            includeBody: false,
+            // The edge handler consumes only the small /login form body. Other
+            // request bodies remain read-only and CloudFront forwards them intact.
+            includeBody: true,
           },
           {
             functionVersion: edgeResponseVersion,
@@ -320,7 +353,7 @@ export class OmpCloudIdeEdgeStack extends cdk.Stack {
 
     new cdk.CfnOutput(this, 'DistributionUrl', {
       value: `https://${distribution.distributionDomainName}`,
-      description: 'Open this URL and authenticate with the configured Basic Auth user',
+      description: 'Open this URL and authenticate with the configured edge login user',
     });
     new cdk.CfnOutput(this, 'AccessPasswordSecretArn', {
       value: accessPassword.secretArn,
@@ -328,6 +361,7 @@ export class OmpCloudIdeEdgeStack extends cdk.Stack {
     });
     new cdk.CfnOutput(this, 'BasicAuthUsername', {
       value: config.edge.basicAuthUsername,
+      description: 'Username accepted by the edge login form and legacy HTTP Basic clients',
     });
     new cdk.CfnOutput(this, 'SessionsTableName', {
       value: table.tableName,
