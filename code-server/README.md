@@ -81,6 +81,8 @@ Later MicroVMs restore OMP's `agent.db`, its installation ID, and GitHub CLI's O
 
 The image also installs a global OMP configuration with interactive goal continuation and the ask tool enabled. Tool approvals default to `yolo`, while `rm -rf *` and `git push --force*` are denied by `bash.patterns`. These patterns govern OMP's `bash` tool; they are approval rules rather than operating-system sandboxing.
 
+OMP's Puppeteer browser prelude is enabled in headless mode. A checksum-pinned arm64 Chromium build is expanded into `/opt/chromium` during the image build and selected with `PUPPETEER_EXECUTABLE_PATH`, so the first E2E run does not depend on a browser download. `tab.screenshot()` evidence is saved under `/home/vscode/workspace/.artifacts/screenshots` by default.
+
 Opening `/login` only renders the access form; it does not call `RunMicrovm`. A MicroVM starts after successful login when the browser first enters `/` without an active `mvm-session` cookie.
 
 ## Suspend and resume
@@ -91,7 +93,7 @@ While paused, regular editor requests are blocked at Lambda@Edge. Press **Resume
 
 ## Implementation status
 
-The deployable personal-IDE path is implemented: Tokyo MicroVM image, CloudFront/Lambda@Edge access control, code-server, pinned OMP, Bun/Node/Python/uv, GitHub CLI OAuth without PAT, AWS CLI, language servers, `ripgrep`, encrypted lifecycle persistence, explicit suspend/resume, and `cdkd` deployment.
+The deployable personal-IDE path is implemented: Tokyo MicroVM image, CloudFront/Lambda@Edge access control, code-server, pinned OMP, Bun/Node/Python/uv, GitHub CLI OAuth without PAT, AWS CLI, language servers, `ripgrep`, headless Chromium for OMP browser E2E, encrypted lifecycle persistence, explicit suspend/resume, and `cdkd` deployment.
 
 The original design document is not implemented literally in these intentionally superseded areas:
 

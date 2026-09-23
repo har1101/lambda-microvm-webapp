@@ -282,6 +282,11 @@ describe('OMP Cloud IDE infrastructure', () => {
     expect(dockerfile).toContain('useradd --uid 1000');
     expect(dockerfile).toContain('USER vscode');
     expect(dockerfile).toContain('ripgrep');
+    expect(dockerfile).toContain('ARG CHROMIUM_VERSION=149.0.0');
+    expect(dockerfile).toContain('CHROMIUM_ARM64_PACK_SHA256=9c42e7850d746cbf0ac0e68eaa48af277af8255a5ee12a813c08573671f231f6');
+    expect(dockerfile).toContain('AWS_EXECUTION_ENV=AWS_Lambda_nodejs24.x TMPDIR=/opt/chromium');
+    expect(dockerfile).toContain('PUPPETEER_EXECUTABLE_PATH=/opt/chromium/chromium');
+    expect(dockerfile).toContain('/opt/chromium/chromium --version');
     expect(dockerfile).toContain(
       ['COPY omp-cloud-ide-controls $', '{EXTENSIONS_DIR}/har1101.omp-cloud-ide-controls-0.1.0'].join(''),
     );
@@ -289,6 +294,9 @@ describe('OMP Cloud IDE infrastructure', () => {
     expect(ompConfig).toContain('approvalMode: yolo');
     expect(ompConfig).toContain('continuationModes:\n    - interactive');
     expect(ompConfig).toContain('ask:\n  enabled: true');
+    expect(ompConfig).toContain(
+      'browser:\n  enabled: true\n  headless: true\n  screenshotDir: /home/vscode/workspace/.artifacts/screenshots',
+    );
     expect(ompConfig).toContain('- match: "rm -rf *"\n      approval: deny');
     expect(ompConfig).toContain('- match: "git push --force*"\n      approval: deny');
     expect(settings).toContain('"ompCloudIde.controlUrl"');

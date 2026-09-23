@@ -36,6 +36,11 @@ goal:
 ask:
   enabled: true
 
+browser:
+  enabled: true
+  headless: true
+  screenshotDir: /home/vscode/workspace/.artifacts/screenshots
+
 bash:
   patterns:
     - match: "rm -rf *"

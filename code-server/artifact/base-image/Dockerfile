@@ -8,6 +8,8 @@ ARG AWS_CLI_VERSION=2.34.45
 ARG NODE_VERSION=24.21.0
 ARG UV_VERSION=0.12.18
 ARG RIPGREP_VERSION=15.2.0
+ARG CHROMIUM_VERSION=149.0.0
+ARG CHROMIUM_ARM64_PACK_SHA256=9c42e7850d746cbf0ac0e68eaa48af277af8255a5ee12a813c08573671f231f6
 
 RUN dnf install -y \
       shadow-utils \
@@ -62,6 +64,28 @@ RUN mkdir -p ${BUN_INSTALL} \
     && bun install --global "@oh-my-pi/pi-coding-agent@${OMP_VERSION}" \
     && omp --version
 
+# OMP uses puppeteer-core and can download Chrome for Testing on first use, but
+# Google does not publish Linux arm64 builds. Pre-expand a pinned AL2023 arm64
+# headless Chromium so browser.open works without a runtime download.
+RUN mkdir -p /opt/chromium /tmp/chromium-installer/node_modules /tmp/chromium-pack \
+    && curl -fsSL \
+      "https://github.com/Sparticuz/chromium/releases/download/v${CHROMIUM_VERSION}/chromium-v${CHROMIUM_VERSION}-pack.arm64.tar" \
+      -o /tmp/chromium-pack.tar \
+    && echo "${CHROMIUM_ARM64_PACK_SHA256}  /tmp/chromium-pack.tar" | sha256sum -c - \
+    && tar -xf /tmp/chromium-pack.tar -C /tmp/chromium-pack \
+    && npm install --prefix /tmp/chromium-installer --ignore-scripts \
+      "@sparticuz/chromium-min@${CHROMIUM_VERSION}" \
+    && AWS_EXECUTION_ENV=AWS_Lambda_nodejs24.x TMPDIR=/opt/chromium node --input-type=module -e \
+      'import Chromium from "/tmp/chromium-installer/node_modules/@sparticuz/chromium-min/build/index.js"; await Chromium.executablePath("/tmp/chromium-pack");' \
+    && chmod 0755 /opt/chromium/chromium \
+    && LD_LIBRARY_PATH=/opt/chromium/al2023/lib:/opt/chromium /opt/chromium/chromium --version \
+    && rm -rf /tmp/chromium-installer /tmp/chromium-pack /tmp/chromium-pack.tar \
+    && npm cache clean --force
+
+ENV PUPPETEER_EXECUTABLE_PATH=/opt/chromium/chromium
+ENV FONTCONFIG_PATH=/opt/chromium/fonts
+ENV LD_LIBRARY_PATH=/opt/chromium/al2023/lib:/opt/chromium
+
 RUN curl -fsSL "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_arm64.tar.gz" \
       -o /tmp/gh.tar.gz \
     && tar -xzf /tmp/gh.tar.gz -C /tmp \
@@ -92,6 +116,7 @@ ENV PI_CODING_AGENT_DIR=${HOME}/.omp/agent
 
 RUN mkdir -p \
       ${HOME}/workspace \
+      ${HOME}/workspace/.artifacts/screenshots \
       ${EXTENSIONS_DIR} \
       ${USER_DATA_DIR}/User \
       ${PI_CODING_AGENT_DIR} \
