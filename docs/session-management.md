@@ -64,15 +64,19 @@ ttl             DynamoDBレコードの自動削除時刻
 
 ### 2. セッション選択
 
-`GET /session/select`は、再接続可能なMicroVMを状態付きで一覧表示する。
+`GET /session/select`はDynamoDBを任意の最大25件Scanし、各候補を`GetMicrovm`で照合して状態付きで一覧表示する。
 
 - `RUNNING`: `Connect`
 - `SUSPENDED`または明示停止中: `Resume and connect`
+- `SUSPENDING`: 完了待ちを案内
+- `PENDING`/`UNKNOWN`: 現状は接続操作を表示するが、endpoint/code-serverのreadyは保証されない
 - 候補がない場合: `Start a new MicroVM`
 
 ### 3-A. 新規セッション
 
 `POST /session/select`で`action=new`を送ると、Lambda@Edgeが`RunMicrovm`を実行する。その後、port 8080だけを許可したMicroVM auth tokenを作成し、DynamoDBへレコードを保存して`mvm-session`を発行する。
+
+この3段階はtransactionではない。`RunMicrovm`成功後にtoken作成またはDynamoDB保存が失敗すると、一覧から見えないorphan MicroVMが残り得る。現状は補償Terminateとidempotencyが未実装である。
 
 ### 3-B. 既存セッション
 
@@ -96,6 +100,8 @@ ttl             DynamoDBレコードの自動削除時刻
 5. `Host`、`Origin`、`X-aws-proxy-auth`をMicroVM endpoint用に設定する。
 6. HTTPSでAWS管理endpointへ転送する。
 
+現状は手順1で検証した`omp-cloud-ide-auth`と`mvm-session`をrequestの`Cookie` headerから除去せず、そのままcode-server originへ転送する。`HttpOnly`でもorigin serverにはCookieが届き、code-server proxyが内側backendへ引き継ぐ場合はserver-side appから見える可能性がある。Edge専用Cookieだけを検証後にstripし、code-server固有Cookieは維持する改善と、そのE2E確認が必要である。
+
 MicroVM内ではcode-serverが`0.0.0.0:8080`で待ち受け、独自認証は無効になっている。手前のCloudFrontログインとMicroVM proxy tokenの二段階を通らなければ到達できないためである。
 
 code-serverの`/proxy/3000/`は、MicroVMの3000番を外部公開しているわけではない。外部通信は常にport 8080のcode-serverを通り、code-serverが内部の`localhost:3000`へ中継する。
@@ -114,6 +120,8 @@ code-serverの`/proxy/3000/`は、MicroVMの3000番を外部公開している�
 
 TerminateされたMicroVMのローカルディスクとRAM状態は戻せない。S3へ保存されるのはOMPとGitHubの認証ファイルだけで、`/home/vscode/workspace`は保存対象ではない。未完了の実装を残す場合は、Terminate前にGitへcommit・pushする必要がある。
 
+`maximumDurationInSeconds=28800`はRUNNINGとSUSPENDEDを合わせたMicroVMの総寿命である。Suspend保持の設定が別に8時間あっても、起動から8時間を超えて同じMicroVMへ戻れるという意味ではない。
+
 ## 今回修正した障害の原因
 
 以前のorigin-response Lambda@Edgeは、MicroVM originがHTMLナビゲーションに対して一時的に`502`または`504`を返すと、`mvm-session` Cookieを即座に削除して`/session/start`へ送っていた。
@@ -130,15 +138,20 @@ Suspendからの自動Resume中にも短時間の`502/504`が発生し得るた�
 ## セキュリティ上の境界
 
 - セッション選択画面は有効なログインCookieがなければ表示できない。
-- `sessionId`はUUID形式を検証し、DynamoDBとLambda MicroVM APIの両方で再確認する。
+- `sessionId`は現状、hexとhyphenからなる36文字の簡易形式を検証し、DynamoDBとLambda MicroVM APIの両方で再確認する。UUIDのversion/variantやhyphen位置までの厳密検証ではない。
 - proxy tokenはブラウザへ返さず、Lambda@Edgeだけがリクエストヘッダーへ注入する。
 - MicroVM auth tokenはport 8080だけを許可する。
 - CloudFrontキャッシュは無効で、ログイン・セッション画面には`Cache-Control: no-store`を付ける。
 - セッション選択画面はCSPで外部スクリプトと外部送信を禁止する。
 
+ただし、IDE、`/proxy/<port>/`、login/selector/control routeは同じCloudFront originである。`SameSite=Strict`は外部siteからの一般的なCSRFには有効だが、同一originのproxyアプリから状態変更routeを隔離しない。現状はproxy先アプリも信頼する個人用環境という境界である。
+
 ## 制約
 
-- 現在は単一ユーザー用なので、セッション一覧はDynamoDB Scanで最大25件を確認する。
+- 現在は単一ユーザー用なので、セッション一覧はDynamoDB Scanの任意の最大25件を確認する。新しい順は保証せず、最大25回の`GetMicrovm`を並行実行する。
 - DynamoDB TTL削除は即時ではないが、終了済みMicroVMはAPI照合で一覧から除外する。
-- MicroVMの最大実行時間とSuspend保持時間を超えてTerminateされた場合は再接続できない。
+- MicroVMのRUNNING+SUSPENDED総寿命8時間を超えてTerminateされた場合は再接続できない。
 - セッション選択はMicroVMのローカル作業状態を永続化する機能ではない。生存している同一MicroVMへ接続し直す機能である。
+- proxy token更新は分散Edgeからの条件なし更新であり、並行refreshの競合は未検証である。
+- origin-responseはHTMLの`502/504`をpath非限定でselectorへ戻すため、proxy先アプリ自身のHTMLエラーをMicroVM障害と誤認し得る。
+- Suspend/Terminate時のS3保存はbest-effortで、保存失敗が利用者へ表示されない。認証状態が重要な場合はlifecycle logとS3更新時刻も確認する。
