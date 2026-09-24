@@ -12,6 +12,9 @@ The Cloud IDE is customized for `har1101` and uses:
 - encrypted S3 persistence for OMP and GitHub OAuth state
 - CloudFront-side password form with a signed, `HttpOnly` session cookie before `RunMicrovm`
 - an explicit suspend/resume control that prevents editor reconnects from waking a paused MicroVM
+- an authenticated session chooser for reconnecting to an existing MicroVM or starting a new one
 - `cdkd` as the dev/test deployment engine
+
+The connection path, cookie model, DynamoDB session record, suspend/resume behavior, and recovery design are documented in [docs/session-management.md](docs/session-management.md).
 
 No credentials or personal access tokens are committed to this repository.

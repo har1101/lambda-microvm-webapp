@@ -209,7 +209,7 @@ export class OmpCloudIdeEdgeStack extends cdk.Stack {
         resources: [executionRoleArn],
       }),
     );
-    table.grant(edgeRole, 'dynamodb:GetItem', 'dynamodb:PutItem', 'dynamodb:UpdateItem');
+    table.grant(edgeRole, 'dynamodb:GetItem', 'dynamodb:PutItem', 'dynamodb:Scan', 'dynamodb:UpdateItem');
     accessPassword.grantRead(edgeRole);
     edgeRole.addToPolicy(
       new iam.PolicyStatement({

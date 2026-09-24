@@ -83,7 +83,7 @@ The image also installs a global OMP configuration with interactive goal continu
 
 OMP's Puppeteer browser prelude is enabled in headless mode. A checksum-pinned arm64 Chromium build is expanded into `/opt/chromium` during the image build and selected with `PUPPETEER_EXECUTABLE_PATH`, so the first E2E run does not depend on a browser download. `tab.screenshot()` evidence is saved under `/home/vscode/workspace/.artifacts/screenshots` by default.
 
-Opening `/login` only renders the access form; it does not call `RunMicrovm`. A MicroVM starts after successful login when the browser first enters `/` without an active `mvm-session` cookie.
+Opening `/login` only renders the access form; it does not call `RunMicrovm`. After successful login, `/session/select` lists running and suspended MicroVMs. The user explicitly chooses an existing session to connect or resume, or starts a new MicroVM. Temporary origin `502`/`504` responses preserve the browser's `mvm-session` association and return to the chooser instead of orphaning a live workspace.
 
 ## Suspend and resume
 

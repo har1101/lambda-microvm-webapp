@@ -6,6 +6,7 @@ import { OmpCloudIdeEdgeStack, OmpCloudIdeMicrovmStack } from '../lib/lambda-mic
 
 type EdgeTestHelpers = {
   createAccessCookie: (password: string, now?: number) => string;
+  createMicrovmSessionCookie: (sessionId: string) => string;
   isAccessCookieValidForPassword: (value: string, password: string, now?: number) => boolean;
   loginPageResponse: (
     errorMessage?: string,
@@ -29,12 +30,34 @@ type EdgeTestHelpers = {
     headers: Record<string, Array<{ key: string; value: string }>>;
   };
   resumingPageResponse: () => { status: string; body: string };
+  sessionAttachedResponse: (
+    sessionId: string,
+    resuming: boolean,
+  ) => { status: string; headers: Record<string, Array<{ key: string; value: string }>>; body?: string };
   sessionControlResponse: (options: {
     hasSession: boolean;
     paused?: boolean;
     message?: string;
     error?: boolean;
     clearSessionCookie?: boolean;
+  }) => {
+    status: string;
+    headers: Record<string, Array<{ key: string; value: string }>>;
+    body: string;
+  };
+  sessionSelectionResponse: (options: {
+    sessions: Array<{
+      sessionId: string;
+      microvmId: string;
+      state: string;
+      imageVersion: string;
+      paused: boolean;
+      createdAt: number;
+      ttl: number;
+    }>;
+    currentSessionId?: string;
+    errorMessage?: string;
+    status?: string;
   }) => {
     status: string;
     headers: Record<string, Array<{ key: string; value: string }>>;
@@ -162,6 +185,10 @@ describe('OMP Cloud IDE infrastructure', () => {
             Condition: Match.absent(),
           }),
           Match.objectLike({
+            Action: Match.arrayWith(['dynamodb:Scan']),
+            Effect: 'Allow',
+          }),
+          Match.objectLike({
             Action: Match.arrayWith(['secretsmanager:GetSecretValue']),
             Effect: 'Allow',
           }),
@@ -226,12 +253,13 @@ describe('OMP Cloud IDE infrastructure', () => {
 
     const noSession = helpers.sessionControlResponse({ hasSession: false });
     expect(noSession.body).toContain('No active Cloud IDE session');
-    expect(noSession.body).toContain('href="/">Start editor</a>');
+    expect(noSession.body).toContain('href="/session/select">Choose a session</a>');
     expect(noSession.body).not.toContain('action="/session/suspend"');
 
     const running = helpers.sessionControlResponse({ hasSession: true });
     expect(running.body).toContain('method="post" action="/session/suspend"');
     expect(running.body).toContain('Suspend Cloud IDE');
+    expect(running.body).toContain('href="/session/select">Switch session</a>');
     expect(running.headers['content-security-policy'][0].value).toContain("frame-ancestors 'self'");
 
     const paused = helpers.sessionControlResponse({ hasSession: true, paused: true });
@@ -241,6 +269,71 @@ describe('OMP Cloud IDE infrastructure', () => {
     const error = helpers.sessionControlResponse({ hasSession: true, error: true, message: '<failed>' });
     expect(error.body).toContain('class="status error"');
     expect(error.body).toContain('&lt;failed&gt;');
+  });
+
+  test('renders a safe chooser for existing and new MicroVM sessions', () => {
+    const helpers = getEdgeModule().__test;
+    const sessionId = '7d041485-dff5-4033-bdbc-a921757e217b';
+    const response = helpers.sessionSelectionResponse({
+      currentSessionId: sessionId,
+      sessions: [
+        {
+          sessionId,
+          microvmId: 'microvm-<unsafe>',
+          state: 'SUSPENDED',
+          imageVersion: '11.0',
+          paused: false,
+          createdAt: 1_800_000_000_000,
+          ttl: 0,
+        },
+      ],
+    });
+
+    expect(response.status).toBe('200');
+    expect(response.body).toContain('Choose a Cloud IDE session');
+    expect(response.body).toContain('microvm-&lt;unsafe&gt;');
+    expect(response.body).not.toContain('microvm-<unsafe>');
+    expect(response.body).toContain('Currently selected in this browser');
+    expect(response.body).toContain('Resume and connect');
+    expect(response.body).toContain('name="sessionId" value="7d041485-dff5-4033-bdbc-a921757e217b"');
+    expect(response.body).toContain('Start a new MicroVM');
+    expect(response.headers['content-security-policy'][0].value).toContain("form-action 'self'");
+
+    const attached = helpers.sessionAttachedResponse(sessionId, false);
+    expect(attached.status).toBe('303');
+    expect(attached.headers.location).toEqual([{ key: 'Location', value: '/' }]);
+    expect(attached.headers['set-cookie'][0].value).toContain(`mvm-session=${sessionId}`);
+    expect(attached.headers['set-cookie'][0].value).toContain('HttpOnly');
+
+    const resuming = helpers.sessionAttachedResponse(sessionId, true);
+    expect(resuming.status).toBe('200');
+    expect(resuming.body).toContain('Resuming the Cloud IDE');
+    expect(resuming.headers['set-cookie'][0].value).toContain(`mvm-session=${sessionId}`);
+  });
+
+  test('preserves the session cookie when a MicroVM origin temporarily returns 502', async () => {
+    const responseHandler = require('../artifact/edge-response/index.js').handler as (
+      event: unknown,
+    ) => Promise<{ status: string; headers: Record<string, unknown> }>;
+    const response = await responseHandler({
+      Records: [
+        {
+          cf: {
+            request: {
+              headers: {
+                accept: [{ key: 'Accept', value: 'text/html' }],
+                cookie: [{ key: 'Cookie', value: 'mvm-session=test-session' }],
+              },
+            },
+            response: { status: '502', headers: {} },
+          },
+        },
+      ],
+    });
+
+    expect(response.status).toBe('302');
+    expect(response.headers.location).toEqual([{ key: 'Location', value: '/session/select' }]);
+    expect(response.headers['set-cookie']).toBeUndefined();
   });
 
   test('uses a CSP-compatible start-page redirect', () => {

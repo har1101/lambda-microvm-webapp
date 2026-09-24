@@ -19,13 +19,9 @@ exports.handler = async (event) => {
       status: '302',
       statusDescription: 'Found',
       headers: {
-        location: [{ key: 'Location', value: '/session/start' }],
-        'set-cookie': [
-          {
-            key: 'Set-Cookie',
-            value: 'mvm-session=; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0',
-          },
-        ],
+        // Keep the association cookie. A suspended or still-resuming MicroVM
+        // can temporarily return 502/504 even though its workspace is intact.
+        location: [{ key: 'Location', value: '/session/select' }],
         'cache-control': [{ key: 'Cache-Control', value: 'no-store' }],
       },
     };

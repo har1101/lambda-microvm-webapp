@@ -8,7 +8,13 @@ const {
   RunMicrovmCommand,
   SuspendMicrovmCommand,
 } = require('@aws-sdk/client-lambda-microvms');
-const { DynamoDBClient, GetItemCommand, PutItemCommand, UpdateItemCommand } = require('@aws-sdk/client-dynamodb');
+const {
+  DynamoDBClient,
+  GetItemCommand,
+  PutItemCommand,
+  ScanCommand,
+  UpdateItemCommand,
+} = require('@aws-sdk/client-dynamodb');
 const { GetSecretValueCommand, SecretsManagerClient } = require('@aws-sdk/client-secrets-manager');
 const { createHmac, randomUUID, timingSafeEqual } = require('node:crypto');
 
@@ -38,7 +44,13 @@ exports.handler = async (event) => {
   const isSuspendRoute = request.uri === '/session/suspend';
   const isResumeRoute = request.uri === '/session/resume';
 
+  if (request.uri === '/session/select') {
+    return handleSessionSelection(request, sessionId);
+  }
   if (request.uri === '/session/start') {
+    if (request.method !== 'POST') {
+      return redirectToSessionSelect();
+    }
     return startSession();
   }
 
@@ -46,7 +58,7 @@ exports.handler = async (event) => {
     if (isControlRoute || isSuspendRoute || isResumeRoute) {
       return sessionControlResponse({ hasSession: false });
     }
-    return redirectToStart();
+    return redirectToSessionSelect();
   }
 
   const result = await ddb.send(
@@ -60,7 +72,7 @@ exports.handler = async (event) => {
     if (isControlRoute || isSuspendRoute || isResumeRoute) {
       return sessionControlResponse({ hasSession: false, clearSessionCookie: true });
     }
-    return redirectToStart(true);
+    return redirectToSessionSelect(true);
   }
 
   const paused = result.Item.paused?.BOOL === true;
@@ -162,6 +174,7 @@ async function startSession() {
         endpoint: { S: run.endpoint },
         token: { S: token },
         tokenExpiry: { N: String(now + cfg.TOKEN_DURATION_MIN * 60000) },
+        createdAt: { N: String(now) },
         paused: { BOOL: false },
         ttl: { N: String(ttl) },
       },
@@ -175,7 +188,7 @@ async function startSession() {
       'set-cookie': [
         {
           key: 'Set-Cookie',
-          value: `mvm-session=${id}; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=${cfg.MAX_DURATION_SEC}`,
+          value: createMicrovmSessionCookie(id),
         },
       ],
       'cache-control': [{ key: 'Cache-Control', value: 'no-store' }],
@@ -197,6 +210,145 @@ async function startSession() {
       '</body></html>',
     ].join(''),
   };
+}
+
+async function handleSessionSelection(request, currentSessionId) {
+  if (request.method === 'GET' || request.method === 'HEAD') {
+    return sessionSelectionResponse({
+      sessions: await listAvailableSessions(),
+      currentSessionId,
+    });
+  }
+  if (request.method !== 'POST') {
+    return methodNotAllowedResponse();
+  }
+
+  const form = parseFormBody(request.body);
+  if (!form) {
+    return sessionSelectionResponse({
+      sessions: await listAvailableSessions(),
+      currentSessionId,
+      errorMessage: 'The session request was invalid or too large.',
+      status: '400',
+    });
+  }
+
+  const action = form.get('action');
+  if (action === 'new') {
+    return startSession();
+  }
+  if (action !== 'attach') {
+    return sessionSelectionResponse({
+      sessions: await listAvailableSessions(),
+      currentSessionId,
+      errorMessage: 'Choose an existing session or start a new MicroVM.',
+      status: '400',
+    });
+  }
+
+  const selectedSessionId = form.get('sessionId') ?? '';
+  if (!/^[0-9a-f-]{36}$/i.test(selectedSessionId)) {
+    return sessionSelectionResponse({
+      sessions: await listAvailableSessions(),
+      currentSessionId,
+      errorMessage: 'The selected session ID was invalid.',
+      status: '400',
+    });
+  }
+  return attachSession(selectedSessionId, currentSessionId);
+}
+
+async function listAvailableSessions() {
+  const result = await ddb.send(
+    new ScanCommand({
+      TableName: cfg.TABLE,
+      ProjectionExpression: 'sessionId,microvmId,paused,createdAt,#ttl',
+      ExpressionAttributeNames: { '#ttl': 'ttl' },
+      Limit: 25,
+    }),
+  );
+
+  const sessions = await Promise.all(
+    (result.Items ?? []).map(async (item) => {
+      const sessionId = item.sessionId?.S;
+      const microvmId = item.microvmId?.S;
+      if (!sessionId || !microvmId) return null;
+      try {
+        const microvm = await mvm.send(new GetMicrovmCommand({ microvmIdentifier: microvmId }));
+        if (microvm.state === 'TERMINATED' || microvm.state === 'TERMINATING') return null;
+        return {
+          sessionId,
+          microvmId,
+          state: microvm.state ?? 'UNKNOWN',
+          imageVersion: microvm.imageVersion ?? '',
+          paused: item.paused?.BOOL === true,
+          createdAt: Number(item.createdAt?.N ?? 0),
+          ttl: Number(item.ttl?.N ?? 0),
+        };
+      } catch (error) {
+        if (error?.name !== 'ResourceNotFoundException') {
+          console.error('Could not inspect MicroVM while listing sessions', error?.name);
+        }
+        return null;
+      }
+    }),
+  );
+
+  return sessions
+    .filter(Boolean)
+    .sort((left, right) => (right.createdAt || right.ttl * 1000) - (left.createdAt || left.ttl * 1000));
+}
+
+async function attachSession(selectedSessionId, currentSessionId) {
+  const result = await ddb.send(
+    new GetItemCommand({
+      TableName: cfg.TABLE,
+      Key: { sessionId: { S: selectedSessionId } },
+      ConsistentRead: true,
+    }),
+  );
+  if (!result.Item?.microvmId?.S) {
+    return sessionSelectionResponse({
+      sessions: await listAvailableSessions(),
+      currentSessionId,
+      errorMessage: 'That session no longer exists. Choose another session or start a new MicroVM.',
+      status: '404',
+    });
+  }
+
+  try {
+    const microvmId = result.Item.microvmId.S;
+    const state = await getMicrovmState(microvmId);
+    if (state === 'TERMINATED' || state === 'TERMINATING') {
+      return sessionSelectionResponse({
+        sessions: await listAvailableSessions(),
+        currentSessionId,
+        errorMessage: 'That MicroVM has terminated and cannot be resumed.',
+        status: '410',
+      });
+    }
+    if (state === 'SUSPENDING') {
+      return sessionSelectionResponse({
+        sessions: await listAvailableSessions(),
+        currentSessionId,
+        errorMessage: 'That MicroVM is still suspending. Wait a few seconds and try again.',
+        status: '409',
+      });
+    }
+    if (state === 'SUSPENDED') {
+      await mvm.send(new ResumeMicrovmCommand({ microvmIdentifier: microvmId }));
+    }
+    await setSessionPaused(selectedSessionId, false);
+    return sessionAttachedResponse(selectedSessionId, state === 'SUSPENDED');
+  } catch (error) {
+    console.error('Could not attach existing MicroVM session', error?.name);
+    return sessionSelectionResponse({
+      sessions: await listAvailableSessions(),
+      currentSessionId,
+      errorMessage: 'Could not connect to that MicroVM. Retry or choose another session.',
+      status: '502',
+    });
+  }
 }
 
 async function suspendSession(request, sessionId, item) {
@@ -322,30 +474,37 @@ async function handleLogin(request) {
     status: '303',
     statusDescription: 'See Other',
     headers: {
-      location: [{ key: 'Location', value: '/' }],
+      location: [{ key: 'Location', value: '/session/select' }],
       'set-cookie': [{ key: 'Set-Cookie', value: cookie }],
       'cache-control': [{ key: 'Cache-Control', value: 'no-store' }],
     },
   };
 }
 
-function parseLoginForm(body) {
+function parseFormBody(body) {
   if (!body?.data || body.inputTruncated) {
     return null;
   }
 
-  let decoded;
   try {
-    decoded = body.encoding === 'base64' ? Buffer.from(body.data, 'base64').toString('utf8') : body.data;
+    const decoded = body.encoding === 'base64' ? Buffer.from(body.data, 'base64').toString('utf8') : body.data;
+    return new URLSearchParams(decoded);
   } catch {
     return null;
   }
+}
 
-  const params = new URLSearchParams(decoded);
+function parseLoginForm(body) {
+  const params = parseFormBody(body);
+  if (!params) return null;
   return {
     username: params.get('username') ?? '',
     password: params.get('password') ?? '',
   };
+}
+
+function createMicrovmSessionCookie(sessionId) {
+  return `mvm-session=${sessionId}; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=${cfg.MAX_DURATION_SEC}`;
 }
 
 function createAccessCookie(password, now = Date.now()) {
@@ -451,6 +610,78 @@ function loginPageResponse(errorMessage = '', status = '200') {
   };
 }
 
+function sessionSelectionResponse({ sessions, currentSessionId = '', errorMessage = '', status = '200' }) {
+  const error = errorMessage ? `<p class="error" role="alert">${escapeHtml(errorMessage)}</p>` : '';
+  const sessionCards = sessions.length
+    ? sessions
+        .map((session) => {
+          const isCurrent = session.sessionId === currentSessionId;
+          const isSuspended = session.state === 'SUSPENDED' || session.paused;
+          const actionLabel = isSuspended ? 'Resume and connect' : 'Connect';
+          const created = session.createdAt
+            ? new Date(session.createdAt).toISOString()
+            : 'Created before session history timestamps were enabled';
+          return [
+            `<article class="session${isCurrent ? ' current' : ''}">`,
+            '<div class="session-heading">',
+            `<strong>${escapeHtml(session.microvmId)}</strong>`,
+            `<span class="state ${escapeHtml(String(session.state).toLowerCase())}">${escapeHtml(session.state)}</span>`,
+            '</div>',
+            `<p>Image ${escapeHtml(session.imageVersion || 'unknown')} · ${escapeHtml(created)}</p>`,
+            isCurrent ? '<p class="current-label">Currently selected in this browser</p>' : '',
+            '<form method="post" action="/session/select">',
+            '<input type="hidden" name="action" value="attach">',
+            `<input type="hidden" name="sessionId" value="${escapeHtml(session.sessionId)}">`,
+            `<button class="primary" type="submit">${actionLabel}</button>`,
+            '</form></article>',
+          ].join('');
+        })
+        .join('')
+    : '<p class="empty">No resumable MicroVM sessions were found.</p>';
+
+  return {
+    status,
+    statusDescription: status === '200' ? 'OK' : 'Error',
+    headers: {
+      'cache-control': [{ key: 'Cache-Control', value: 'no-store' }],
+      'content-type': [{ key: 'Content-Type', value: 'text/html; charset=utf-8' }],
+      'x-content-type-options': [{ key: 'X-Content-Type-Options', value: 'nosniff' }],
+      'content-security-policy': [
+        {
+          key: 'Content-Security-Policy',
+          value:
+            "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
+        },
+      ],
+    },
+    body: [
+      '<!doctype html><html lang="ja"><head><meta charset="utf-8">',
+      '<meta name="viewport" content="width=device-width,initial-scale=1">',
+      '<title>Choose OMP Cloud IDE Session</title>',
+      '<style>html{color-scheme:dark}body{font-family:system-ui,sans-serif;background:#111827;color:#e5e7eb;',
+      'min-height:100vh;margin:0;padding:2rem;box-sizing:border-box}.shell{width:min(48rem,100%);margin:auto}',
+      'h1{font-size:1.55rem;margin:0 0 .5rem}.hint,.session p,.empty{color:#9ca3af;line-height:1.5}',
+      '.error{color:#fca5a5;background:#450a0a;border:1px solid #991b1b;border-radius:8px;padding:.75rem}',
+      '.sessions{display:grid;gap:1rem;margin:1.5rem 0}.session{background:#1f2937;border:1px solid #374151;',
+      'border-radius:12px;padding:1rem}.session.current{border-color:#60a5fa}.session-heading{display:flex;gap:.75rem;',
+      'align-items:center;justify-content:space-between;flex-wrap:wrap}strong{font:600 .85rem ui-monospace,monospace}',
+      '.state{font-size:.75rem;font-weight:700;padding:.25rem .5rem;border-radius:999px;background:#374151}',
+      '.running{color:#86efac}.suspended{color:#fde68a}.current-label{color:#93c5fd!important}',
+      'button{box-sizing:border-box;width:100%;padding:.75rem;border:0;border-radius:6px;color:#fff;font-weight:600;',
+      'cursor:pointer}.primary{background:#2563eb}.new{background:#374151}.new-session{margin-top:1rem;padding-top:1.5rem;',
+      'border-top:1px solid #374151}</style></head><body><main class="shell">',
+      '<h1>Choose a Cloud IDE session</h1>',
+      '<p class="hint">Reconnect to a running or suspended MicroVM, or start a clean session.</p>',
+      error,
+      `<section class="sessions">${sessionCards}</section>`,
+      '<form class="new-session" method="post" action="/session/select">',
+      '<input type="hidden" name="action" value="new">',
+      '<button class="new" type="submit">Start a new MicroVM</button></form>',
+      '</main></body></html>',
+    ].join(''),
+  };
+}
+
 function sessionControlResponse({
   hasSession,
   paused = false,
@@ -462,7 +693,7 @@ function sessionControlResponse({
   if (!hasSession) {
     controls = [
       '<p class="hint">No active Cloud IDE session is associated with this browser.</p>',
-      '<a class="button primary" href="/">Start editor</a>',
+      '<a class="button primary" href="/session/select">Choose a session</a>',
     ].join('');
   } else if (paused) {
     controls = [
@@ -477,6 +708,7 @@ function sessionControlResponse({
       '<form method="post" action="/session/suspend">',
       '<button class="danger" type="submit">Suspend Cloud IDE</button></form>',
       '<a class="button secondary" href="/">Back to editor</a>',
+      '<a class="button secondary" href="/session/select">Switch session</a>',
     ].join('');
   }
 
@@ -515,6 +747,23 @@ function sessionControlResponse({
       controls,
       '</main></body></html>',
     ].join(''),
+  };
+}
+
+function sessionAttachedResponse(sessionId, resuming) {
+  if (resuming) {
+    const response = resumingPageResponse();
+    response.headers['set-cookie'] = [{ key: 'Set-Cookie', value: createMicrovmSessionCookie(sessionId) }];
+    return response;
+  }
+  return {
+    status: '303',
+    statusDescription: 'See Other',
+    headers: {
+      location: [{ key: 'Location', value: '/' }],
+      'set-cookie': [{ key: 'Set-Cookie', value: createMicrovmSessionCookie(sessionId) }],
+      'cache-control': [{ key: 'Cache-Control', value: 'no-store' }],
+    },
   };
 }
 
@@ -628,9 +877,9 @@ function escapeHtml(value) {
     .replaceAll("'", '&#39;');
 }
 
-function redirectToStart(clearCookie = false) {
+function redirectToSessionSelect(clearCookie = false) {
   const headers = {
-    location: [{ key: 'Location', value: '/session/start' }],
+    location: [{ key: 'Location', value: '/session/select' }],
     'cache-control': [{ key: 'Cache-Control', value: 'no-store' }],
   };
   if (clearCookie) {
@@ -661,6 +910,7 @@ function parseCookies(cookieHeader) {
 
 exports.__test = {
   createAccessCookie,
+  createMicrovmSessionCookie,
   escapeHtml,
   isAccessCookieValidForPassword,
   loginPageResponse,
@@ -669,6 +919,8 @@ exports.__test = {
   parseLoginForm,
   postOnlyResponse,
   resumingPageResponse,
+  sessionAttachedResponse,
   sessionControlResponse,
+  sessionSelectionResponse,
   signAccessCookie,
 };
