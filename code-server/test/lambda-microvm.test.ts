@@ -67,7 +67,7 @@ type EdgeTestHelpers = {
     body: string;
   };
   signAccessCookie: (payload: string, password: string) => string;
-  startSession: () => Promise<{ status: string }>;
+  startSession: (requestId?: string) => Promise<{ status: string; headers: Record<string, unknown>; body: string }>;
 };
 
 type EdgeModule = {
@@ -96,6 +96,54 @@ function getEdgeModule(): EdgeModule {
   getEdgeTemplate();
   edgeModule ??= require('../artifact/edge/index.js') as EdgeModule;
   return edgeModule;
+}
+
+type AwsInput = Record<string, unknown>;
+type AwsCall = { name: string; input: AwsInput };
+
+async function withAwsMocks<T>(
+  overrides: Record<string, (input: AwsInput) => unknown>,
+  run: () => Promise<T>,
+): Promise<{ calls: AwsCall[]; result: T }> {
+  const { LambdaMicrovmsClient } = require('../artifact/edge/node_modules/@aws-sdk/client-lambda-microvms');
+  const { DynamoDBClient } = require('../artifact/edge/node_modules/@aws-sdk/client-dynamodb');
+  const { SecretsManagerClient } = require('../artifact/edge/node_modules/@aws-sdk/client-secrets-manager');
+  const calls: AwsCall[] = [];
+  const defaults: Record<string, (input: AwsInput) => unknown> = {
+    PutItemCommand: () => ({}),
+    UpdateItemCommand: () => ({}),
+    DeleteItemCommand: () => ({}),
+    ScanCommand: () => ({ Items: [] }),
+    ListMicrovmsCommand: () => ({ items: [] }),
+    RunMicrovmCommand: () => ({ microvmId: 'mvm-test', endpoint: 'mvm-test.example' }),
+    CreateMicrovmAuthTokenCommand: () => ({ authToken: { 'X-aws-proxy-auth': 'test-token' } }),
+    TerminateMicrovmCommand: () => ({}),
+  };
+  const mockSend = async (...args: unknown[]) => {
+    const command = args[0];
+    if (
+      !command ||
+      typeof command !== 'object' ||
+      !('input' in command) ||
+      !command.input ||
+      typeof command.input !== 'object'
+    ) {
+      throw new Error('Invalid AWS command');
+    }
+    const input = command.input as AwsInput;
+    const name = command.constructor.name;
+    calls.push({ name, input });
+    const respond = overrides[name] ?? defaults[name];
+    if (!respond) throw new Error(`Unexpected AWS command: ${name}`);
+    return respond(input);
+  };
+  const clients = [LambdaMicrovmsClient, DynamoDBClient, SecretsManagerClient];
+  const spies = clients.map((client) => jest.spyOn(client.prototype, 'send').mockImplementation(mockSend));
+  try {
+    return { calls, result: await run() };
+  } finally {
+    for (const spy of spies) spy.mockRestore();
+  }
 }
 
 describe('OMP Cloud IDE infrastructure', () => {
@@ -184,13 +232,19 @@ describe('OMP Cloud IDE infrastructure', () => {
             Resource: 'arn:aws:lambda:ap-northeast-1:123456789012:microvm-image:omp-cloud-ide',
           }),
           Match.objectLike({
-            Action: Match.arrayWith(['lambda:GetMicrovm', 'lambda:SuspendMicrovm', 'lambda:ResumeMicrovm']),
+            Action: Match.arrayWith([
+              'lambda:GetMicrovm',
+              'lambda:SuspendMicrovm',
+              'lambda:ResumeMicrovm',
+              'lambda:TerminateMicrovm',
+            ]),
             Effect: 'Allow',
             Resource: [
               'arn:aws:lambda:ap-northeast-1:123456789012:microvm-image:omp-cloud-ide',
               'arn:aws:lambda:ap-northeast-1:123456789012:microvm:*',
             ],
           }),
+          Match.objectLike({ Action: 'lambda:ListMicrovms', Effect: 'Allow', Resource: '*' }),
           Match.objectLike({
             Action: 'iam:PassRole',
             Effect: 'Allow',
@@ -329,37 +383,380 @@ describe('OMP Cloud IDE infrastructure', () => {
 
   test('passes a MicroVM lifetime deadline no later than the real one to the run hook', async () => {
     const helpers = getEdgeModule().__test;
-    const edgeDir = path.join(__dirname, '..', 'artifact', 'edge');
-    type Send = (command: { constructor: { name: string }; input: Record<string, unknown> }) => Promise<unknown>;
-    const mvmPrototype = require(require.resolve('@aws-sdk/client-lambda-microvms', { paths: [edgeDir] }))
-      .LambdaMicrovmsClient.prototype as { send: Send };
-    const ddbPrototype = require(require.resolve('@aws-sdk/client-dynamodb', { paths: [edgeDir] })).DynamoDBClient
-      .prototype as { send: Send };
-
-    let runInput: Record<string, unknown> | undefined;
     let runCalledAt = 0;
-    const mvmSend = jest.spyOn(mvmPrototype, 'send').mockImplementation(async (command) => {
-      if (command.constructor.name === 'RunMicrovmCommand') {
-        runCalledAt = Date.now();
-        runInput = command.input;
-        return { microvmId: 'mvm-test', endpoint: 'mvm-test.example' };
-      }
-      return { authToken: { 'X-aws-proxy-auth': 'test-token' } };
-    });
-    const ddbSend = jest.spyOn(ddbPrototype, 'send').mockResolvedValue({});
     const startedBefore = Date.now();
-    try {
-      expect((await helpers.startSession()).status).toBe('200');
-    } finally {
-      mvmSend.mockRestore();
-      ddbSend.mockRestore();
-    }
+    const { calls } = await withAwsMocks(
+      {
+        RunMicrovmCommand: () => {
+          runCalledAt = Date.now();
+          return { microvmId: 'mvm-test', endpoint: 'mvm-test.example' };
+        },
+      },
+      async () => expect((await helpers.startSession()).status).toBe('200'),
+    );
 
-    const payload = JSON.parse(String(runInput?.runHookPayload));
+    const payload = JSON.parse(String(calls.find((c) => c.name === 'RunMicrovmCommand')?.input.runHookPayload));
     expect(payload.sessionId).toMatch(/^[0-9a-f-]{36}$/);
     // The service starts its 8-hour clock no earlier than the RunMicrovm call.
     expect(payload.expiresAt).toBeGreaterThanOrEqual(startedBefore + 28_800_000);
     expect(payload.expiresAt).toBeLessThanOrEqual(runCalledAt + 28_800_000);
+  });
+
+  test('terminates a new MicroVM that could not be registered', async () => {
+    const helpers = getEdgeModule().__test;
+    const { calls } = await withAwsMocks(
+      {
+        RunMicrovmCommand: () => ({ microvmId: 'mvm-orphan', endpoint: 'mvm-orphan.example' }),
+        CreateMicrovmAuthTokenCommand: () => {
+          throw Object.assign(new Error('throttled'), { name: 'ThrottlingException' });
+        },
+      },
+      async () => {
+        const response = await helpers.startSession();
+        expect(response.status).toBe('502');
+        // The browser must not be bound to a session that has no MicroVM.
+        expect(response.headers['set-cookie']).toBeUndefined();
+      },
+    );
+    expect(calls.filter((c) => c.name === 'TerminateMicrovmCommand').map((c) => c.input.microvmIdentifier)).toEqual([
+      'mvm-orphan',
+    ]);
+  });
+
+  test('shows a MicroVM whose compensating termination failed without binding a cookie', async () => {
+    const { result } = await withAwsMocks(
+      {
+        RunMicrovmCommand: () => ({ microvmId: 'mvm-orphan', endpoint: 'mvm-orphan.example' }),
+        CreateMicrovmAuthTokenCommand: () => {
+          throw new Error('registration failed');
+        },
+        TerminateMicrovmCommand: () => {
+          throw new Error('termination failed');
+        },
+        ListMicrovmsCommand: () => ({
+          items: [
+            {
+              microvmId: 'mvm-orphan',
+              imageArn: 'arn:aws:lambda:ap-northeast-1:123456789012:microvm-image:omp-cloud-ide',
+              state: 'RUNNING',
+            },
+          ],
+        }),
+      },
+      () => getEdgeModule().__test.startSession(),
+    );
+    expect(result.body).toContain('mvm-orphan');
+    expect(result.headers['set-cookie']).toBeUndefined();
+  });
+
+  test('reconciles all session and MicroVM pages before reporting untracked machines', async () => {
+    const edge = getEdgeModule();
+    const password = 'test-only-password';
+    const accessCookie = edge.__test.createAccessCookie(password).split(';', 1)[0];
+    const imageArn = 'arn:aws:lambda:ap-northeast-1:123456789012:microvm-image:omp-cloud-ide';
+    const { result } = await withAwsMocks(
+      {
+        GetSecretValueCommand: () => ({ SecretString: password }),
+        ScanCommand: (input) =>
+          input.ExclusiveStartKey
+            ? { Items: [{ sessionId: { S: 'tracked' }, microvmId: { S: 'mvm-tracked' } }] }
+            : { Items: [], LastEvaluatedKey: { sessionId: { S: 'last' } } },
+        GetMicrovmCommand: () => ({ state: 'RUNNING', imageVersion: '1' }),
+        ListMicrovmsCommand: (input) =>
+          input.nextToken
+            ? { items: [{ microvmId: 'mvm-orphan', imageArn, state: 'RUNNING' }] }
+            : { items: [{ microvmId: 'mvm-tracked', imageArn, state: 'RUNNING' }], nextToken: 'next' },
+      },
+      () =>
+        edge.handler({
+          Records: [
+            {
+              cf: {
+                request: {
+                  method: 'GET',
+                  uri: '/session/select',
+                  headers: {
+                    cookie: [{ key: 'Cookie', value: accessCookie }],
+                  },
+                },
+              },
+            },
+          ],
+        }),
+    );
+    expect(result.body).toContain('mvm-tracked');
+    expect(result.body).toContain('mvm-orphan');
+    expect(result.body?.match(/<strong>mvm-tracked<\/strong>/g)).toHaveLength(1);
+  });
+
+  test('starts one MicroVM for a double-submitted start form', async () => {
+    const helpers = getEdgeModule().__test;
+    const requestId = '6f1c2d3e-4b5a-4c6d-8e7f-9a0b1c2d3e4f';
+    const claimed = new Set<string>();
+    const { calls } = await withAwsMocks(
+      {
+        PutItemCommand: (input) => {
+          const item = input.Item as { sessionId: { S: string }; microvmId?: unknown };
+          if (input.ConditionExpression && claimed.has(item.sessionId.S)) {
+            throw Object.assign(new Error('exists'), { name: 'ConditionalCheckFailedException' });
+          }
+          claimed.add(item.sessionId.S);
+          return {};
+        },
+      },
+      async () => {
+        expect((await helpers.startSession(requestId)).status).toBe('200');
+        expect((await helpers.startSession(requestId)).status).toBe('409');
+      },
+    );
+    expect(calls.filter((c) => c.name === 'RunMicrovmCommand')).toHaveLength(1);
+    expect(JSON.parse(String(calls.find((c) => c.name === 'RunMicrovmCommand')?.input.runHookPayload)).sessionId).toBe(
+      requestId,
+    );
+  });
+
+  test('does not forward an expired proxy token when renewal fails', async () => {
+    const edge = getEdgeModule();
+    const password = 'test-only-password';
+    const accessCookie = edge.__test.createAccessCookie(password).split(';', 1)[0];
+    const sessionId = '7d041485-dff5-4033-bdbc-a921757e217b';
+    type Forwarded = { status?: string; headers: Record<string, Array<{ value: string }>> };
+    const requestWithTokenExpiry = async (tokenExpiry: number) =>
+      (
+        await withAwsMocks(
+          {
+            GetSecretValueCommand: () => ({ SecretString: password }),
+            GetItemCommand: () => ({
+              Item: {
+                sessionId: { S: sessionId },
+                microvmId: { S: 'mvm-test' },
+                endpoint: { S: 'mvm-test.example' },
+                token: { S: 'old-token' },
+                tokenExpiry: { N: String(tokenExpiry) },
+                paused: { BOOL: false },
+              },
+            }),
+            CreateMicrovmAuthTokenCommand: () => {
+              throw Object.assign(new Error('down'), { name: 'InternalServerException' });
+            },
+          },
+          () =>
+            edge.handler({
+              Records: [
+                {
+                  cf: {
+                    request: {
+                      method: 'GET',
+                      uri: '/',
+                      headers: {
+                        accept: [{ key: 'Accept', value: 'text/html' }],
+                        cookie: [{ key: 'Cookie', value: `${accessCookie}; mvm-session=${sessionId}` }],
+                      },
+                    },
+                  },
+                },
+              ],
+            }),
+        )
+      ).result as Forwarded;
+
+    expect((await requestWithTokenExpiry(Date.now() - 1_000)).status).toBe('503');
+    // Still inside the refresh window: the old token keeps working, so forward it.
+    const forwarded = await requestWithTokenExpiry(Date.now() + 5 * 60_000);
+    expect(forwarded.headers['x-aws-proxy-auth'][0].value).toBe('old-token');
+  });
+
+  test('requires an exact second confirmation, then cleans up only the terminated session', async () => {
+    const edge = getEdgeModule();
+    const password = 'test-only-password';
+    const accessCookie = edge.__test.createAccessCookie(password).split(';', 1)[0];
+    const sessionId = '7d041485-dff5-4033-bdbc-a921757e217b';
+    const microvmId = 'microvm-40287cea-cb68-32ac-a059-02188a827bff';
+    const imageArn = 'arn:aws:lambda:ap-northeast-1:123456789012:microvm-image:omp-cloud-ide';
+    let state = 'RUNNING';
+    let rowExists = true;
+    const row = { sessionId: { S: sessionId }, microvmId: { S: microvmId }, paused: { BOOL: true } };
+    const post = (action: string, confirmation = '') =>
+      edge.handler({
+        Records: [
+          {
+            cf: {
+              request: {
+                method: 'POST',
+                uri: '/session/select',
+                headers: { cookie: [{ key: 'Cookie', value: `${accessCookie}; mvm-session=${sessionId}` }] },
+                body: {
+                  encoding: 'text',
+                  data: new URLSearchParams({ action, sessionId, microvmId, confirmation }).toString(),
+                },
+              },
+            },
+          },
+        ],
+      });
+    const { calls } = await withAwsMocks(
+      {
+        GetSecretValueCommand: () => ({ SecretString: password }),
+        GetItemCommand: () => ({ Item: rowExists ? row : undefined }),
+        GetMicrovmCommand: () => ({ microvmId, imageArn, state }),
+        ScanCommand: () => ({ Items: rowExists ? [row] : [] }),
+        TerminateMicrovmCommand: () => {
+          state = 'TERMINATING';
+          return {};
+        },
+        DeleteItemCommand: () => {
+          rowExists = false;
+          return {};
+        },
+      },
+      async () => {
+        const confirmation = await post('terminate-confirm');
+        expect(confirmation.body).toContain(`Type the MicroVM ID to confirm`);
+        expect(confirmation.body).toContain(microvmId);
+        expect((await post('terminate', 'wrong-id')).body).toContain('Type the exact MicroVM ID');
+        const result = await post('terminate', microvmId);
+        expect(result.body).toContain('Termination requested');
+        expect(result.headers['set-cookie']).toEqual([
+          { key: 'Set-Cookie', value: expect.stringContaining('mvm-session=;') },
+        ]);
+        expect(rowExists).toBe(true);
+        state = 'TERMINATED';
+        const chooser = await edge.handler({
+          Records: [
+            {
+              cf: {
+                request: {
+                  method: 'GET',
+                  uri: '/session/select',
+                  headers: { cookie: [{ key: 'Cookie', value: accessCookie }] },
+                },
+              },
+            },
+          ],
+        });
+        expect(chooser.body).not.toContain(microvmId);
+        expect(rowExists).toBe(false);
+      },
+    );
+    expect(calls.filter((call) => call.name === 'TerminateMicrovmCommand')).toHaveLength(1);
+    expect(calls.find((call) => call.name === 'DeleteItemCommand')?.input.ConditionExpression).toBe('microvmId = :id');
+  });
+
+  test('keeps an uncertain termination blocked and rejects untracked termination requests', async () => {
+    const edge = getEdgeModule();
+    const password = 'test-only-password';
+    const accessCookie = edge.__test.createAccessCookie(password).split(';', 1)[0];
+    const sessionId = '7d041485-dff5-4033-bdbc-a921757e217b';
+    const microvmId = 'microvm-11111111-2222-4333-8444-555555555555';
+    const row = {
+      sessionId: { S: sessionId },
+      microvmId: { S: microvmId },
+      paused: { BOOL: false },
+      terminationPending: { BOOL: false },
+    };
+    const invoke = (method: string, uri: string, data?: URLSearchParams) =>
+      edge.handler({
+        Records: [
+          {
+            cf: {
+              request: {
+                method,
+                uri,
+                headers: { cookie: [{ key: 'Cookie', value: `${accessCookie}; mvm-session=${sessionId}` }] },
+                body: data ? { encoding: 'text', data: data.toString() } : undefined,
+              },
+            },
+          },
+        ],
+      });
+    const { calls } = await withAwsMocks(
+      {
+        GetSecretValueCommand: () => ({ SecretString: password }),
+        GetItemCommand: () => ({ Item: row }),
+        ScanCommand: () => ({ Items: [row] }),
+        GetMicrovmCommand: () => ({
+          microvmId,
+          imageArn: 'arn:aws:lambda:ap-northeast-1:123456789012:microvm-image:omp-cloud-ide',
+          state: 'RUNNING',
+        }),
+        UpdateItemCommand: () => {
+          row.terminationPending.BOOL = true;
+          row.paused.BOOL = true;
+          return {};
+        },
+        TerminateMicrovmCommand: () => {
+          throw Object.assign(new Error('lost response'), { name: 'TimeoutError' });
+        },
+      },
+      async () => {
+        const untracked = await invoke(
+          'POST',
+          '/session/select',
+          new URLSearchParams({ action: 'terminate', microvmId, confirmation: microvmId }),
+        );
+        expect(untracked.status).toBe('400');
+        const result = await invoke(
+          'POST',
+          '/session/select',
+          new URLSearchParams({ action: 'terminate', sessionId, microvmId, confirmation: microvmId }),
+        );
+        expect(result.status).toBe('502');
+        expect(result.body).toContain('Termination outcome is unknown');
+        expect(result.headers['set-cookie']).toBeUndefined();
+        expect((await invoke('GET', '/session/control')).body).not.toContain('Resume editor');
+        expect((await invoke('GET', '/')).status).toBe('200');
+        const chooser = await invoke('GET', '/session/select');
+        expect(chooser.body).toContain('Termination pending; do not reconnect.');
+        expect(chooser.body).not.toContain('name="action" value="attach"');
+      },
+    );
+    expect(calls.filter((call) => call.name === 'TerminateMicrovmCommand')).toHaveLength(1);
+    expect(row.terminationPending.BOOL).toBe(true);
+  });
+
+  test('forwards editor cookies but never forwards Edge access or session cookies', async () => {
+    const edge = getEdgeModule();
+    const password = 'test-only-password';
+    const accessCookie = edge.__test.createAccessCookie(password).split(';', 1)[0];
+    const sessionId = '7d041485-dff5-4033-bdbc-a921757e217b';
+    const forward = (other = '') =>
+      edge.handler({
+        Records: [
+          {
+            cf: {
+              request: {
+                method: 'GET',
+                uri: '/api/editor',
+                headers: {
+                  cookie: [
+                    { key: 'Cookie', value: accessCookie },
+                    { key: 'Cookie', value: `mvm-session=${sessionId}${other}` },
+                  ],
+                },
+              },
+            },
+          },
+        ],
+      });
+    await withAwsMocks(
+      {
+        GetSecretValueCommand: () => ({ SecretString: password }),
+        GetItemCommand: () => ({
+          Item: {
+            microvmId: { S: 'mvm-test' },
+            endpoint: { S: 'mvm-test.example' },
+            token: { S: 'valid-token' },
+            tokenExpiry: { N: String(Date.now() + 60 * 60_000) },
+          },
+        }),
+      },
+      async () => {
+        const forwarded = await forward('; vscode-web=foo=bar; theme=dark');
+        expect(forwarded.headers.cookie).toEqual([{ key: 'Cookie', value: 'vscode-web=foo=bar; theme=dark' }]);
+        expect(forwarded.headers['x-aws-proxy-auth']).toEqual([{ key: 'X-aws-proxy-auth', value: 'valid-token' }]);
+        expect((await forward()).headers.cookie).toBeUndefined();
+      },
+    );
   });
 
   test('lifecycle.py persistence and run hook behave as specified (test/lifecycle_test.py)', () => {

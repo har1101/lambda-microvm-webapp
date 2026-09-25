@@ -1,6 +1,6 @@
 # OMP Cloud IDE の接続・セッション管理
 
-この文書は、ブラウザからLambda MicroVM内のcode-serverへ接続する仕組みと、MicroVMセッションを新規作成・再接続・一時停止する際の状態管理を説明する。
+この文書は、ブラウザからLambda MicroVM内のcode-serverへ接続する仕組みと、MicroVMセッションの新規作成・再接続・一時停止・終了の状態管理を説明する。
 
 ## 全体構成
 
@@ -54,7 +54,7 @@ createdAt       セッション作成時刻
 ttl             DynamoDBレコードの自動削除時刻
 ```
 
-セッション選択画面では`token`や`endpoint`を表示しない。DynamoDBからIDと表示用メタデータだけをScanし、各`microvmId`を`GetMicrovm`で照合する。`TERMINATED`、`TERMINATING`、存在しないMicroVMは候補から除外する。
+セッション選択画面では`token`や`endpoint`を表示しない。DynamoDBの全ページを25件ずつScanし、各`microvmId`を`GetMicrovm`で照合する。`TERMINATING`は候補から除外し、`TERMINATED`または存在しないMicroVMの行は対象ID一致を条件に削除する。`ListMicrovms`でも対象Imageの全ページを照合し、セッション行がない稼働中MicroVMを「Untracked MicroVMs」として表示する。
 
 ## ログインから接続まで
 
@@ -64,7 +64,7 @@ ttl             DynamoDBレコードの自動削除時刻
 
 ### 2. セッション選択
 
-`GET /session/select`はDynamoDBを任意の最大25件Scanし、各候補を`GetMicrovm`で照合して状態付きで一覧表示する。
+`GET /session/select`はDynamoDBを25件ずつ全ページScanし、各候補を`GetMicrovm`で照合して状態付きで一覧表示する。
 
 - `RUNNING`: `Connect`
 - `SUSPENDED`または明示停止中: `Resume and connect`
@@ -74,9 +74,9 @@ ttl             DynamoDBレコードの自動削除時刻
 
 ### 3-A. 新規セッション
 
-`POST /session/select`で`action=new`を送ると、Lambda@Edgeが`RunMicrovm`を実行する。その後、port 8080だけを許可したMicroVM auth tokenを作成し、DynamoDBへレコードを保存して`mvm-session`を発行する。
+`POST /session/select`の`action=new`には画面に埋め込んだrequest UUIDを付ける。Lambda@EdgeはまずDynamoDBへ条件付き`PutItem`で短命の起動claimを確保し、同じフォームの二重送信では2台目を起動しない。次に`RunMicrovm`を実行し、port 8080だけを許可したauth tokenを作成してセッション行を保存し、最後に`mvm-session`を発行する。旧`/session/start`は起動せず選択画面へ戻す。
 
-この3段階はtransactionではない。`RunMicrovm`成功後にtoken作成またはDynamoDB保存が失敗すると、一覧から見えないorphan MicroVMが残り得る。現状は補償Terminateとidempotencyが未実装である。
+この操作はtransactionではない。`RunMicrovm`後のtoken作成や行保存が失敗した場合は、作成したIDに対して`TerminateMicrovm`を要求する。補償失敗や不明な結果で残った稼働中MicroVMは、選択画面の`ListMicrovms`照合で「Untracked MicroVMs」へ表示する。ただし起動中の一時的な不整合と区別できないため、untrackedの画面内Terminateは設けない。IDと状態を確認し、AWS API/Consoleで手動終了する。起動claimは15分のTTLを持ち、行が完成するまでは接続候補にならない。
 
 ### 3-B. 既存セッション
 
@@ -98,9 +98,10 @@ ttl             DynamoDBレコードの自動削除時刻
 3. proxy tokenの期限が近ければ`CreateMicrovmAuthToken`で更新する。
 4. CloudFront originをDynamoDBの`endpoint`へ変更する。
 5. `Host`、`Origin`、`X-aws-proxy-auth`をMicroVM endpoint用に設定する。
-6. HTTPSでAWS管理endpointへ転送する。
+6. Edge専用のaccess/session Cookieだけを`Cookie` headerから除去し、code-server固有Cookieを保持する。
+7. HTTPSでAWS管理endpointへ転送する。
 
-現状は手順1で検証した`omp-cloud-ide-auth`と`mvm-session`をrequestの`Cookie` headerから除去せず、そのままcode-server originへ転送する。`HttpOnly`でもorigin serverにはCookieが届き、code-server proxyが内側backendへ引き継ぐ場合はserver-side appから見える可能性がある。Edge専用Cookieだけを検証後にstripし、code-server固有Cookieは維持する改善と、そのE2E確認が必要である。
+access/session Cookieは認証判定には使うが、code-server originには渡さない。`HttpOnly`だけではorigin serverからCookieを隠せないためである。ただし同一CloudFront originの`/proxy/<port>/`アプリは制御画面へリクエストでき、VM内の同一UIDのコードは認証ファイルも読める。Cookie stripはこれらを隔離する仕組みではない。
 
 MicroVM内ではcode-serverが`0.0.0.0:8080`で待ち受け、独自認証は無効になっている。手前のCloudFrontログインとMicroVM proxy tokenの二段階を通らなければ到達できないためである。
 
@@ -112,19 +113,45 @@ code-serverの`/proxy/3000/`は、MicroVMの3000番を外部公開している�
 
 `POST /session/suspend`では、先にDynamoDBの`paused=true`を保存してから`SuspendMicrovm`を呼ぶ。これにより、code-serverのWebSocket再接続が意図せずMicroVMを自動Resumeすることを防ぐ。
 
+SuspendするとMicroVM内の`/suspend` hookが呼ばれ、OMPとGitHubの認証状態をS3へ保存する(後述の「Suspend/Terminate時の認証状態保存」)。
+
 ### Resume
 
-`POST /session/resume`またはセッション選択画面の`Resume and connect`が`ResumeMicrovm`を呼ぶ。Resume後は`paused=false`へ戻す。
+`POST /session/resume`またはセッション選択画面の`Resume and connect`が`ResumeMicrovm`を呼ぶ。Resume後は`paused=false`へ戻す。MicroVM内の`/resume` hookは即時200を返すだけで、5分ごとの定期保存はResume後もそのまま続く。
 
-### Terminate
+### 明示Terminate
+
+セッション一覧または現在の制御画面から`Terminate permanently...`を押すと、対象MicroVM ID・状態を`GetMicrovm`で確認した上で確認画面が出る。対象Image ARNを再検証し、セッション行のID変更も拒否する。MicroVM ID全文を入力してPOSTすると、DynamoDBに`terminationPending=true`と`paused=true`を書き、エディタ通信と再接続を止めてから`TerminateMicrovm`を要求する。受理が確認できた場合、現在選択中のセッションなら`mvm-session`を失効させ、access Cookieは残す。
+
+APIの応答が失われても終了が受理された可能性があるので、結果が不明な場合も通信遮断を維持し、選択画面から同じ対象の再試行を案内する。`TERMINATING`中はDynamoDB行を保持し、`TERMINATED`またはNotFoundを確認した時点で`microvmId`一致を条件にその行だけを削除する。選択画面を再表示した際にも終了済み行を掃除する。`/terminate` hookは認証状態を保存するがfail-openであり、保存成功を保証しない。終了前にstatus barを確認し、作業をcommit/pushする。
+
+#### 終了前に残すものと寿命
 
 TerminateされたMicroVMのローカルディスクとRAM状態は戻せない。S3へ保存されるのはOMPとGitHubの認証ファイルだけで、`/home/vscode/workspace`は保存対象ではない。未完了の実装を残す場合は、Terminate前にGitへcommit・pushする必要がある。
 
 `maximumDurationInSeconds=28800`はRUNNINGとSUSPENDEDを合わせたMicroVMの総寿命である。Suspend保持の設定が別に8時間あっても、起動から8時間を超えて同じMicroVMへ戻れるという意味ではない。
 
+### Suspend/Terminate時の認証状態保存
+
+`/suspend`と`/terminate` hookは、`lifecycle.py`が40秒のdeadline(Image側のhook timeoutは45秒)内でOMPとGitHubの認証ファイルをS3へ保存する。各AWS CLI呼び出しは`min(25秒, 残り時間)`で打ち切るため、S3/KMSが応答しなくてもhookがtimeoutを超えて止まることはない。
+
+- sha256が前回保存と同じファイルは送らない。
+- 保存は`aws s3api put-object`で、`/run`の復元時に記録したETagと一致するときだけ書くETag楽観ロックである(S3に未作成なら`--if-none-match '*'`)。別MicroVMがより新しい状態を書いていれば上書きせず、`認証競合`として記録する。
+- `/run`で復元に失敗したkeyと競合したkeyは自動保存しない。未ログインのファイルでS3の正常な状態を上書きしないためである。
+- hookはfail-openで常に200を返し、失敗してもSuspend/Terminateを止めない。代わりに結果を`~/.cache/omp-cloud-ide/auth-sync.json`へ記録する。
+- 定期保存が実行中でも、hookが待っていれば定期保存のAWS呼び出しを中断してlockを譲らせる。
+
+記録した結果はcode-serverのstatus barに`認証 N分前`、`認証保存失敗`、`認証復元失敗`、`認証競合`として表示され、クリックすると`persist-auth-state`で手動保存する。実行中MicroVMのstdout(`[lifecycle]`行)はCloudWatch Logsへ届かないため、保存結果はログではなくstatus barか`auth-sync.json`で確認する。Terminate後は確認できないので、Terminate前にstatus barを確認する。
+
+2026-09-25の新規VM E2Eでは、1台で`omp/install-id`と`github/hosts.yml`が`認証復元失敗`になり、後続の2台では成功した。原因は未特定。失敗したVMはそのkeyの自動保存を止めるので、利用開始時にstatus barを確認し、必要なら再ログイン後に明示的に`persist-auth-state`を実行する。
+
 ### 残り寿命の表示
 
-Edgeは`RunMicrovm`直前に`expiresAt = now + 8時間`を計算して`runHookPayload`へ入れ、`/run` hookがMicroVM内へ記録する。code-serverのstatus barはこの値から`残り H:MM`を表示し、終了前に未push変更の確認を促す。セッション選択画面は`GetMicrovm`の`startedAt + maximumDurationInSeconds`から`Ends ... (Xh Ym left)`を表示する。どちらもこの機能のdeploy後に起動したMicroVMから有効で、それ以前のVMは`残り時間不明`になる。
+Edgeは`RunMicrovm`直前に`expiresAt = now + 8時間`を計算して`runHookPayload`へ入れ、`/run` hookがMicroVM内の`~/.cache/omp-cloud-ide/session.json`へ記録する。実際の期限より遅くならないよう、`RunMicrovm`より前の時刻で計算している。VMは自分の起動時刻を知る手段を持たないため、期限はEdgeから渡す。`runHookPayload`には`sessionId`も入るが、bearer Cookie値なのでVM内へは保存しない。
+
+code-serverのstatus barはこの値から`残り H:MM`を表示し、残り30分以下で黄色、10分以下で赤にする。残り60/15/5分を過ぎるたびに1回だけ通知し、commit/pushを促す(遅れて開いた場合は最も近い閾値だけ)。クリックするとSource Controlを開く。MicroVMの時計はNTP同期されないため、S3 regional endpointの`Date` headerで毎分とwindow focus時に補正する。実機では3分のSuspend→Resume後も補正は-1秒で、ゲスト時計の遅れは観測されなかった。
+
+セッション選択画面は`GetMicrovm`の`startedAt + maximumDurationInSeconds`から`Ends ... (Xh Ym left)`を表示する。どちらもこの機能のdeploy後に起動したMicroVMから有効で、それ以前のVMは`残り時間不明`になる。
 
 ## 今回修正した障害の原因
 
@@ -152,10 +179,13 @@ Suspendからの自動Resume中にも短時間の`502/504`が発生し得るた�
 
 ## 制約
 
-- 現在は単一ユーザー用なので、セッション一覧はDynamoDB Scanの任意の最大25件を確認する。新しい順は保証せず、最大25回の`GetMicrovm`を並行実行する。
-- DynamoDB TTL削除は即時ではないが、終了済みMicroVMはAPI照合で一覧から除外する。
+- 現在は単一ユーザー用なので、選択画面はDynamoDBと`ListMicrovms`をページングして全件確認する。`GetMicrovm`は候補の数だけ並列実行されるため、件数が多いとEdgeの30秒timeoutやAPI throttlingの恐れがある。
+- DynamoDB TTL削除は即時ではないが、終了済みMicroVMの行は一覧照合時に条件付きで削除する。`TERMINATING`の行は終了確認まで保持する。
 - MicroVMのRUNNING+SUSPENDED総寿命8時間を超えてTerminateされた場合は再接続できない。
 - セッション選択はMicroVMのローカル作業状態を永続化する機能ではない。生存している同一MicroVMへ接続し直す機能である。
 - proxy token更新は分散Edgeからの条件なし更新であり、並行refreshの競合は未検証である。
 - origin-responseはHTMLの`502/504`をpath非限定でselectorへ戻すため、proxy先アプリ自身のHTMLエラーをMicroVM障害と誤認し得る。
-- Suspend/Terminate時のS3保存はbest-effortで、保存失敗が利用者へ表示されない。認証状態が重要な場合はlifecycle logとS3更新時刻も確認する。
+- Suspend/Terminate時のS3保存はfail-openで、失敗してもSuspend/Terminateは止まらない。結果はVM内の`auth-sync.json`とstatus barにしか残らず、セッション選択画面やDynamoDBには表示されない。
+- 手動保存がlockを握っている間(最大約2分)にSuspendされると、`/suspend` hookは待ちきれずに保存をskipし得る。
+- `認証競合`になったMicroVMは、別MicroVMが保存した新しい認証を取り込み直せない。ログインし直すか、新規MicroVMを起動して復元する。このVMの認証を正とする場合だけ`persist-auth-state --overwrite`で上書きする。
+- ETag楽観ロック導入前のImageで起動したMicroVMは、条件なしでS3へ書く。

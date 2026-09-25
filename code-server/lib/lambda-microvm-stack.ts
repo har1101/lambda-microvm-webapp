@@ -200,11 +200,19 @@ export class OmpCloudIdeEdgeStack extends cdk.Stack {
     );
     edgeRole.addToPolicy(
       new iam.PolicyStatement({
-        actions: ['lambda:GetMicrovm', 'lambda:SuspendMicrovm', 'lambda:ResumeMicrovm'],
+        actions: ['lambda:GetMicrovm', 'lambda:SuspendMicrovm', 'lambda:ResumeMicrovm', 'lambda:TerminateMicrovm'],
         // Current MicroVM lifecycle authorization can evaluate the source
         // image while running and the instance ARN while suspended. Keep both
         // scopes account-local instead of granting these actions on "*".
         resources: [imageArn, microvmInstanceArn],
+      }),
+    );
+    edgeRole.addToPolicy(
+      new iam.PolicyStatement({
+        // Reconciles session rows against live MicroVMs. ListMicrovms has no
+        // resource-level permission; the call itself filters by imageIdentifier.
+        actions: ['lambda:ListMicrovms'],
+        resources: ['*'],
       }),
     );
     edgeRole.addToPolicy(
@@ -219,7 +227,14 @@ export class OmpCloudIdeEdgeStack extends cdk.Stack {
         resources: [executionRoleArn],
       }),
     );
-    table.grant(edgeRole, 'dynamodb:GetItem', 'dynamodb:PutItem', 'dynamodb:Scan', 'dynamodb:UpdateItem');
+    table.grant(
+      edgeRole,
+      'dynamodb:GetItem',
+      'dynamodb:PutItem',
+      'dynamodb:Scan',
+      'dynamodb:UpdateItem',
+      'dynamodb:DeleteItem',
+    );
     accessPassword.grantRead(edgeRole);
     edgeRole.addToPolicy(
       new iam.PolicyStatement({

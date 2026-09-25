@@ -2,7 +2,7 @@
 
 最終更新: 2026-09-25
 対象: `code-server/`配下の個人用OMP Cloud IDE実装
-基準コミット: `6c46d65`以降
+基準: 2026-09-25時点の実装とデプロイ検証
 
 この文書は、現時点で何が実装・検証済みか、何が部分実装または未実装か、次にどの改善を行うべきかを独立して判断できるようにまとめたものである。
 
@@ -48,11 +48,11 @@ OMPとGitHubの認証状態はKMS暗号化されたS3へ保存される。ワー
 | CloudFront | 実装・検証済み | HTTPS入口、cache無効、HTTP/2・HTTP/3 |
 | Lambda@Edge origin-request | 実装・検証済み | 認証、セッション管理、origin差し替え、token付与 |
 | Lambda@Edge origin-response | 実装・検証済み | 一時的`502`/`504`から選択画面へ復帰 |
-| DynamoDBセッションテーブル | 実装・検証済み | PAY_PER_REQUEST、TTL、最大25件Scan |
+| DynamoDBセッションテーブル | 実装・検証済み | PAY_PER_REQUEST、TTL。選択画面は25件ずつ全ページScan |
 | Secrets Managerアクセスパスワード | 実装・検証済み | 32文字自動生成、Edgeが実行時取得 |
-| S3認証状態Bucket | 実装済み | KMS、Versioning、Block Public Access、RETAIN。保存結果通知はbest-effort |
+| S3認証状態Bucket | 実装・検証済み | KMS、Versioning、Block Public Access、RETAIN。非現行Version lifecycleあり。実行Roleと実bucketでETag条件付き書き込みを確認済み |
 | KMS Key rotation | 実装済み | rotation有効、RETAIN |
-| MicroVM CloudWatch Logs | 実装済み | 専用Log Group、1週間保持、削除保護、RETAIN |
+| MicroVM CloudWatch Logs | 部分実装 | 専用Log Group、1週間保持、削除保護、RETAIN。ただし届くのはImage build/検証用VMの出力だけで、実行中MicroVMのstdout(`[lifecycle]`行など)は届かない |
 | Edge CloudWatch Logs | 部分実装 | 元Functionは731日保持・RETAIN、複製先regional logの保持/集約は未管理 |
 | カスタムドメイン/ACM | 未実装 | CloudFront標準ドメインを使用 |
 | WAF/レート制限 | 未実装 | ログイン試行制限なし |
@@ -75,7 +75,7 @@ OMPとGitHubの認証状態はKMS暗号化されたS3へ保存される。ワー
 | ログイン試行ロック | 未実装 | brute-force防止なし |
 | ログアウト/全Cookie失効UI | 未実装 | 手動Cookie削除またはパスワードrotation |
 | 状態変更request分離 | 未実装 | proxyアプリとcontrolが同一origin。SameSiteだけでは同一originコードを防げない |
-| Edge専用Cookieのorigin転送防止 | 未実装 | 認証後もaccess/session Cookieをcode-server originへ転送 |
+| Edge専用Cookieのorigin転送防止 | 実装・検証済み | access/session Cookieは認証後にorigin-requestから除去し、code-server固有Cookieを保持。実VMの`/proxy/3000/headers`でEdge Cookieが届かないことを確認 |
 | 未信頼repository隔離 | 未実装 | Workspace Trust無効、同一UIDからOAuth/AWS資格情報とInternet egressを利用可能 |
 | DDBの顧客管理KMS Key | 未実装 | AWS所有キーによるデフォルト暗号化に依存 |
 
@@ -83,19 +83,19 @@ OMPとGitHubの認証状態はKMS暗号化されたS3へ保存される。ワー
 
 | 項目 | 状態 | 現状 |
 | --- | --- | --- |
-| 新規MicroVM起動 | 部分実装 | 明示POSTのみ。後続API失敗時のorphan補償なし |
+| 新規MicroVM起動 | 実装・検証済み | 明示POST、UUIDの条件付きclaimで二重POSTを409として抑止。登録失敗は補償Terminateを要求 |
 | 既存セッション一覧 | 実装・検証済み | 終了済み以外を表示。PENDING/SUSPENDING/UNKNOWNのUXは未整備 |
 | 既存RUNNINGへ再接続 | 実装・検証済み | session Cookie再発行 |
 | 既存SUSPENDEDのResume | 実装・検証済み | `ResumeMicrovm`後に同じsessionへ接続 |
 | 明示Suspend | 実装・検証済み | status bar→control page→POST |
 | 再接続による意図しないResume防止 | 実装・検証済み | DDB `paused`で通常通信を遮断 |
 | 一時的502/504からの復旧 | 実装・検証済み | Cookie維持、一覧へ戻す |
-| token自動更新 | 実装済み | 1時間token、15分前更新 |
-| セッションTerminate UI | 未実装 | AWS API/Console等で手動 |
+| token自動更新 | 実装済み | 1時間token、15分前更新。更新失敗時、旧tokenが失効済みなら503で止める |
+| セッションTerminate UI | 実装・検証済み | 追跡中の行だけ選択画面・制御画面からID再入力で終了。曖昧な失敗は遮断を維持し、終了確認後に対象DDB行を削除 |
 | セッション名・用途ラベル | 未実装 | MicroVM IDと作成時刻のみ |
-| 一覧ページング | 未実装 | Scanは最大25件 |
-| 一覧の負荷制御 | 未実装 | 最大25並列`GetMicrovm`、bounded concurrency/retry/cacheなし |
-| stale DDB行の即時削除 | 部分実装 | 一覧から除外するがTTL削除待ち |
+| 一覧ページング | 実装済み | DDB Scanと`ListMicrovms`を全ページ照合。個人用のため件数上限・bounded concurrencyはない |
+| 一覧の負荷制御 | 未実装 | 全候補を並列`GetMicrovm`、bounded concurrency/retry/cacheなし |
+| stale DDB行の即時削除 | 部分実装 | 一覧確認時にTERMINATED/NotFound行を対象ID一致で削除。TERMINATING中は保持 |
 | 複数ユーザーの所有者分離 | 未実装 | 認証済み利用者は全候補を見られる単一ユーザー設計 |
 
 ### 2.4 OMPと開発ツール
@@ -142,10 +142,11 @@ OMPとGitHubの認証状態はKMS暗号化されたS3へ保存される。ワー
 | OMP `install-id`永続化 | 実装済み | 他ファイルと同じdeadline・失敗記録の対象 |
 | GitHub CLI認証永続化 | 実装済み | `hosts.yml`→S3。保存結果をstatus barに表示 |
 | `/run`復元 | 実装済み | 25秒deadline内でatomic replace。未作成(NoSuchKey)は正常、その他の失敗は`restoreFailed`として記録し、そのkeyの自動保存を止める(未ログインのファイルでS3の正常な状態を上書きしない)。fail-openで200 |
-| 5分定期保存 | 実装済み | sha256が前回保存と同じならskip。lockが使用中なら待たずにskipし、hookが待っていれば実行中のAWS呼び出しを中断して譲る |
-| `/suspend`保存 | 実装済み | 40秒deadline(hook timeout 45秒)。失敗は記録し、Suspendを止めないfail-openで200 |
+| 5分定期保存 | 実装済み | ETag条件付き。sha256が前回保存と同じならskip。競合・復元失敗のkeyは自動保存しない。lockが使用中なら待たずにskipし、hookが待っていれば実行中のAWS呼び出しを中断して譲る |
+| `/suspend`保存 | 実装済み | 40秒deadline(hook timeout 45秒)でETag条件付き保存。失敗・競合は`auth-sync.json`へ記録し、Suspendを止めないfail-openで200。手動保存がlockを握っている間(最大約2分)は保存をskipし得る |
 | `/terminate`保存 | 実装済み | 同上 |
 | 手動保存 | 実装済み | `persist-auth-state`またはstatus barのクリック。変更のあるファイルをETag条件付きで保存し、失敗・競合時は非zero終了。`restoreFailed`のブロックも解除する。`--overwrite`は全ファイルを無条件に保存 |
+| 保存結果の表示 | 実装・検証済み | status barに`認証 N分前`、15分(同期間隔の3倍)以上古いか記録がなければ警告、`認証保存失敗`/`認証復元失敗`/`認証競合`はエラー表示。control page・セッション選択画面・metricには未反映 |
 | S3 Version lifecycle | 実装・検証済み | 非現行Versionは30日で失効。ただし最新10世代の非現行Versionは期間に関係なく保持。未完了multipart uploadは1日で破棄 |
 | Workspace永続化 | 未実装 | Gitを永続化境界とする |
 | S3過去Versionからの復元UI | 未実装 | 手動運用 |
@@ -158,7 +159,7 @@ OMPとGitHubの認証状態はKMS暗号化されたS3へ保存される。ワー
 | AWS CDK TypeScript | 実装済み | 2リージョン・2スタック |
 | cdkd deploy | 実装・検証済み | `--all --full-wait` |
 | cdkd diff/dry-run | 実装済み | npm scripts |
-| IaC unit test | 実装・検証済み | Jest 11件 |
+| IaC unit test | 実装・検証済み | Jest 22件(うち1件がPython `lifecycle_test.py`の9件を実行) |
 | Biome lint | 実装・検証済み | recommended rules |
 | TypeScript strict check | 実装・検証済み | `tsc --noEmit` |
 | GitHub Actions CI | 未実装 | workflowなし |
@@ -170,7 +171,7 @@ OMPとGitHubの認証状態はKMS暗号化されたS3へ保存される。ワー
 | dependency update automation | 未実装 | 手動pin更新 |
 | automated deployed E2E | 未実装 | 手動実行 |
 | 複数環境の並行deploy | 未実装 | resource名・control URL・生成config pathが環境非対応 |
-| retained resource cleanup | 未実装 | Lambda@Edge旧Version、S3 Version、KMS等の棚卸しRunbookなし |
+| retained resource cleanup | 未実装 | Lambda@Edge旧Version、KMS等の棚卸しRunbookなし(S3非現行Versionはlifecycleで失効) |
 
 ## 3. 現在の検証実績
 
@@ -181,11 +182,11 @@ OMPとGitHubの認証状態はKMS暗号化されたS3へ保存される。ワー
 ```text
 npm run build
 npm run lint
-npm test -- --runInBand  # 11 tests
+npm test -- --runInBand  # Jest 22 tests(Python lifecycle_test.py 9 testsを含む)
 npm run diff             # deploy後は両Stack差分ゼロ
 ```
 
-テスト内容は、IaC、IAM、Cookie署名、HTML escape、CSP、Suspend/Resume、502復旧、Image設定、Chromium、extensionなどを含む。
+テスト内容は、IaC、IAM、Cookie署名、HTML escape、CSP、Suspend/Resume、502復旧、Image設定、Chromium、extensionなどを含む。Python側(`lifecycle_test.py`)は、初回復元の未作成object、復元失敗時の自動保存停止、別VMの新しい状態を上書きしないETag条件付き書き込み、sha256による未変更skip、保存失敗の記録、hook deadline、hookによる定期保存の中断、`/run` hook envelopeからの期限記録を確認する。Jest側は残り寿命のcountdown・通知閾値・時計補正と、Edgeが実際の期限より遅い`expiresAt`を渡さないことも確認する。
 
 ### 3.2 実ブラウザE2E
 
@@ -202,6 +203,18 @@ npm run diff             # deploy後は両Stack差分ゼロ
 - テストDynamoDB行の削除
 - 既存MicroVMがテスト前後で維持される
 
+2026-09-25、残り寿命表示・認証保存状態表示・ETag楽観ロックのデプロイ後に、テスト専用MicroVMで次を確認した。
+
+- 新規MicroVMのstatus barに`残り 7:59`と`認証 0分前`が表示される
+- 30〜180秒のSuspend後にResumeしても、同じ表示が続く。3分のSuspend後の時計補正は-1秒で、ゲスト時計の遅れは観測されなかった
+- テストMicroVMのTerminate、テストDynamoDB行の削除、既存MicroVMの保護
+
+このE2Eでは、login・chooser・Suspend・ResumeをCookie付きHTTPで操作し、ブラウザではcode-server UIだけを開いた。同梱のheadless ChromiumがEdgeのlogin/chooserページを描画するとSkia FontConfigで異常終了するためである(5.9.1節)。
+
+同日、起動・終了の安全策を反映したEdgeをデプロイし、テスト用MicroVMだけでフォームUUIDの二重POSTが409になること、追跡中のセッションを選択・接続できること、確認画面で誤ったIDが拒否されること、正しいIDでTerminateした後に`TERMINATED`を確認して行が消えること、access Cookieを残して選択画面へ戻ることを確認した。既存MicroVMは検証後も残った。新規VMのstatus barは`残り 7:59`を表示したが、1回の実行では`omp/install-id`と`github/hosts.yml`に`認証復元失敗`も表示された。後続の新規VMでは`認証 0分前`となったため、復元の安定性は未確認である。
+
+別のテスト用MicroVMでは、IDE内でport 3000の一時的なHTTP endpointを起動し、CloudFrontの`/proxy/3000/headers`を通したCookie headerが空であることを確認した。access/session Cookieを付けたブラウザ側リクエストでも、originへは渡っていない。`/run`の認証復元はこのVMで全ファイル成功し、同じVMからのS3 `get-object`も成功したが、前述の失敗が一過性だった理由は未特定。
+
 ### 3.3 手動利用確認
 
 - OMP起動
@@ -211,6 +224,7 @@ npm run diff             # deploy後は両Stack差分ゼロ
 - ChromeからのCloudFrontログイン
 - Codex内蔵ブラウザでのHTMLログインフォーム
 - 失った`mvm-session`を既存セッション選択で復旧
+- 実行Role(`omp-cloud-ide-microvm-execution`)と実bucket(Versioning、SSE-KMS)でのS3 conditional write: `If-None-Match`による作成、別writer更新後の`conflict`、手動保存も`conflict`で非zero終了、`--overwrite`での上書き成功(5.1節)
 
 ### 3.4 未完のE2E
 
@@ -222,9 +236,12 @@ npm run diff             # deploy後は両Stack差分ゼロ
 - 新規VMでS3 objectを復元し、OMP/GitHub認証が利用できるところまでの再現可能なE2E
 - S3の過去Versionからの認証DB復旧
 - 強制的な異常終了後の最大損失時間確認
-- 同時に2つのMicroVMがOAuth refreshする競合試験
+- 2台の実MicroVMが同時にOAuth refreshする競合試験(条件付き書き込み自体は実行Roleと実bucketで確認済み)
 - 8時間上限到達後の新規VMへの認証復元
+- `/run`認証復元の一過性失敗の原因特定と再現防止。2026-09-25の新規VMでは2ファイルが`restoreFailed`になり、直後に起動した別のVMでは全ファイル成功した。復元失敗時は自動保存がブロックされるため、そのVMで再ログインして手動保存する前にstatus barを確認する
 - CloudFront/Lambda@Edgeのregional log横断調査
+- 残り寿命の60/15/5分通知と警告色の実機確認(実機で確認したのは開始直後とSuspend/Resume後の表示まで)
+- status bar項目のクリック(Suspend制御画面、手動保存、Source Control)の実ブラウザ操作。headless Chromiumでは文字glyphがほぼ描画されず、合成`element.click()`も効かないため自動化できていない
 
 ## 4. 元設計から変更した点
 
@@ -289,29 +306,16 @@ npm run diff             # deploy後は両Stack差分ゼロ
 
 無条件の定期workspace snapshotは、サイズ、secret混入、復元競合、コストが増えるため、認証状態と同じ仕組みへ安易に混ぜない。
 
-#### 5.3 明示Terminate機能を追加する
+#### 5.3 明示Terminateと新規作成の安全策(実装済み 2026-09-25)
 
-Suspendだけでなく、不要なセッションを一覧から安全にTerminateするUIが必要である。
+- chooserの新規起動フォームへrequest UUIDを入れ、DDB条件付きclaimを先に確保する。同じフォームの二重POSTは2台目を作らず409を返す
+- `RunMicrovm`後にtoken作成や行保存が失敗したら`TerminateMicrovm`を要求する。補償も失敗したMicroVMは`ListMicrovms`とDDBの全ページ照合で「Untracked MicroVMs」に表示する(定期ジョブではなくchooser表示時)。起動中のVMと区別できないためuntrackedの画面内Terminateは提供せず、AWS API/Consoleで手動確認する
+- 追跡中セッションの終了ボタンは、Image ARNと状態を再確認し、確認画面でMicroVM ID全文の再入力を求める。`terminationPending=true`と`paused=true`で通信・再接続を遮断してからAPIを呼び、成功した現在のbrowser session Cookieだけを失効させる
+- API結果が不明でも遮断を維持して再試行可能にする。`TERMINATING`中のDDB行は保持し、TERMINATED/NotFoundを確認したときだけ対象ID一致の条件付き削除をする。認証状態の`/terminate` hookはfail-openで保存成功を保証しない
+- `lambda:TerminateMicrovm`はImage/同アカウントMicroVM ARN、`lambda:ListMicrovms`はresource-level認可がないため`*`。DDB DeleteItemは対象Tableのみ
+- token refresh失敗時は、旧tokenが有効なら継続し、失効済みなら503と再試行を案内する
 
-要件:
-
-- MicroVM IDと状態を再確認
-- 二段階確認
-- `/terminate` hook完了を待つ
-- 対象Image/accountへ絞った`lambda:TerminateMicrovm`権限とIAM assertionを追加
-- DDB行削除
-- 現在のbrowser Cookieを削除
-- 他の既存セッションを誤削除しない
-
-#### 5.3.1 新規作成のorphanを補償する
-
-`RunMicrovm`成功後にtoken作成またはDynamoDB Putが失敗すると、chooserから見えないMicroVMが残り得る。
-
-- start処理で作成済みIDを保持し、後続失敗時だけTerminateする
-- 二重POSTに対するidempotency key/conditional writeを導入する
-- 定期的に`ListMicrovms`とDynamoDBを照合し、orphan/stale recordを検出する
-- compensation/reconciliation用の`lambda:TerminateMicrovm`/`lambda:ListMicrovms`を対象Image/accountへ絞り、IAM testを追加する
-- token refresh失敗時に期限切れtokenで黙って続行せず、retryまたは明示エラーへ送る
+残る制約: Lambda@Edgeの30秒以内に全候補を照合するため、VMが増えた場合のbounded concurrency、キャッシュ、定期reconciliationは未実装。terminate受理とhook完了は同義ではないため、行の削除は終了状態を確認するまで遅延する。
 
 ### P1: 運用を自動化・可観測化する
 
@@ -351,8 +355,8 @@ main merge: prod Environment承認後にdeploy + E2E
 - CloudFront 4xx/5xx率
 - セッション起動、Resume、Suspendのカスタムメトリクス
 - 認証失敗回数（パスワード値は記録しない）
-- lifecycle sync失敗回数
-- lifecycle last-success/failed-files
+- lifecycle sync失敗回数・last-success・failed-files・conflictsのmetric化(現在はVM内`auth-sync.json`とstatus barだけ)
+- 実行中MicroVMのログ取得経路(現状、runtime MicroVMのstdoutはCloudWatch Logsへ届かない)
 - regional Lambda@Edge logの保持/中央集約
 - CloudFront access log
 - `GetMicrovm.stateReason`を含む障害Runbook
@@ -374,6 +378,12 @@ Lambda@Edgeのログは実行リージョンへ分散し得るため、中央集
 - timeoutや途中失敗でもfinally cleanup
 - selector、editor、Suspend/Resumeのscreenshotをartifact化
 
+2026-09-25のdeployed E2Eで分かった実装上の注意:
+
+- 同梱のheadless ChromiumはEdgeのlogin/chooserページでabortするため(5.9.1節)、login・chooser・Suspend・ResumeはCookie付きHTTPで操作し、ブラウザはcode-server UIだけに使う
+- code-serverはready後に`/`へ`./?folder=...`への302を返すので、readiness probeに使える
+- status bar項目は合成`element.click()`では反応せず、実mouse clickも文字glyphが描画されない状態では不安定である
+
 ### P1: セキュリティを強化する
 
 #### 5.7 個人用パスワードをOIDCへ置き換える
@@ -392,7 +402,7 @@ Lambda@Edgeのログは実行リージョンへ分散し得るため、中央集
 
 現在は同一CloudFront origin上の`/proxy/<port>/`アプリからsession制御routeへrequestできる。根本対策として、control/auth専用hostnameを分け、状態変更Cookieをそのhostnameだけへ限定する。
 
-加えて現状はEdgeで認証した後も`omp-cloud-ide-auth`と`mvm-session`をcode-server originへ転送している。`HttpOnly`でもorigin serverにはCookie headerが届くため、Edge専用の2 Cookieだけをorigin転送前に除去し、code-server自身に必要なCookieは保持する。code-server proxyが内側backendへCookieを渡さないこともE2Eで確認する。
+Edge専用の`omp-cloud-ide-auth`と`mvm-session`は、認証後にcode-serverへ転送する前に除去する。code-server自身のCookieは保持する。ただし同一CloudFront origin上の`/proxy/<port>/`アプリは制御routeへリクエストでき、server-side appは同じUIDの認証ファイルを読める。control/auth専用hostnameへの分離とproxy backendの実機E2Eは引き続き必要である。
 
 移行までの軽減策:
 
@@ -435,18 +445,43 @@ MicroVM proxy tokenは現状60分である。短命化（例: 15〜30分）とre
 - base image version/digestの更新方針
 - OMP/provider更新時の互換性テスト
 
+#### 5.9.1 Chromiumの調達元を再評価する
+
+現在はSparticuz/chromiumのarm64 pack(149.0.0)をImage build時に`/opt/chromium`へ展開している。開発時点ではChrome for TestingにLinux arm64の配布物がなく、OMPのpuppeteerが自動ダウンロードに失敗するためである。
+
+2026-09-25時点のChrome for Testingの配布一覧(`known-good-versions-with-downloads.json`)では、`linux-arm64`が153.0.8001.0から追加されている。次にChromiumを更新するときは、次の2案を比較する。
+
+| 観点 | Sparticuz arm64 pack(現行) | Chrome for Testing linux-arm64 |
+| --- | --- | --- |
+| 配布元 | 個人メンテナンスのOSS(Lambda向け) | Google公式(自動テスト向け) |
+| 共有ライブラリ | AL2023向けを同梱 | 同梱しない。AL2023 minimalへ不足分を`dnf`で入れる |
+| 導入の仕組み | `AWS_EXECUTION_ENV`と`TMPDIR`を指定して`@sparticuz/chromium-min`で展開 | zipを展開し、`PUPPETEER_EXECUTABLE_PATH`で指定 |
+| versionの選び方 | Sparticuzのrelease単位 | Chromeのversion単位。puppeteerが想定するversionに合わせやすい |
+| 検証 | pack tarのSHA-256を固定 | 配布zipのSHA-256を固定する必要がある |
+| font | 同梱の`FONTCONFIG_PATH=/opt/chromium/fonts`を使う。font fallbackでabortする(下記) | AL2023側でfontconfigとfontを用意する必要がある(未検証) |
+
+現行packには実害も出ている。2026-09-25のdeployed E2Eでは、Edgeのlogin/chooserページを描画した時点で`FATAL: SkFontMgr_FontConfigInterface.cpp:163 Not implemented`によりChromiumが異常終了した(font fallback時)。また`about:blank`からCloudFrontへの最初のnavigationが`Navigating frame was detached`で失敗することがあった。code-server UIは描画できるが、文字glyphはほぼ表示されない。OMP Browserで一般のWebページを開く場合も、font fallbackが起きれば同じ異常終了が起こり得る。
+
+前提として、どちらを選んでもOMPの`browser.open`→`localhost`操作→screenshotまでを通すdeployed E2E(3.4節の未完項目)が必要である。E2Eなしでは切り替え後の動作を判断できない。
+
+完了条件:
+
+- 採用した案でImage buildが`chromium --version`まで成功する
+- OMP Browser E2EがMicroVM上で成功する
+- EdgeのHTMLページを含む通常のWebページをabortせずに描画でき、文字glyphがscreenshotに表示される
+- 採用理由とversion・checksumの更新手順を`docs/architecture-and-design.md`9.8節へ反映する
+
 ### P2: セッション管理を拡張する
 
 #### 5.10 DynamoDB Scanをやめる
 
-現在は最大25件Scanであり、個人用途に限定される。改善案:
+現在は全ページScanしているが、個人用途に限定される。改善案:
 
 - `ownerId`と`updatedAt`を持つGSI
 - `Query`によるユーザー別・新しい順取得
-- pagination token
 - bounded concurrency、retry/backoff、partial failure表示
 - 一覧cacheまたは状態の非同期集約でN+1 API callを削減
-- terminated recordの明示cleanup
+- 終了済み行の定期cleanupとorphanの定期reconciliation(現在はchooser表示時のみ)
 - session label/repository/branch metadata
 
 origin-responseの`502`/`504`復旧もpathを限定し、`/proxy/<port>/`アプリ自身のHTMLエラーをMicroVM障害と誤認しないようにする。
@@ -496,7 +531,13 @@ S3 Versioningはあるが、どのVersionへ戻すかは手動である。次を
 
 #### 5.14 lifecycle保存結果をセッションUIへ反映する
 
-現在、保存失敗はログへ出るだけで利用者に見えない。最後の成功時刻、失敗状態、手動再試行をcontrol pageに表示できると、Terminate前の判断が容易になる。
+code-serverのstatus barへの表示は実装済みである(5.0節)。`認証 N分前`、`認証保存失敗`、`認証復元失敗`、`認証競合`を表示し、クリックで手動保存できる。
+
+残る課題:
+
+- セッション選択画面・control pageへの表示。保存結果はVM内の`auth-sync.json`にしかなく、EdgeからもDynamoDBからも読めない。VMの実行Roleには記録先への書き込み権限がない
+- Terminate UI(5.3節)で、Terminate前に最後の保存結果を確認させる
+- 手動保存がlockを握っている間(最大約2分)に来たSuspend hookが保存をskipし得る
 
 #### 5.15 Resume hookで依存関係を再検証する
 
@@ -508,9 +549,11 @@ S3 Versioningはあるが、どのVersionへ戻すかは手動である。次を
 - egress/network connection
 - lifecycle daemonと定期sync thread
 
-#### 5.16 run hook payload契約を活用する
+#### 5.16 run hook payloadの活用を広げる
 
-Lambdaは`/run`へ`{"microvmId": ..., "runHookPayload": "<RunMicrovmへ渡した文字列>"}`を送る。現在Edgeは`runHookPayload`へ`{"sessionId", "expiresAt"}`を入れ、`lifecycle.py`は`expiresAt`と`microvmId`だけを`~/.cache/omp-cloud-ide/session.json`へ書いてstatus barの残り寿命表示に使う。`sessionId`はbearer Cookie値なのでVM内へ保存しない。`microvmId`をログ・競合制御・session別S3 prefixへ活用する余地は残っている。
+Lambdaは`/run`へ`{"microvmId": ..., "runHookPayload": "<RunMicrovmへ渡した文字列>"}`を送る。残り寿命表示のため、Edgeは`RunMicrovm`直前に計算した`expiresAt`を`runHookPayload`の`{"sessionId", "expiresAt"}`に入れ、`lifecycle.py`はこのenvelopeを解釈して`{microvmId, expiresAt}`を`~/.cache/omp-cloud-ide/session.json`へ書く(実装済み)。VMは自分の`startedAt`を知る手段(`GetMicrovm`権限や環境変数)を持たないため、期限はEdgeから渡している。`sessionId`はbearer Cookie値なのでVM内へ保存しない。
+
+未活用: 記録済みの`microvmId`を、保存結果の記録、認証競合の診断、session別S3 prefixへ使う余地がある。
 
 #### 5.17 保持とcleanupのRunbookを作る
 
@@ -524,11 +567,11 @@ Lambdaは`/run`へ`{"microvmId": ..., "runHookPayload": "<RunMicrovmへ渡した
 
 ### Phase A: 現行個人利用を堅牢化
 
-1. lifecycle timeout/失敗通知/last-success
-2. 新規作成orphanのcompensation
-3. auth-state競合防止とS3 Version lifecycle
+1. lifecycle timeout/失敗通知/last-success(実装済み: 5.0節)
+2. 新規作成orphanのcompensationとchooser reconciliation(実装済み: 5.3節)
+3. auth-state競合防止とS3 Version lifecycle(実装済み: 5.1節、5.17節)
 4. control originとproxy originの分離
-5. 明示Terminate UI
+5. 明示Terminate UI(実装済み: 5.3節)
 6. E2Eスクリプト正式化
 7. checksum・version pin拡充
 
@@ -558,12 +601,12 @@ Lambdaは`/run`へ`{"microvmId": ..., "runHookPayload": "<RunMicrovmへ渡した
 
 1. 作業成果は早めにcommit/pushする。
 2. OMP/GitHubログイン直後は`persist-auth-state`(またはstatus barの`認証`表示のクリック)を実行する。
-3. Terminate前・作業終了前はstatus barの`認証`表示が失敗・警告になっていないことを確認する。
+3. Terminate前・作業終了前はstatus barの`認証`表示が失敗・警告になっていないことを確認する。実行中MicroVMのlifecycleログはCloudWatch Logsへ届かないため、ログではなくstatus barか`~/.cache/omp-cloud-ide/auth-sync.json`で確認する。
 4. 複数MicroVMで認証を更新した場合、status barが`認証競合`になったVMの認証は古い。どちらの認証を正とするか決め、必要なら`persist-auth-state --overwrite`を実行する。
 5. 未信頼repoや依存scriptを`yolo`で実行しない。
 6. 作業終了時はstatus barから明示Suspendする。
 7. デプロイ前にbuild/lint/test/diffを通す。
-8. デプロイは`npm run deploy`の`--full-wait`を使う。
+8. デプロイは`npm run deploy`の`--full-wait`を使い、短いtimeoutのツール配下で実行しない。途中で止めるとcdkdのstack lockが残る。その場合はcdkd processが生きていないことを確認してから`cdkd force-unlock <stack> --stack-region <region>`を実行し、deployし直す。
 9. Edge/session変更後は実ブラウザE2Eを行う。
 10. E2Eでは既存MicroVMを保護し、テストで作ったVMだけを削除する。
 11. Secret値やproxy tokenをログ・スクリーンショット・Gitへ出さない。

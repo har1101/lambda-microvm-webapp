@@ -8,7 +8,7 @@ Personal browser IDE for `har1101`. CloudFront authenticates the browser before 
 Browser
   -> CloudFront + Lambda@Edge password form (us-east-1)
      -> signed, HttpOnly access cookie
-     -> suspend/resume control page
+     -> suspend/resume/confirmed terminate control page
   -> Lambda MicroVM endpoint token injection
   -> code-server :8080 (ap-northeast-1)
   -> OMP / gh / development toolchain
@@ -23,6 +23,8 @@ Lifecycle hooks
 The SQLite database is copied with Python's SQLite backup API, never as a live-file byte copy. State is restored on `/run`, saved every five minutes (unchanged files are skipped), saved on `/suspend` and `/terminate`, and can be saved immediately with `persist-auth-state`, which prints a per-file result and exits non-zero if any file failed. Hooks run under deadlines shorter than their image timeouts and always answer 200 so they never block Run/Suspend/Terminate; the outcome is recorded in `~/.cache/omp-cloud-ide/auth-sync.json` and shown in the status bar (`認証 N分前`, `認証保存失敗`, `認証復元失敗`, or `認証競合`). Clicking it runs `persist-auth-state`. If a restore failed for a file, automatic saves skip that file so an unauthenticated local copy cannot overwrite good state in S3; log in again and save manually to lift the block.
 
 Several MicroVMs share the same S3 keys, so every save is conditional on the ETag this VM last restored or wrote. If another MicroVM saved newer state first, the write is refused and the status bar shows `認証競合` instead of silently replacing the newer credentials. Run `persist-auth-state --overwrite` only when this VM's credentials should win.
+
+Check the auth status bar after each new MicroVM starts and before terminating it. A 2026-09-25 deployed run showed `認証復元失敗` for `omp/install-id` and `github/hosts.yml`, while two later fresh VMs restored all files; the intermittent cause is not yet identified. On a failed VM, automatic saves of those keys remain blocked. Reauthenticate there and run `persist-auth-state` explicitly only when you intend that VM's credentials to become the saved state.
 
 ## Deployment boundary
 
@@ -87,6 +89,8 @@ OMP's Puppeteer browser prelude is enabled in headless mode. A checksum-pinned a
 
 Opening `/login` only renders the access form; it does not call `RunMicrovm`. After successful login, `/session/select` lists running and suspended MicroVMs. The user explicitly chooses an existing session to connect or resume, or starts a new MicroVM. Temporary origin `502`/`504` responses preserve the browser's `mvm-session` association and return to the chooser instead of orphaning a live workspace.
 
+New starts use a form UUID and a conditional DynamoDB claim to avoid duplicate MicroVMs. If registration fails after `RunMicrovm`, Edge requests compensation termination. The chooser lists MicroVMs without a session row; because a newly starting VM can briefly appear there, verify its ID and use the AWS API/Console for manual cleanup rather than an in-page untracked termination button.
+
 ## Suspend and resume
 
 The editor status bar contains **Suspend Cloud IDE**. It opens `/session/control` through code-server's HTTPS URL opener; press **Suspend Cloud IDE** there to suspend the current browser's MicroVM. This two-step control is deliberate: the suspend API must be called outside the MicroVM, and the control plane marks the session paused before requesting the snapshot so code-server WebSocket reconnects cannot immediately wake it again.
@@ -94,6 +98,10 @@ The editor status bar contains **Suspend Cloud IDE**. It opens `/session/control
 Next to it, the status bar shows the remaining MicroVM lifetime (`残り H:MM`). The Edge passes a deadline in the `/run` hook payload, because a MicroVM cannot look up its own `startedAt`; the lifetime counts both RUNNING and SUSPENDED time. The item turns yellow at 30 minutes and red at 10 minutes, and a notification at 60, 15, and 5 minutes asks you to commit and push. MicroVMs started before this feature was deployed show `残り時間不明`.
 
 While paused, regular editor requests are blocked at Lambda@Edge. Press **Resume editor** on the control page to resume explicitly. A suspended MicroVM incurs snapshot storage and snapshot operation charges, but no compute charge. The current idle policy also automatically suspends a session after five minutes without endpoint traffic and terminates it after eight suspended hours; an open code-server tab can generate traffic, so use the explicit button when you are finished for now.
+
+## Terminate a session
+
+Commit and push all workspace changes first; termination destroys the VM's local disk and RAM. From `/session/select` or `/session/control`, choose **Terminate permanently...**, inspect the MicroVM ID and state, then type its full ID into the confirmation form. Edge blocks editor traffic before requesting termination. If the API result is uncertain, the session stays blocked and can be retried from the chooser. The current `mvm-session` cookie is cleared when termination is accepted, and the matching DynamoDB row is removed only after `TERMINATED` or NotFound is observed. The `/terminate` hook tries to save auth state but is fail-open; check its status bar before ending the VM.
 
 ## Implementation status
 
@@ -124,6 +132,7 @@ The S3 bucket and KMS key use `Retain`; destroying the stacks does not delete pe
 
 - The browser must pass the Lambda@Edge password form before `RunMicrovm` is called. Legacy HTTP Basic credentials remain accepted for non-browser smoke checks, but unauthenticated browsers are redirected to `/login` instead of relying on a native Basic-auth dialog.
 - code-server has no independent password because it is reachable only through the AWS MicroVM proxy token injected by the authenticated edge function.
+- Edge removes its own access and session cookies before forwarding to code-server while preserving code-server cookies. This does not isolate same-origin `/proxy/<port>/` apps from session control routes or credentials readable inside the VM.
 - The MicroVM execution role can access only its auth-state prefix and its log group.
 - OMP, GitHub, and access credentials are not included in the Docker image or Git repository.
 - The MicroVM container runs as UID 1000, not root.

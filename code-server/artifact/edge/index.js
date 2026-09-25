@@ -4,11 +4,14 @@ const {
   CreateMicrovmAuthTokenCommand,
   GetMicrovmCommand,
   LambdaMicrovmsClient,
+  ListMicrovmsCommand,
   ResumeMicrovmCommand,
   RunMicrovmCommand,
   SuspendMicrovmCommand,
+  TerminateMicrovmCommand,
 } = require('@aws-sdk/client-lambda-microvms');
 const {
+  DeleteItemCommand,
   DynamoDBClient,
   GetItemCommand,
   PutItemCommand,
@@ -25,6 +28,9 @@ const secrets = new SecretsManagerClient({ region: cfg.AUTH_SECRET_REGION });
 let cachedPassword;
 let passwordCachedAt = 0;
 const PASSWORD_CACHE_MS = 5 * 60 * 1000;
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+// A start claim that never received a MicroVM (RunMicrovm failed) expires on its own.
+const START_CLAIM_TTL_SEC = 15 * 60;
 
 exports.handler = async (event) => {
   const request = event.Records[0].cf.request;
@@ -48,10 +54,7 @@ exports.handler = async (event) => {
     return handleSessionSelection(request, sessionId);
   }
   if (request.uri === '/session/start') {
-    if (request.method !== 'POST') {
-      return redirectToSessionSelect();
-    }
-    return startSession();
+    return redirectToSessionSelect();
   }
 
   if (!sessionId) {
@@ -68,16 +71,19 @@ exports.handler = async (event) => {
       ConsistentRead: true,
     }),
   );
-  if (!result.Item) {
+  if (!result.Item?.microvmId?.S) {
     if (isControlRoute || isSuspendRoute || isResumeRoute) {
       return sessionControlResponse({ hasSession: false, clearSessionCookie: true });
     }
     return redirectToSessionSelect(true);
   }
 
+  if (result.Item.terminationPending?.BOOL === true) {
+    return terminationResultResponse(result.Item.microvmId.S, true);
+  }
   const paused = result.Item.paused?.BOOL === true;
   if (isControlRoute) {
-    return sessionControlResponse({ hasSession: true, paused });
+    return sessionControlResponse({ hasSession: true, paused, sessionId });
   }
   if (isSuspendRoute) {
     return suspendSession(request, sessionId, result.Item);
@@ -115,6 +121,11 @@ exports.handler = async (event) => {
       );
     } catch (error) {
       console.error('MicroVM auth token refresh failed', error?.name);
+      // Within the refresh window the old token still works; once it has
+      // expired, forwarding it would only produce an opaque origin 403.
+      if (token === result.Item.token.S && Date.now() >= expiry) {
+        return tokenUnavailableResponse(request.headers);
+      }
     }
   }
 
@@ -133,30 +144,88 @@ exports.handler = async (event) => {
   request.headers.host = [{ key: 'Host', value: host }];
   request.headers['x-aws-proxy-auth'] = [{ key: 'X-aws-proxy-auth', value: token }];
   request.headers.origin = [{ key: 'Origin', value: `https://${host}` }];
+  stripEdgeCookies(request.headers);
   return request;
 };
 
-async function startSession() {
-  const id = randomUUID();
+async function startSession(requestId) {
+  // The chooser renders a fresh UUID into each "new" form. Using it as the
+  // session ID and claiming it before RunMicrovm means a double-submitted form
+  // starts one MicroVM, not two.
+  const id = UUID_PATTERN.test(requestId ?? '') ? requestId.toLowerCase() : randomUUID();
+  const claimedAt = Date.now();
+  try {
+    await ddb.send(
+      new PutItemCommand({
+        TableName: cfg.TABLE,
+        // No microvmId yet, so the chooser ignores this row until it is filled.
+        Item: {
+          sessionId: { S: id },
+          createdAt: { N: String(claimedAt) },
+          ttl: { N: String(Math.floor(claimedAt / 1000) + START_CLAIM_TTL_SEC) },
+        },
+        ConditionExpression: 'attribute_not_exists(sessionId)',
+      }),
+    );
+  } catch (error) {
+    if (error?.name !== 'ConditionalCheckFailedException') throw error;
+    return chooserResponse({
+      errorMessage:
+        'This start request was already submitted and is still starting. Reload in a few seconds to connect.',
+      status: '409',
+    });
+  }
+
   // Measured before RunMicrovm, so this is never later than the service-side
   // startedAt + maximumDurationInSeconds that actually terminates the MicroVM.
   const expiresAt = Date.now() + cfg.MAX_DURATION_SEC * 1000;
-  const run = await mvm.send(
-    new RunMicrovmCommand({
-      imageIdentifier: cfg.IMAGE_ARN,
-      executionRoleArn: cfg.EXECUTION_ROLE_ARN,
-      ingressNetworkConnectors: [cfg.INGRESS],
-      egressNetworkConnectors: [cfg.EGRESS],
-      idlePolicy: {
-        autoResumeEnabled: true,
-        maxIdleDurationSeconds: cfg.IDLE_SEC,
-        suspendedDurationSeconds: cfg.SUSPENDED_SEC,
-      },
-      maximumDurationInSeconds: cfg.MAX_DURATION_SEC,
-      runHookPayload: JSON.stringify({ sessionId: id, expiresAt }),
-    }),
-  );
+  let run;
+  try {
+    run = await mvm.send(
+      new RunMicrovmCommand({
+        imageIdentifier: cfg.IMAGE_ARN,
+        executionRoleArn: cfg.EXECUTION_ROLE_ARN,
+        ingressNetworkConnectors: [cfg.INGRESS],
+        egressNetworkConnectors: [cfg.EGRESS],
+        idlePolicy: {
+          autoResumeEnabled: true,
+          maxIdleDurationSeconds: cfg.IDLE_SEC,
+          suspendedDurationSeconds: cfg.SUSPENDED_SEC,
+        },
+        maximumDurationInSeconds: cfg.MAX_DURATION_SEC,
+        runHookPayload: JSON.stringify({ sessionId: id, expiresAt }),
+      }),
+    );
+  } catch (error) {
+    console.error('RunMicrovm failed', error?.name);
+    return chooserResponse({ errorMessage: 'Could not start a new MicroVM. Please retry.', status: '502' });
+  }
 
+  try {
+    await registerSession(id, run);
+  } catch (error) {
+    // Without a session row the MicroVM would be unreachable from the chooser
+    // yet keep running and billing, so undo the start.
+    console.error('New MicroVM could not be registered; terminating it', error?.name);
+    let terminated = false;
+    try {
+      await mvm.send(new TerminateMicrovmCommand({ microvmIdentifier: run.microvmId }));
+      terminated = true;
+    } catch (terminateError) {
+      console.error('Compensating TerminateMicrovm failed', terminateError?.name, run.microvmId);
+    }
+    return chooserResponse({
+      errorMessage: terminated
+        ? 'The new MicroVM could not be registered, so termination was requested. Please retry.'
+        : `The new MicroVM could not be registered and termination failed. Check Untracked MicroVMs for ${run.microvmId}.`,
+      status: '502',
+    });
+  }
+
+  return startingPageResponse(id);
+}
+
+async function registerSession(id, run) {
   const tokenResponse = await mvm.send(
     new CreateMicrovmAuthTokenCommand({
       microvmIdentifier: run.microvmId,
@@ -183,7 +252,9 @@ async function startSession() {
       },
     }),
   );
+}
 
+function startingPageResponse(id) {
   return {
     status: '200',
     headers: {
@@ -217,8 +288,7 @@ async function startSession() {
 
 async function handleSessionSelection(request, currentSessionId) {
   if (request.method === 'GET' || request.method === 'HEAD') {
-    return sessionSelectionResponse({
-      sessions: await listAvailableSessions(),
+    return chooserResponse({
       currentSessionId,
     });
   }
@@ -228,8 +298,7 @@ async function handleSessionSelection(request, currentSessionId) {
 
   const form = parseFormBody(request.body);
   if (!form) {
-    return sessionSelectionResponse({
-      sessions: await listAvailableSessions(),
+    return chooserResponse({
       currentSessionId,
       errorMessage: 'The session request was invalid or too large.',
       status: '400',
@@ -238,11 +307,13 @@ async function handleSessionSelection(request, currentSessionId) {
 
   const action = form.get('action');
   if (action === 'new') {
-    return startSession();
+    return startSession(form.get('requestId'));
+  }
+  if (action === 'terminate-confirm' || action === 'terminate') {
+    return handleTermination(form, currentSessionId, action === 'terminate');
   }
   if (action !== 'attach') {
-    return sessionSelectionResponse({
-      sessions: await listAvailableSessions(),
+    return chooserResponse({
       currentSessionId,
       errorMessage: 'Choose an existing session or start a new MicroVM.',
       status: '400',
@@ -251,8 +322,7 @@ async function handleSessionSelection(request, currentSessionId) {
 
   const selectedSessionId = form.get('sessionId') ?? '';
   if (!/^[0-9a-f-]{36}$/i.test(selectedSessionId)) {
-    return sessionSelectionResponse({
-      sessions: await listAvailableSessions(),
+    return chooserResponse({
       currentSessionId,
       errorMessage: 'The selected session ID was invalid.',
       status: '400',
@@ -261,30 +331,48 @@ async function handleSessionSelection(request, currentSessionId) {
   return attachSession(selectedSessionId, currentSessionId);
 }
 
+async function chooserResponse(options) {
+  const { sessions, trackedMicrovmIds } = await listAvailableSessions();
+  const untracked = await listUntrackedMicrovms(trackedMicrovmIds);
+  return sessionSelectionResponse({ ...options, sessions, untracked });
+}
+
 async function listAvailableSessions() {
-  const result = await ddb.send(
-    new ScanCommand({
-      TableName: cfg.TABLE,
-      ProjectionExpression: 'sessionId,microvmId,paused,createdAt,#ttl',
-      ExpressionAttributeNames: { '#ttl': 'ttl' },
-      Limit: 25,
-    }),
-  );
+  const items = [];
+  let lastKey;
+  do {
+    const result = await ddb.send(
+      new ScanCommand({
+        TableName: cfg.TABLE,
+        ProjectionExpression: 'sessionId,microvmId,paused,terminationPending,createdAt,#ttl',
+        ExpressionAttributeNames: { '#ttl': 'ttl' },
+        Limit: 25,
+        ExclusiveStartKey: lastKey,
+      }),
+    );
+    items.push(...(result.Items ?? []));
+    lastKey = result.LastEvaluatedKey;
+  } while (lastKey);
 
   const sessions = await Promise.all(
-    (result.Items ?? []).map(async (item) => {
+    items.map(async (item) => {
       const sessionId = item.sessionId?.S;
       const microvmId = item.microvmId?.S;
       if (!sessionId || !microvmId) return null;
       try {
         const microvm = await mvm.send(new GetMicrovmCommand({ microvmIdentifier: microvmId }));
-        if (microvm.state === 'TERMINATED' || microvm.state === 'TERMINATING') return null;
+        if (microvm.state === 'TERMINATED') {
+          await deleteSessionRecord(sessionId, microvmId);
+          return null;
+        }
+        if (microvm.state === 'TERMINATING') return null;
         return {
           sessionId,
           microvmId,
           state: microvm.state ?? 'UNKNOWN',
           imageVersion: microvm.imageVersion ?? '',
           paused: item.paused?.BOOL === true,
+          terminationPending: item.terminationPending?.BOOL === true,
           createdAt: Number(item.createdAt?.N ?? 0),
           expiresAt: microvm.startedAt
             ? new Date(microvm.startedAt).getTime() + (microvm.maximumDurationInSeconds ?? cfg.MAX_DURATION_SEC) * 1000
@@ -292,17 +380,189 @@ async function listAvailableSessions() {
           ttl: Number(item.ttl?.N ?? 0),
         };
       } catch (error) {
-        if (error?.name !== 'ResourceNotFoundException') {
-          console.error('Could not inspect MicroVM while listing sessions', error?.name);
+        if (error?.name === 'ResourceNotFoundException') {
+          await deleteSessionRecord(sessionId, microvmId);
+          return null;
         }
+        console.error('Could not inspect MicroVM while listing sessions', error?.name);
         return null;
       }
     }),
   );
 
-  return sessions
-    .filter(Boolean)
-    .sort((left, right) => (right.createdAt || right.ttl * 1000) - (left.createdAt || left.ttl * 1000));
+  return {
+    sessions: sessions
+      .filter(Boolean)
+      .sort((left, right) => (right.createdAt || right.ttl * 1000) - (left.createdAt || left.ttl * 1000)),
+    trackedMicrovmIds: new Set(items.map((item) => item.microvmId?.S).filter(Boolean)),
+  };
+}
+
+/**
+ * Live MicroVMs of this image with no session row: typically a start whose
+ * registration failed and whose compensating terminate also failed. They are
+ * unreachable through the proxy but keep billing, so the chooser shows them.
+ */
+async function listUntrackedMicrovms(trackedMicrovmIds) {
+  const untracked = [];
+  try {
+    let nextToken;
+    do {
+      const result = await mvm.send(
+        new ListMicrovmsCommand({ imageIdentifier: cfg.IMAGE_ARN, maxResults: 50, nextToken }),
+      );
+      untracked.push(
+        ...(result.items ?? [])
+          .filter((item) => item.microvmId && item.imageArn === cfg.IMAGE_ARN)
+          .filter((item) => item.state !== 'TERMINATED' && item.state !== 'TERMINATING')
+          .filter((item) => !trackedMicrovmIds.has(item.microvmId))
+          .map((item) => ({
+            microvmId: item.microvmId,
+            state: item.state ?? 'UNKNOWN',
+            startedAt: item.startedAt ? new Date(item.startedAt).getTime() : 0,
+          })),
+      );
+      nextToken = result.nextToken;
+    } while (nextToken);
+  } catch (error) {
+    // Reconciliation must never hide the chooser itself.
+    console.error('Could not list MicroVMs for reconciliation', error?.name);
+  }
+  return untracked;
+}
+
+async function deleteSessionRecord(sessionId, microvmId) {
+  try {
+    await ddb.send(
+      new DeleteItemCommand({
+        TableName: cfg.TABLE,
+        Key: { sessionId: { S: sessionId } },
+        ConditionExpression: 'microvmId = :id',
+        ExpressionAttributeValues: { ':id': { S: microvmId } },
+      }),
+    );
+  } catch (error) {
+    if (error?.name !== 'ConditionalCheckFailedException') throw error;
+  }
+}
+
+async function handleTermination(form, currentSessionId, confirmed) {
+  const sessionId = form.get('sessionId') ?? '';
+  const requestedMicrovmId = form.get('microvmId') ?? '';
+  if (!UUID_PATTERN.test(sessionId)) {
+    return chooserResponse({ currentSessionId, errorMessage: 'The session ID was invalid.', status: '400' });
+  }
+
+  try {
+    const row = await ddb.send(
+      new GetItemCommand({
+        TableName: cfg.TABLE,
+        Key: { sessionId: { S: sessionId } },
+        ConsistentRead: true,
+      }),
+    );
+    if (!row.Item?.microvmId?.S || (requestedMicrovmId && row.Item.microvmId.S !== requestedMicrovmId)) {
+      return chooserResponse({ currentSessionId, errorMessage: 'The selected session has changed.', status: '409' });
+    }
+    const microvmId = row.Item.microvmId.S;
+
+    const microvm = await mvm.send(new GetMicrovmCommand({ microvmIdentifier: microvmId }));
+    if (microvm.imageArn !== cfg.IMAGE_ARN || microvm.microvmId !== microvmId) {
+      return chooserResponse({
+        currentSessionId,
+        errorMessage: 'The MicroVM does not belong to this IDE.',
+        status: '403',
+      });
+    }
+    if (microvm.state === 'TERMINATED' || microvm.state === 'TERMINATING') {
+      if (microvm.state === 'TERMINATED') await deleteSessionRecord(sessionId, microvmId);
+      return chooserResponse({
+        currentSessionId,
+        errorMessage: 'This MicroVM is already terminating or terminated.',
+        status: '409',
+      });
+    }
+    if (!confirmed) return terminationConfirmationResponse(sessionId, microvmId, microvm.state);
+    if (form.get('confirmation') !== microvmId || requestedMicrovmId !== microvmId) {
+      return terminationConfirmationResponse(
+        sessionId,
+        microvmId,
+        microvm.state,
+        'Type the exact MicroVM ID to confirm.',
+      );
+    }
+    // The API can time out after accepting termination. Keep this session
+    // blocked until a terminal state is observed, even on an ambiguous error.
+    await ddb.send(
+      new UpdateItemCommand({
+        TableName: cfg.TABLE,
+        Key: { sessionId: { S: sessionId } },
+        UpdateExpression: 'SET paused = :blocked, terminationPending = :blocked',
+        ConditionExpression: 'microvmId = :id',
+        ExpressionAttributeValues: { ':blocked': { BOOL: true }, ':id': { S: microvmId } },
+      }),
+    );
+    let terminateError;
+    try {
+      await mvm.send(new TerminateMicrovmCommand({ microvmIdentifier: microvmId }));
+    } catch (error) {
+      terminateError = error;
+      console.error('TerminateMicrovm outcome uncertain', error?.name, microvmId);
+    }
+    let state;
+    try {
+      state = await getMicrovmState(microvmId);
+    } catch (error) {
+      if (error?.name === 'ResourceNotFoundException') state = 'TERMINATED';
+      else console.error('Could not verify MicroVM termination yet', error?.name);
+    }
+    if (state === 'TERMINATED') await deleteSessionRecord(sessionId, microvmId);
+    const uncertain = Boolean(terminateError && state !== 'TERMINATED' && state !== 'TERMINATING');
+    const response = terminationResultResponse(microvmId, uncertain);
+    if (uncertain) {
+      response.status = '502';
+      response.statusDescription = 'Bad Gateway';
+    } else if (sessionId === currentSessionId) {
+      response.headers['set-cookie'] = [{ key: 'Set-Cookie', value: expiredSessionCookie() }];
+    }
+    return response;
+  } catch (error) {
+    console.error('Could not terminate MicroVM', error?.name);
+    return chooserResponse({
+      currentSessionId,
+      errorMessage: 'Could not confirm termination. Check the session state and retry if it is still running.',
+      status: '502',
+    });
+  }
+}
+
+function terminationConfirmationResponse(sessionId, microvmId, state, errorMessage = '') {
+  return sessionControlResponse({
+    hasSession: false,
+    customControls: [
+      '<p class="status error">Terminating permanently destroys this MicroVM. Commit and push your work first.</p>',
+      `<p>MicroVM: <strong>${escapeHtml(microvmId)}</strong> (${escapeHtml(state)})</p>`,
+      errorMessage ? `<p class="error" role="alert">${escapeHtml(errorMessage)}</p>` : '',
+      '<form method="post" action="/session/select">',
+      '<input type="hidden" name="action" value="terminate">',
+      `<input type="hidden" name="sessionId" value="${escapeHtml(sessionId)}">`,
+      `<input type="hidden" name="microvmId" value="${escapeHtml(microvmId)}">`,
+      '<label>Type the MicroVM ID to confirm<input name="confirmation" required autocomplete="off"></label>',
+      '<button class="danger" type="submit">Permanently terminate MicroVM</button></form>',
+      '<a class="button secondary" href="/session/select">Cancel</a>',
+    ].join(''),
+  });
+}
+
+function terminationResultResponse(microvmId, uncertain = false) {
+  return sessionControlResponse({
+    hasSession: false,
+    customControls: [
+      `<p>${uncertain ? 'Termination outcome is unknown' : 'Termination requested'} for ${escapeHtml(microvmId)}.</p>`,
+      '<p class="hint">Editor traffic is blocked until this MicroVM reaches TERMINATED. If it remains running, retry from the chooser.</p>',
+      '<a class="button primary" href="/session/select">Check sessions</a>',
+    ].join(''),
+  });
 }
 
 async function attachSession(selectedSessionId, currentSessionId) {
@@ -314,28 +574,32 @@ async function attachSession(selectedSessionId, currentSessionId) {
     }),
   );
   if (!result.Item?.microvmId?.S) {
-    return sessionSelectionResponse({
-      sessions: await listAvailableSessions(),
+    return chooserResponse({
       currentSessionId,
       errorMessage: 'That session no longer exists. Choose another session or start a new MicroVM.',
       status: '404',
     });
   }
 
+  if (result.Item.terminationPending?.BOOL === true) {
+    return chooserResponse({
+      currentSessionId,
+      errorMessage: 'Termination is pending for that MicroVM. Wait or retry termination.',
+      status: '409',
+    });
+  }
   try {
     const microvmId = result.Item.microvmId.S;
     const state = await getMicrovmState(microvmId);
     if (state === 'TERMINATED' || state === 'TERMINATING') {
-      return sessionSelectionResponse({
-        sessions: await listAvailableSessions(),
+      return chooserResponse({
         currentSessionId,
         errorMessage: 'That MicroVM has terminated and cannot be resumed.',
         status: '410',
       });
     }
     if (state === 'SUSPENDING') {
-      return sessionSelectionResponse({
-        sessions: await listAvailableSessions(),
+      return chooserResponse({
         currentSessionId,
         errorMessage: 'That MicroVM is still suspending. Wait a few seconds and try again.',
         status: '409',
@@ -348,8 +612,7 @@ async function attachSession(selectedSessionId, currentSessionId) {
     return sessionAttachedResponse(selectedSessionId, state === 'SUSPENDED');
   } catch (error) {
     console.error('Could not attach existing MicroVM session', error?.name);
-    return sessionSelectionResponse({
-      sessions: await listAvailableSessions(),
+    return chooserResponse({
       currentSessionId,
       errorMessage: 'Could not connect to that MicroVM. Retry or choose another session.',
       status: '502',
@@ -418,13 +681,17 @@ async function getMicrovmState(microvmId) {
   return result.state;
 }
 
-async function setSessionPaused(sessionId, paused) {
+async function setSessionPaused(sessionId, paused, microvmId) {
   await ddb.send(
     new UpdateItemCommand({
       TableName: cfg.TABLE,
       Key: { sessionId: { S: sessionId } },
       UpdateExpression: 'SET paused = :paused',
-      ExpressionAttributeValues: { ':paused': { BOOL: paused } },
+      ConditionExpression: microvmId ? 'microvmId = :id' : undefined,
+      ExpressionAttributeValues: {
+        ':paused': { BOOL: paused },
+        ...(microvmId ? { ':id': { S: microvmId } } : {}),
+      },
     }),
   );
 }
@@ -618,10 +885,12 @@ function loginPageResponse(errorMessage = '', status = '200') {
 
 function sessionSelectionResponse({
   sessions,
+  untracked = [],
   currentSessionId = '',
   errorMessage = '',
   status = '200',
   now = Date.now(),
+  requestId = randomUUID(),
 }) {
   const error = errorMessage ? `<p class="error" role="alert">${escapeHtml(errorMessage)}</p>` : '';
   const sessionCards = sessions.length
@@ -644,15 +913,43 @@ function sessionSelectionResponse({
             '</div>',
             `<p>Image ${escapeHtml(session.imageVersion || 'unknown')} · ${escapeHtml(created)}${escapeHtml(lifetime)}</p>`,
             isCurrent ? '<p class="current-label">Currently selected in this browser</p>' : '',
+            session.terminationPending
+              ? '<p class="current-label">Termination pending; do not reconnect.</p>'
+              : [
+                  '<form method="post" action="/session/select">',
+                  '<input type="hidden" name="action" value="attach">',
+                  `<input type="hidden" name="sessionId" value="${escapeHtml(session.sessionId)}">`,
+                  `<button class="primary" type="submit">${actionLabel}</button>`,
+                  '</form>',
+                ].join(''),
             '<form method="post" action="/session/select">',
-            '<input type="hidden" name="action" value="attach">',
+            '<input type="hidden" name="action" value="terminate-confirm">',
             `<input type="hidden" name="sessionId" value="${escapeHtml(session.sessionId)}">`,
-            `<button class="primary" type="submit">${actionLabel}</button>`,
+            '<button class="danger" type="submit">Terminate permanently...</button>',
             '</form></article>',
           ].join('');
         })
         .join('')
     : '<p class="empty">No resumable MicroVM sessions were found.</p>';
+  const untrackedSection = untracked.length
+    ? [
+        '<section class="untracked"><h2>Untracked MicroVMs</h2>',
+        '<p class="hint">These MicroVMs have no session record. A recently started MicroVM may appear briefly. ',
+        'If one remains running after a failed start, verify its ID and terminate it using the AWS API or Console.</p>',
+        ...untracked.map((microvm) =>
+          [
+            '<article class="session">',
+            '<div class="session-heading">',
+            `<strong>${escapeHtml(microvm.microvmId)}</strong>`,
+            `<span class="state ${escapeHtml(String(microvm.state).toLowerCase())}">${escapeHtml(microvm.state)}</span>`,
+            '</div>',
+            `<p>Started ${escapeHtml(microvm.startedAt ? new Date(microvm.startedAt).toISOString() : 'unknown')}</p>`,
+            '</article>',
+          ].join(''),
+        ),
+        '</section>',
+      ].join('')
+    : '';
 
   return {
     status,
@@ -684,14 +981,18 @@ function sessionSelectionResponse({
       '.running{color:#86efac}.suspended{color:#fde68a}.current-label{color:#93c5fd!important}',
       'button{box-sizing:border-box;width:100%;padding:.75rem;border:0;border-radius:6px;color:#fff;font-weight:600;',
       'cursor:pointer}.primary{background:#2563eb}.new{background:#374151}.new-session{margin-top:1rem;padding-top:1.5rem;',
-      'border-top:1px solid #374151}</style></head><body><main class="shell">',
+      'border-top:1px solid #374151}h2{font-size:1.1rem;margin:2rem 0 .25rem}.untracked .session{border-color:#92400e}',
+      '.session form+form{margin-top:.5rem}.danger{background:#991b1b}',
+      '</style></head><body><main class="shell">',
       '<h1>Choose a Cloud IDE session</h1>',
       '<p class="hint">Reconnect to a running or suspended MicroVM, or start a clean session.</p>',
       error,
       `<section class="sessions">${sessionCards}</section>`,
       '<form class="new-session" method="post" action="/session/select">',
       '<input type="hidden" name="action" value="new">',
+      `<input type="hidden" name="requestId" value="${escapeHtml(requestId)}">`,
       '<button class="new" type="submit">Start a new MicroVM</button></form>',
+      untrackedSection,
       '</main></body></html>',
     ].join(''),
   };
@@ -703,6 +1004,8 @@ function sessionControlResponse({
   message = '',
   error = false,
   clearSessionCookie = false,
+  sessionId = '',
+  customControls = null,
 }) {
   let controls;
   if (!hasSession) {
@@ -726,6 +1029,16 @@ function sessionControlResponse({
       '<a class="button secondary" href="/session/select">Switch session</a>',
     ].join('');
   }
+
+  if (sessionId && hasSession) {
+    controls += [
+      '<form method="post" action="/session/select">',
+      '<input type="hidden" name="action" value="terminate-confirm">',
+      `<input type="hidden" name="sessionId" value="${escapeHtml(sessionId)}">`,
+      '<button class="danger" type="submit">Terminate permanently...</button></form>',
+    ].join('');
+  }
+  if (customControls !== null) controls = customControls;
 
   const headers = {
     'cache-control': [{ key: 'Cache-Control', value: 'no-store' }],
@@ -824,6 +1137,27 @@ function resumingPageResponse() {
   };
 }
 
+function tokenUnavailableResponse(headers) {
+  const message = 'Could not renew access to the MicroVM. Reload to retry.';
+  if (isHtmlNavigation(headers)) {
+    const response = sessionControlResponse({ hasSession: true, paused: false, message, error: true });
+    response.status = '503';
+    response.statusDescription = 'Service Unavailable';
+    response.headers['retry-after'] = [{ key: 'Retry-After', value: '5' }];
+    return response;
+  }
+  return {
+    status: '503',
+    statusDescription: 'Service Unavailable',
+    headers: {
+      'cache-control': [{ key: 'Cache-Control', value: 'no-store' }],
+      'content-type': [{ key: 'Content-Type', value: 'text/plain; charset=utf-8' }],
+      'retry-after': [{ key: 'Retry-After', value: '5' }],
+    },
+    body: message,
+  };
+}
+
 function sessionOperationErrorResponse(message) {
   const response = sessionControlResponse({ hasSession: true, paused: false, message, error: true });
   response.status = '502';
@@ -918,15 +1252,37 @@ function expiredSessionCookie() {
   return 'mvm-session=; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=0';
 }
 
-function parseCookies(cookieHeader) {
-  if (!cookieHeader?.[0]) return {};
-  return cookieHeader[0].value.split(';').reduce((accumulator, cookie) => {
-    const separator = cookie.indexOf('=');
-    if (separator > 0) {
-      accumulator[cookie.substring(0, separator).trim()] = cookie.substring(separator + 1).trim();
+function stripEdgeCookies(headers) {
+  if (!headers.cookie) return;
+  const forwarded = headers.cookie
+    .map((header) => ({
+      key: header.key,
+      value: header.value
+        .split(';')
+        .map((part) => part.trim())
+        .filter((part) => {
+          const separator = part.indexOf('=');
+          const name = separator < 0 ? '' : part.slice(0, separator).trim();
+          return name !== cfg.ACCESS_COOKIE_NAME && name !== 'mvm-session';
+        })
+        .join('; '),
+    }))
+    .filter((header) => header.value);
+  if (forwarded.length) headers.cookie = forwarded;
+  else delete headers.cookie;
+}
+
+function parseCookies(cookieHeaders) {
+  const cookies = {};
+  for (const header of cookieHeaders ?? []) {
+    for (const cookie of header.value.split(';')) {
+      const separator = cookie.indexOf('=');
+      if (separator > 0) {
+        cookies[cookie.substring(0, separator).trim()] = cookie.substring(separator + 1).trim();
+      }
     }
-    return accumulator;
-  }, {});
+  }
+  return cookies;
 }
 
 exports.__test = {
