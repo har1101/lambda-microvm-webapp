@@ -23,6 +23,8 @@ export const config = {
     bucketName: `omp-cloud-ide-auth-${ACCOUNT}-${MICROVM_REGION}`,
     prefix: 'personal',
     syncIntervalSeconds: 300,
+    noncurrentVersionRetentionDays: 30,
+    noncurrentVersionsToRetain: 10,
   },
   edge: {
     tableName: 'omp-cloud-ide-sessions',

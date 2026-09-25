@@ -146,7 +146,7 @@ OMPとGitHubの認証状態はKMS暗号化されたS3へ保存される。ワー
 | `/suspend`保存 | 実装済み | 40秒deadline(hook timeout 45秒)。失敗は記録し、Suspendを止めないfail-openで200 |
 | `/terminate`保存 | 実装済み | 同上 |
 | 手動保存 | 実装済み | `persist-auth-state`またはstatus barのクリック。全ファイルを強制保存し、失敗時は非zero終了。`restoreFailed`のブロックも解除する |
-| S3 Version lifecycle | 未実装 | 5分syncで旧Versionが継続増加 |
+| S3 Version lifecycle | 実装・検証済み | 非現行Versionは30日で失効。ただし最新10世代の非現行Versionは期間に関係なく保持。未完了multipart uploadは1日で破棄 |
 | Workspace永続化 | 未実装 | Gitを永続化境界とする |
 | S3過去Versionからの復元UI | 未実装 | 手動運用 |
 | 複数VMの書き込み競合制御 | 未実装 | last-writer-wins |
@@ -255,7 +255,7 @@ npm run diff             # deploy後は両Stack差分ゼロ
 - sha256で未変更ファイルをskipする
 - 復元に失敗したkeyは自動保存を止める(ログインし直して手動保存すると解除)
 
-未対応: DynamoDB/metricへの記録(VMの実行Roleに権限がないため、現状はVM内ファイルとCloudWatch Logsのみ)、S3 noncurrent versionの保持期間(5.17)。手動保存がlockを握っている間(最大約2分)にSuspendされると、hookは待ちきれずに保存をskipし得る。
+未対応: DynamoDB/metricへの記録(VMの実行Roleに権限がないため、現状はVM内ファイルのみ。実行中MicroVMのstdoutはCloudWatch Logsに届いておらず、Log GroupにあるのはImage build/検証用VMのログだけだった)。手動保存がlockを握っている間(最大約2分)にSuspendされると、hookは待ちきれずに保存をskipし得る。
 
 完了条件「利用者がTerminate前に最新の認証状態が保存されたか判断できる」は、status barの表示で満たす。
 
@@ -513,7 +513,7 @@ Lambdaは`/run`へ`{"microvmId": ..., "runHookPayload": "<RunMicrovmへ渡した
 - Lambda@Edge旧Versionの安全な棚卸しとquota監視
 - DDB PITRとSecret RETAINの要否
 - destroy前のMicroVM→DDB→Secret→RETAIN resource cleanup順序
-- S3 noncurrent version lifecycle
+- S3 noncurrent version lifecycle(実装済み: 30日、最新10世代は常に保持。cdkdは`prefix`だけのruleを旧形式の`Prefix`で送るため、`NewerNoncurrentVersions`と組み合わせると`InvalidRequest`になる。prefixを付けず`Filter: {Prefix: ""}`として送らせている)
 - Cost Budget/Anomaly Detection
 
 ## 6. 推奨ロードマップ

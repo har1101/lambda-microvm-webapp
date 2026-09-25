@@ -54,6 +54,16 @@ export class OmpCloudIdeMicrovmStack extends cdk.Stack {
       blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
       enforceSSL: true,
       versioned: true,
+      // Every changed save creates a version. Keep a recovery window without
+      // unbounded growth; the newest noncurrent versions survive long idle periods.
+      lifecycleRules: [
+        {
+          id: 'expire-old-auth-state-versions',
+          noncurrentVersionExpiration: cdk.Duration.days(config.authState.noncurrentVersionRetentionDays),
+          noncurrentVersionsToRetain: config.authState.noncurrentVersionsToRetain,
+          abortIncompleteMultipartUploadAfter: cdk.Duration.days(1),
+        },
+      ],
       removalPolicy: cdk.RemovalPolicy.RETAIN,
     });
 

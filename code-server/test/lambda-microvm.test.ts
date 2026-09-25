@@ -123,6 +123,15 @@ describe('OMP Cloud IDE infrastructure', () => {
         RestrictPublicBuckets: true,
       },
       VersioningConfiguration: { Status: 'Enabled' },
+      // Auth-state versions are the only recovery path, but must not grow without bound.
+      LifecycleConfiguration: {
+        Rules: [
+          Match.objectLike({
+            Status: 'Enabled',
+            NoncurrentVersionExpiration: { NoncurrentDays: 30, NewerNoncurrentVersions: 10 },
+          }),
+        ],
+      },
     });
     template.hasResourceProperties('AWS::Lambda::MicrovmImage', {
       Name: 'omp-cloud-ide',
