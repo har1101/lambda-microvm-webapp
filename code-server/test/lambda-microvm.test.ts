@@ -421,6 +421,11 @@ describe('OMP Cloud IDE infrastructure', () => {
     expect(
       timer.describeAuthSync({ ...ok, failed: ['x'], restoreFailed: ['github/hosts.yml'] }, now, interval).text,
     ).toBe('$(warning) 認証復元失敗');
+    // A conflict is not a generic failure: the fix is choosing whose credentials win.
+    expect(
+      timer.describeAuthSync({ ...ok, failed: ['github/hosts.yml'], conflicts: ['github/hosts.yml'] }, now, interval)
+        .text,
+    ).toBe('$(warning) 認証競合');
     expect(timer.describeAuthSync(null, now, interval).level).toBe('warning');
   });
 

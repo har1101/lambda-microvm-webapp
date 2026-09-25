@@ -1,7 +1,8 @@
 """Behavior tests for artifact/base-image/lifecycle.py, run by `npm test` via Jest.
 
-A fake `aws` executable on PATH emulates the two S3 calls lifecycle.py makes, so
-the tests exercise real subprocess timeouts, exit codes, and error parsing.
+A fake `aws` executable on PATH emulates the two S3 calls lifecycle.py makes,
+including ETag preconditions, so the tests exercise real subprocess timeouts,
+exit codes, error parsing, and conditional writes.
 """
 
 from __future__ import annotations
@@ -22,7 +23,7 @@ LIFECYCLE = Path(__file__).resolve().parent.parent / "artifact" / "base-image" /
 FAKE_AWS = textwrap.dedent(
     """\
     #!/usr/bin/env python3
-    import json, os, shutil, sys, time
+    import hashlib, json, os, shutil, sys, time
     from pathlib import Path
 
     args = sys.argv[1:]
@@ -37,15 +38,21 @@ FAKE_AWS = textwrap.dedent(
         print("An error occurred (AccessDenied) when calling the operation: denied", file=sys.stderr)
         sys.exit(254)
     stored = Path(os.environ["FAKE_S3_DIR"]) / key.replace("/", "__")
+    etag = lambda path: '"' + hashlib.md5(path.read_bytes()).hexdigest() + '"'
     if operation == "get-object":
         if not stored.exists():
             print("An error occurred (NoSuchKey) when calling the GetObject operation: none", file=sys.stderr)
             sys.exit(254)
         shutil.copy(stored, args[args.index("--key") + 2])
-        print(json.dumps({"ETag": '"get"', "VersionId": "v-get"}))
+        print(json.dumps({"ETag": etag(stored), "VersionId": "v-get"}))
     else:
+        if_match = args[args.index("--if-match") + 1] if "--if-match" in args else None
+        if_none_match = "--if-none-match" in args
+        if (if_match and (not stored.exists() or etag(stored) != if_match)) or (if_none_match and stored.exists()):
+            print("An error occurred (PreconditionFailed) when calling the PutObject operation: x", file=sys.stderr)
+            sys.exit(254)
         shutil.copy(args[args.index("--body") + 1], stored)
-        print(json.dumps({"ETag": '"put"', "VersionId": "v-put"}))
+        print(json.dumps({"ETag": etag(stored), "VersionId": "v-put"}))
     """
 )
 
@@ -118,6 +125,44 @@ class LifecycleTest(unittest.TestCase):
         # Keys that are still absent locally stay blocked: S3 may hold their only good copy.
         self.assertEqual(self.status()["restoreFailed"], ["omp/agent.db", "omp/install-id"])
         self.assertEqual(self.status()["failed"], [])
+
+    def test_stale_vm_does_not_overwrite_newer_state_from_another_vm(self) -> None:
+        s3_hosts = self.s3 / "personal__github__hosts.yml"
+        s3_hosts.write_text("token: v1\n")
+        self.lifecycle.restore_state(self.lifecycle.Deadline(25))
+        # Another MicroVM refreshes the credential after this VM restored it.
+        s3_hosts.write_text("token: v2-from-other-vm\n")
+
+        self.write_hosts("token: v1-changed-here\n")
+        results = self.lifecycle.persist_state("suspend", self.lifecycle.Deadline(10), wait_for_lock=True)
+        self.assertEqual(results["github/hosts.yml"], "conflict")
+        self.assertEqual(s3_hosts.read_text(), "token: v2-from-other-vm\n")
+        self.assertEqual(self.status()["conflicts"], ["github/hosts.yml"])
+
+        # Automatic syncs keep reporting the conflict without retrying the write.
+        calls = len(self.aws_calls())
+        results = self.lifecycle.persist_state("periodic", self.lifecycle.Deadline(10), wait_for_lock=False)
+        self.assertEqual(results["github/hosts.yml"], "conflict")
+        self.assertEqual(len(self.aws_calls()), calls)
+
+        # A plain manual save is still conditional; only --overwrite replaces S3.
+        self.assertEqual(self.lifecycle.manual_sync(), 1)
+        self.assertEqual(s3_hosts.read_text(), "token: v2-from-other-vm\n")
+        self.assertEqual(self.lifecycle.manual_sync(overwrite=True), 0)
+        self.assertEqual(s3_hosts.read_text(), "token: v1-changed-here\n")
+        self.assertEqual(self.status()["conflicts"], [])
+        # After overwriting, this VM owns the latest ETag again and saves normally.
+        self.write_hosts("token: v3\n")
+        results = self.lifecycle.persist_state("periodic", self.lifecycle.Deadline(10), wait_for_lock=False)
+        self.assertEqual(results["github/hosts.yml"], "uploaded")
+
+    def test_first_save_does_not_replace_an_object_created_by_another_vm(self) -> None:
+        self.lifecycle.restore_state(self.lifecycle.Deadline(25))  # nothing in S3 yet
+        (self.s3 / "personal__github__hosts.yml").write_text("token: other-vm\n")
+        self.write_hosts("token: here\n")
+        results = self.lifecycle.persist_state("periodic", self.lifecycle.Deadline(10), wait_for_lock=False)
+        self.assertEqual(results["github/hosts.yml"], "conflict")
+        self.assertEqual((self.s3 / "personal__github__hosts.yml").read_text(), "token: other-vm\n")
 
     def test_unchanged_files_are_not_reuploaded(self) -> None:
         agent_db = self.home / ".omp" / "agent" / "agent.db"

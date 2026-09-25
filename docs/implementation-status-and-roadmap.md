@@ -145,11 +145,11 @@ OMPとGitHubの認証状態はKMS暗号化されたS3へ保存される。ワー
 | 5分定期保存 | 実装済み | sha256が前回保存と同じならskip。lockが使用中なら待たずにskipし、hookが待っていれば実行中のAWS呼び出しを中断して譲る |
 | `/suspend`保存 | 実装済み | 40秒deadline(hook timeout 45秒)。失敗は記録し、Suspendを止めないfail-openで200 |
 | `/terminate`保存 | 実装済み | 同上 |
-| 手動保存 | 実装済み | `persist-auth-state`またはstatus barのクリック。全ファイルを強制保存し、失敗時は非zero終了。`restoreFailed`のブロックも解除する |
+| 手動保存 | 実装済み | `persist-auth-state`またはstatus barのクリック。変更のあるファイルをETag条件付きで保存し、失敗・競合時は非zero終了。`restoreFailed`のブロックも解除する。`--overwrite`は全ファイルを無条件に保存 |
 | S3 Version lifecycle | 実装・検証済み | 非現行Versionは30日で失効。ただし最新10世代の非現行Versionは期間に関係なく保持。未完了multipart uploadは1日で破棄 |
 | Workspace永続化 | 未実装 | Gitを永続化境界とする |
 | S3過去Versionからの復元UI | 未実装 | 手動運用 |
-| 複数VMの書き込み競合制御 | 未実装 | last-writer-wins |
+| 複数VMの書き込み競合制御 | 実装・検証済み | S3 ETagによる楽観ロック。`/run`で記録したETagと一致するときだけ上書きし、不一致は`認証競合`として表示。`persist-auth-state --overwrite`で明示上書き |
 
 ### 2.7 IaC・デプロイ・CI/CD
 
@@ -259,20 +259,24 @@ npm run diff             # deploy後は両Stack差分ゼロ
 
 完了条件「利用者がTerminate前に最新の認証状態が保存されたか判断できる」は、status barの表示で満たす。
 
-#### 5.1 同時実行ポリシーを決める
+#### 5.1 同時実行ポリシーを決める(実装済み 2026-09-25: ETag楽観ロック)
 
-現在、複数MicroVMが同じS3 keyへOMP/GitHub認証状態を書ける。選択肢を1つ決める必要がある。
+複数MicroVMが同じS3 keyへOMP/GitHub認証状態を書けるため、S3 conditional writeによる楽観ロックを採用した。
 
-推奨順:
+- `/run`の復元時に各objectのETag(存在しなければ「未作成」)を`auth-sync.json`へ記録する
+- 自動保存(定期・Suspend・Terminate)と手動保存は`--if-match <ETag>`(未作成なら`--if-none-match '*'`)で書く。成功したら新しいETagを記録する
+- `412 PreconditionFailed`は別VMがより新しい状態を書いた証拠として`conflicts`に記録し、status barに`認証競合`と表示する。そのkeyは自動保存しない
+- `409 ConditionalRequestConflict`は一時的な競合として失敗扱いにし、次回に再試行する
+- 手動保存も条件付きのまま。このVMの認証で上書きすると決めた場合だけ`persist-auth-state --overwrite`で無条件に書き、競合を解除する
 
-1. 当面は「同時に書き込み可能なセッションは1つ」に制限する。
-2. 複数セッションが必要なら、S3 VersionId/ETagによる楽観ロックを実装する。
-3. 本格的な並列利用ではAuth Brokerまたは中央token serviceへ移行する。
+検証: 実行Role(`omp-cloud-ide-microvm-execution`)と実bucketで、未作成→`If-None-Match`で作成、別writerが更新→このVMの保存は`conflict`でS3は別writerの内容のまま、手動保存も`conflict`で非zero、`--overwrite`で上書き成功、を確認した。
+
+未対応: 競合したVMが別VMの新しい認証を取り込み直す操作(現状はログインし直すか、そのVMを終了して新規VMで復元する)。本格的な並列利用ではAuth Brokerまたは中央token serviceへ移行する。
 
 完了条件:
 
-- 2台同時refreshでも新しいcredentialが古いcredentialに戻らない。
-- 競合時は黙って上書きせず、ログまたはUIで検知できる。
+- 2台同時refreshでも新しいcredentialが古いcredentialに戻らない。(満たす)
+- 競合時は黙って上書きせず、ログまたはUIで検知できる。(満たす: status barと`persist-auth-state`の出力)
 
 #### 5.2 Workspaceの損失防止を強化する
 
@@ -555,7 +559,7 @@ Lambdaは`/run`へ`{"microvmId": ..., "runHookPayload": "<RunMicrovmへ渡した
 1. 作業成果は早めにcommit/pushする。
 2. OMP/GitHubログイン直後は`persist-auth-state`(またはstatus barの`認証`表示のクリック)を実行する。
 3. Terminate前・作業終了前はstatus barの`認証`表示が失敗・警告になっていないことを確認する。
-4. 複数MicroVMで同時に認証更新しない。
+4. 複数MicroVMで認証を更新した場合、status barが`認証競合`になったVMの認証は古い。どちらの認証を正とするか決め、必要なら`persist-auth-state --overwrite`を実行する。
 5. 未信頼repoや依存scriptを`yolo`で実行しない。
 6. 作業終了時はstatus barから明示Suspendする。
 7. デプロイ前にbuild/lint/test/diffを通す。

@@ -194,7 +194,10 @@ def restore_state(deadline: Deadline) -> None:
                 }
                 restored += 1
             except SyncError as error:
-                if error.code != "NoSuchKey":
+                if error.code == "NoSuchKey":
+                    # First save must then create the object, not replace one another VM wrote.
+                    files[key] = {"missing": True}
+                else:
                     failed.append(key)
                     log(f"restore failed for {key}: {error.code}")
             except OSError as error:
@@ -212,6 +215,7 @@ def restore_state(deadline: Deadline) -> None:
                 "lastAttemptAt": attempted_at,
                 "lastSuccessAt": None if failed else attempted_at,
                 "failed": [],
+                "conflicts": [],
                 "restoreFailed": failed,
             },
         )
@@ -226,9 +230,15 @@ def sqlite_snapshot(source: Path, destination: Path) -> None:
 
 
 def upload_file(
-    key: str, source: Path, record: dict, deadline: Deadline, force: bool, abort: threading.Event | None
+    key: str, source: Path, record: dict, deadline: Deadline, mode: str, abort: threading.Event | None
 ) -> str:
-    """Uploads a consistent snapshot unless it matches the last confirmed upload."""
+    """Uploads a consistent snapshot unless it matches the last confirmed upload.
+
+    Writes are conditional on the S3 object still being the one this VM last
+    restored or wrote (ETag), so a stale VM cannot silently replace credentials
+    another MicroVM refreshed. Only "overwrite", or a key whose ETag is unknown
+    because its restore failed, writes unconditionally.
+    """
     with tempfile.TemporaryDirectory(prefix="omp-auth-") as temp_dir:
         snapshot = Path(temp_dir) / source.name
         if source.name == "agent.db":
@@ -237,30 +247,52 @@ def upload_file(
             shutil.copy2(source, snapshot)
         os.chmod(snapshot, 0o600)
         digest = file_sha256(snapshot)
-        if not force and record.get("sha256") == digest:
+        if mode != "overwrite" and record.get("sha256") == digest:
             return "unchanged"
-        meta = run_aws(
-            deadline,
-            abort,
-            "s3api",
-            "put-object",
-            "--bucket",
-            BUCKET,
-            "--key",
-            f"{PREFIX}/{key}",
-            "--body",
-            str(snapshot),
-        )
+        precondition: list[str] = []
+        if mode != "overwrite":
+            if record.get("etag"):
+                precondition = ["--if-match", record["etag"]]
+            elif record.get("missing"):
+                precondition = ["--if-none-match", "*"]
+        try:
+            meta = run_aws(
+                deadline,
+                abort,
+                "s3api",
+                "put-object",
+                "--bucket",
+                BUCKET,
+                "--key",
+                f"{PREFIX}/{key}",
+                "--body",
+                str(snapshot),
+                *precondition,
+            )
+        except SyncError as error:
+            # Only a failed precondition proves another writer won; a 409
+            # ConditionalRequestConflict is transient and is retried next sync.
+            if error.code == "PreconditionFailed":
+                return "conflict"
+            raise
     record.clear()
     record.update(sha256=digest, etag=meta.get("ETag"), versionId=meta.get("VersionId"), savedAt=now_ms())
     return "uploaded"
 
 
 def persist_state(
-    trigger: str, deadline: Deadline, *, wait_for_lock: bool, force: bool = False, abort: threading.Event | None = None
+    trigger: str,
+    deadline: Deadline,
+    *,
+    wait_for_lock: bool,
+    mode: str = "auto",
+    abort: threading.Event | None = None,
 ) -> dict[str, str]:
     """Saves auth files to S3 and records the outcome in STATUS_FILE.
 
+    mode: "auto" (periodic/hooks) skips keys blocked by a failed restore or a
+    conflict; "manual" also saves restore-blocked keys (the user logged in again);
+    "overwrite" unconditionally replaces S3 with this VM's files.
     Returns {key: outcome}; outcomes other than uploaded/unchanged/absent are failures.
     """
     if not BUCKET:
@@ -270,25 +302,39 @@ def persist_state(
         status = load_status()
         files = status.setdefault("files", {})
         blocked = set(status.get("restoreFailed", []))
+        conflicts = set(status.get("conflicts", []))
         results: dict[str, str] = {}
         for key, source in STATE_FILES.items():
             if not source.is_file():
                 results[key] = "absent"
                 continue
-            if key in blocked and not force:
+            if mode == "auto" and key in blocked:
                 results[key] = "blocked-after-restore-failure"
                 continue
+            if mode == "auto" and key in conflicts:
+                results[key] = "conflict"
+                continue
             try:
-                results[key] = upload_file(key, source, files.setdefault(key, {}), deadline, force, abort)
-                blocked.discard(key)
+                results[key] = upload_file(key, source, files.setdefault(key, {}), deadline, mode, abort)
             except SyncError as error:
                 results[key] = error.code
             except (OSError, sqlite3.Error) as error:
                 results[key] = type(error).__name__
+            if results[key] == "uploaded":
+                blocked.discard(key)
+                conflicts.discard(key)
+            elif results[key] == "conflict":
+                conflicts.add(key)
 
         failed = sorted(key for key, outcome in results.items() if outcome not in {"uploaded", "unchanged", "absent"})
         attempted_at = now_ms()
-        status.update(lastTrigger=trigger, lastAttemptAt=attempted_at, failed=failed, restoreFailed=sorted(blocked))
+        status.update(
+            lastTrigger=trigger,
+            lastAttemptAt=attempted_at,
+            failed=failed,
+            restoreFailed=sorted(blocked),
+            conflicts=sorted(conflicts),
+        )
         if not failed:
             status["lastSuccessAt"] = attempted_at
         write_json_atomic(STATUS_FILE, status)
@@ -406,19 +452,27 @@ class HookHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
 
-def manual_sync() -> int:
-    """`persist-auth-state`: force-upload every present file and report per-file results."""
+def manual_sync(overwrite: bool = False) -> int:
+    """`persist-auth-state [--overwrite]`: save changed files and report per-file results."""
     if not BUCKET:
         print("AUTH_STATE_BUCKET is unset; nothing was saved.", file=sys.stderr)
         return 1
+    mode = "overwrite" if overwrite else "manual"
     try:
-        results = persist_state("manual", Deadline(MANUAL_BUDGET_SECONDS), wait_for_lock=True, force=True)
+        results = persist_state("manual", Deadline(MANUAL_BUDGET_SECONDS), wait_for_lock=True, mode=mode)
     except SyncError as error:
         print(f"auth state was not saved: {error.code}", file=sys.stderr)
         return 1
     for key, outcome in results.items():
         print(f"{key}: {outcome}")
     failed = [key for key, outcome in results.items() if outcome not in {"uploaded", "unchanged", "absent"}]
+    if any(results[key] == "conflict" for key in failed):
+        print(
+            "CONFLICT: another MicroVM saved newer auth state to S3, so this VM's copy was not written.\n"
+            "Keep using the other VM's credentials (log in again here if needed), or run\n"
+            "`persist-auth-state --overwrite` to replace S3 with this VM's files.",
+            file=sys.stderr,
+        )
     if failed:
         print(f"FAILED: {', '.join(failed)}", file=sys.stderr)
         return 1
@@ -430,8 +484,12 @@ if __name__ == "__main__":
     AGENT_DIR.mkdir(parents=True, exist_ok=True)
     for target in STATE_FILES.values():
         target.parent.mkdir(parents=True, exist_ok=True)
-    if len(sys.argv) == 2 and sys.argv[1] == "--sync":
-        raise SystemExit(manual_sync())
+    if len(sys.argv) >= 2 and sys.argv[1] == "--sync":
+        extra = sys.argv[2:]
+        if extra not in ([], ["--overwrite"]):
+            print("usage: persist-auth-state [--overwrite]", file=sys.stderr)
+            raise SystemExit(2)
+        raise SystemExit(manual_sync(overwrite=extra == ["--overwrite"]))
     threading.Thread(target=periodic_sync, daemon=True).start()
     log(f"hook server listening on port 9000; sync interval={SYNC_INTERVAL}s")
     ThreadingHTTPServer(("0.0.0.0", 9000), HookHandler).serve_forever()

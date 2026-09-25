@@ -63,11 +63,19 @@ function clockOffsetMs(dateHeader, sentAt, receivedAt) {
 function describeAuthSync(status, nowMs, syncIntervalMs) {
   const restoreFailed = Array.isArray(status?.restoreFailed) ? status.restoreFailed : [];
   const failed = Array.isArray(status?.failed) ? status.failed : [];
+  const conflicts = Array.isArray(status?.conflicts) ? status.conflicts : [];
   if (restoreFailed.length > 0) {
     return {
       text: '$(warning) 認証復元失敗',
       level: 'error',
       detail: `起動時にS3から復元できなかったため、次のファイルの自動保存を止めています: ${restoreFailed.join(', ')}。ログインし直してからクリックで保存してください。`,
+    };
+  }
+  if (conflicts.length > 0) {
+    return {
+      text: '$(warning) 認証競合',
+      level: 'error',
+      detail: `別のMicroVMがS3の認証状態を更新したため、このVMの変更は保存していません: ${conflicts.join(', ')}。このVMの認証で上書きする場合はターミナルで persist-auth-state --overwrite を実行してください。`,
     };
   }
   if (failed.length > 0) {
