@@ -1,6 +1,5 @@
 import { spawnSync } from 'node:child_process';
 import * as fs from 'node:fs';
-import * as os from 'node:os';
 import * as path from 'node:path';
 import { Match, Template } from 'aws-cdk-lib/assertions';
 import * as cdk from 'aws-cdk-lib/core';
@@ -354,49 +353,10 @@ describe('OMP Cloud IDE infrastructure', () => {
     expect(payload.expiresAt).toBeLessThanOrEqual(runCalledAt + 28_800_000);
   });
 
-  test('records the lifetime deadline from the Lambda run hook envelope', () => {
-    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'lifecycle-home-'));
-    const lifecycle = path.join(__dirname, '..', 'artifact', 'base-image', 'lifecycle.py');
-    const recordSession = (body: string) =>
-      spawnSync(
-        'python3',
-        [
-          '-c',
-          [
-            'import importlib.util, sys',
-            `spec = importlib.util.spec_from_file_location("lifecycle", ${JSON.stringify(lifecycle)})`,
-            'module = importlib.util.module_from_spec(spec)',
-            'spec.loader.exec_module(module)',
-            'module.record_session(sys.stdin.buffer.read())',
-          ].join('\n'),
-        ],
-        { input: body, env: { ...process.env, HOME: home }, encoding: 'utf8' },
-      );
-    const sessionFile = path.join(home, '.cache', 'omp-cloud-ide', 'session.json');
-
-    try {
-      // A bare payload (not wrapped by Lambda) must not be mistaken for a deadline.
-      expect(recordSession(JSON.stringify({ expiresAt: 1_800_028_800_000 })).status).toBe(0);
-      expect(fs.existsSync(sessionFile)).toBe(false);
-      expect(recordSession('not json').status).toBe(0);
-      expect(fs.existsSync(sessionFile)).toBe(false);
-
-      const envelope = {
-        microvmId: 'mvm-test',
-        runHookPayload: JSON.stringify({
-          sessionId: '7d041485-dff5-4033-bdbc-a921757e217b',
-          expiresAt: 1_800_028_800_000,
-        }),
-      };
-      expect(recordSession(JSON.stringify(envelope)).status).toBe(0);
-      // The session ID is a bearer cookie value, so it stays out of the VM file.
-      expect(JSON.parse(fs.readFileSync(sessionFile, 'utf8'))).toEqual({
-        microvmId: 'mvm-test',
-        expiresAt: 1_800_028_800_000,
-      });
-    } finally {
-      fs.rmSync(home, { recursive: true, force: true });
-    }
+  test('lifecycle.py persistence and run hook behave as specified (test/lifecycle_test.py)', () => {
+    const result = spawnSync('python3', [path.join(__dirname, 'lifecycle_test.py')], { encoding: 'utf8' });
+    expect(`${result.stderr}`).toMatch(/\nOK\s*$/);
+    expect(result.status).toBe(0);
   });
 
   test('counts down the MicroVM lifetime and warns once per crossed threshold', () => {
@@ -406,6 +366,11 @@ describe('OMP Cloud IDE infrastructure', () => {
       formatRemaining: (remainingMs: number) => string;
       parseSessionDeadline: (text: string) => number | null;
       severity: (remainingMs: number) => string;
+      describeAuthSync: (
+        status: unknown,
+        nowMs: number,
+        syncIntervalMs: number,
+      ) => { text: string; level: string; detail: string };
     };
     const minutes = (value: number) => value * 60_000;
 
@@ -433,6 +398,21 @@ describe('OMP Cloud IDE infrastructure', () => {
     const localNow = trueNow - minutes(10);
     expect(timer.clockOffsetMs('Fri, 15 Jan 2027 12:00:00 GMT', localNow - 100, localNow + 100)).toBe(minutes(10));
     expect(timer.clockOffsetMs(null, localNow, localNow)).toBeNull();
+
+    // Auth-sync status: failures outrank age; a sync older than 3 intervals is stale.
+    const now = 1_800_000_000_000;
+    const interval = minutes(5);
+    const ok = { lastSuccessAt: now - minutes(4), failed: [], restoreFailed: [] };
+    expect(timer.describeAuthSync(ok, now, interval)).toMatchObject({ text: '$(cloud) 認証 4分前', level: 'normal' });
+    expect(timer.describeAuthSync({ ...ok, lastSuccessAt: now - minutes(16) }, now, interval).level).toBe('warning');
+    expect(timer.describeAuthSync({ ...ok, failed: ['omp/agent.db'] }, now, interval)).toMatchObject({
+      text: '$(warning) 認証保存失敗',
+      level: 'error',
+    });
+    expect(
+      timer.describeAuthSync({ ...ok, failed: ['x'], restoreFailed: ['github/hosts.yml'] }, now, interval).text,
+    ).toBe('$(warning) 認証復元失敗');
+    expect(timer.describeAuthSync(null, now, interval).level).toBe('warning');
   });
 
   test('preserves the session cookie when a MicroVM origin temporarily returns 502', async () => {

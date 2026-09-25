@@ -130,7 +130,7 @@ OMPとGitHubの認証状態はKMS暗号化されたS3へ保存される。ワー
 | VS Code日本語化 | 実装済み | Japanese language pack |
 | YAML/Python/Docker extension | 実装済み | Image build時に導入 |
 | Suspend control extension | 部分実装 | HTTPS制御画面を開くがCloudFront URLがImage内に固定 |
-| MicroVM残り寿命表示 | 実装済み | Edgeが`RunMicrovm`直前に計算した期限を`/run` hook経由で渡し、status barへ`残り H:MM`、30分/10分で警告色、60/15/5分で通知。VM内時計はS3 `Date` headerで毎分補正。deploy後の新規VMのみ対象、Suspend/Resumeを跨ぐ実機E2Eは未完 |
+| MicroVM残り寿命表示 | 実装・検証済み | Edgeが`RunMicrovm`直前に計算した期限を`/run` hook経由で渡し、status barへ`残り H:MM`、30分/10分で警告色、60/15/5分で通知。VM内時計はS3 `Date` headerで毎分補正(実機ではSuspend 3分→Resume後も補正-1秒で、ゲスト時計の遅れは観測されなかった)。deploy後の新規VMのみ対象 |
 | リポジトリ自動clone | 未実装 | 起動後に手動clone |
 | project依存の自動install | 未実装 | 各リポジトリで手動 |
 
@@ -138,14 +138,14 @@ OMPとGitHubの認証状態はKMS暗号化されたS3へ保存される。ワー
 
 | 項目 | 状態 | 現状 |
 | --- | --- | --- |
-| OMP `agent.db`永続化 | 部分実装 | SQLite backup API→S3。失敗してもhook/手動commandは成功扱い |
-| OMP `install-id`永続化 | 部分実装 | S3対象だが、他ファイルと同じbest-effort/timeout制約を持つ |
-| GitHub CLI認証永続化 | 部分実装 | `hosts.yml`→S3。保存成功の利用者通知なし |
-| `/run`復元 | 部分実装 | atomic replace。S3 CLI non-zeroはskipして200、subprocess timeout等は応答失敗し得る |
-| 5分定期保存 | 部分実装 | 変更有無に関係なくupload、hookと同じlock |
-| `/suspend`保存 | 部分実装 | 45秒timeoutに対し逐次S3処理は最大75秒超 |
-| `/terminate`保存 | 部分実装 | 45秒timeout、捕捉された個別保存失敗でも200 |
-| 手動保存 | 部分実装 | `persist-auth-state`は失敗を非zeroで通知しない |
+| OMP `agent.db`永続化 | 実装済み | SQLite backup API→`s3api put-object`。結果・VersionIdを`~/.cache/omp-cloud-ide/auth-sync.json`へ記録しstatus barに表示 |
+| OMP `install-id`永続化 | 実装済み | 他ファイルと同じdeadline・失敗記録の対象 |
+| GitHub CLI認証永続化 | 実装済み | `hosts.yml`→S3。保存結果をstatus barに表示 |
+| `/run`復元 | 実装済み | 25秒deadline内でatomic replace。未作成(NoSuchKey)は正常、その他の失敗は`restoreFailed`として記録し、そのkeyの自動保存を止める(未ログインのファイルでS3の正常な状態を上書きしない)。fail-openで200 |
+| 5分定期保存 | 実装済み | sha256が前回保存と同じならskip。lockが使用中なら待たずにskipし、hookが待っていれば実行中のAWS呼び出しを中断して譲る |
+| `/suspend`保存 | 実装済み | 40秒deadline(hook timeout 45秒)。失敗は記録し、Suspendを止めないfail-openで200 |
+| `/terminate`保存 | 実装済み | 同上 |
+| 手動保存 | 実装済み | `persist-auth-state`またはstatus barのクリック。全ファイルを強制保存し、失敗時は非zero終了。`restoreFailed`のブロックも解除する |
 | S3 Version lifecycle | 未実装 | 5分syncで旧Versionが継続増加 |
 | Workspace永続化 | 未実装 | Gitを永続化境界とする |
 | S3過去Versionからの復元UI | 未実装 | 手動運用 |
@@ -243,21 +243,21 @@ npm run diff             # deploy後は両Stack差分ゼロ
 
 ### P0: データ損失と認証競合を減らす
 
-#### 5.0 lifecycle保存を「成功/失敗が分かる処理」にする
+#### 5.0 lifecycle保存を「成功/失敗が分かる処理」にする(実装済み 2026-09-25)
 
-現在の認証状態保存はベストエフォートであり、失敗してもhookは200、手動commandは成功終了する。さらにAWS CLI 25秒timeoutを3ファイルへ逐次適用するため、hook全体timeoutを超え得る。
+次を実装した。
 
-必要な改善:
+- hookごとのdeadline(`/run` 25秒、`/suspend`・`/terminate` 40秒)。各AWS CLI呼び出しは`min(25秒, 残り時間)`で打ち切る
+- fail-open policy: hookは常に200を返してRun/Suspend/Terminateを止めない。代わりに結果を`auth-sync.json`へ記録する
+- 手動command(`persist-auth-state`)は失敗ファイルがあれば非zeroで終了し、ファイルごとの結果を表示する
+- last-success、failed-files、restoreFailed、VersionId/ETagを`auth-sync.json`へ記録し、code-serverのstatus barに`認証 N分前`/`認証保存失敗`/`認証復元失敗`として表示する。クリックで手動保存
+- lifecycle hookが待っている間、定期保存は実行中のAWS呼び出しを中断してlockを譲る。lockは`fcntl.flock`で手動commandとも共有する
+- sha256で未変更ファイルをskipする
+- 復元に失敗したkeyは自動保存を止める(ログインし直して手動保存すると解除)
 
-- hook全体deadlineを設け、残時間を各I/Oへ配分する
-- `agent.db`など必須ファイル失敗時はnon-2xxまたは明示したfail-open/fail-closed policyを返す
-- 手動commandは失敗ファイルがあれば非zeroで終了する
-- last-success、failed-files、保存VersionIdをDynamoDB/metric/UIへ記録する
-- periodic syncよりlifecycle hookを優先し、lock待ちでtimeoutしないようにする
-- hash/mtimeで未変更ファイルをskipする
-- S3 noncurrent versionの保持日数/世代数を決める
+未対応: DynamoDB/metricへの記録(VMの実行Roleに権限がないため、現状はVM内ファイルとCloudWatch Logsのみ)、S3 noncurrent versionの保持期間(5.17)。手動保存がlockを握っている間(最大約2分)にSuspendされると、hookは待ちきれずに保存をskipし得る。
 
-完了条件は、利用者がTerminate前に最新の認証状態が保存されたか判断できることである。
+完了条件「利用者がTerminate前に最新の認証状態が保存されたか判断できる」は、status barの表示で満たす。
 
 #### 5.1 同時実行ポリシーを決める
 
@@ -553,8 +553,8 @@ Lambdaは`/run`へ`{"microvmId": ..., "runHookPayload": "<RunMicrovmへ渡した
 改善が完了するまで、次を守る。
 
 1. 作業成果は早めにcommit/pushする。
-2. OMP/GitHubログイン直後は`persist-auth-state`を実行する。
-3. commandが成功表示しても、現状はS3保存成功を保証しないためlifecycle logも確認する。
+2. OMP/GitHubログイン直後は`persist-auth-state`(またはstatus barの`認証`表示のクリック)を実行する。
+3. Terminate前・作業終了前はstatus barの`認証`表示が失敗・警告になっていないことを確認する。
 4. 複数MicroVMで同時に認証更新しない。
 5. 未信頼repoや依存scriptを`yolo`で実行しない。
 6. 作業終了時はstatus barから明示Suspendする。

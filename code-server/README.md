@@ -20,7 +20,7 @@ Lifecycle hooks
       personal/github/hosts.yml
 ```
 
-The SQLite database is copied with Python's SQLite backup API, never as a live-file byte copy. State is restored on `/run`, saved every five minutes, saved on `/suspend` and `/terminate`, and can be saved immediately with `persist-auth-state`.
+The SQLite database is copied with Python's SQLite backup API, never as a live-file byte copy. State is restored on `/run`, saved every five minutes (unchanged files are skipped), saved on `/suspend` and `/terminate`, and can be saved immediately with `persist-auth-state`, which prints a per-file result and exits non-zero if any file failed. Hooks run under deadlines shorter than their image timeouts and always answer 200 so they never block Run/Suspend/Terminate; the outcome is recorded in `~/.cache/omp-cloud-ide/auth-sync.json` and shown in the status bar (`認証 N分前`, `認証保存失敗`, or `認証復元失敗`). Clicking it runs `persist-auth-state`. If a restore failed for a file, automatic saves skip that file so an unauthenticated local copy cannot overwrite good state in S3; log in again and save manually to lift the block.
 
 ## Deployment boundary
 

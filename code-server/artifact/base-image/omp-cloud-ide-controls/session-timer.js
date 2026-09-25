@@ -54,4 +54,58 @@ function clockOffsetMs(dateHeader, sentAt, receivedAt) {
   return Math.round(serverSecond + 500 - (sentAt + receivedAt) / 2);
 }
 
-module.exports = { NOTIFY_MINUTES, clockOffsetMs, dueNotification, formatRemaining, parseSessionDeadline, severity };
+/**
+ * Summarizes lifecycle.py's auth-sync.json for the status bar. Ages use the local
+ * clock on purpose: lifecycle.py stamps the file with the same guest clock.
+ * Failures outrank staleness; a sync older than three intervals means the
+ * periodic sync is not running and S3 may be missing recent logins.
+ */
+function describeAuthSync(status, nowMs, syncIntervalMs) {
+  const restoreFailed = Array.isArray(status?.restoreFailed) ? status.restoreFailed : [];
+  const failed = Array.isArray(status?.failed) ? status.failed : [];
+  if (restoreFailed.length > 0) {
+    return {
+      text: '$(warning) 認証復元失敗',
+      level: 'error',
+      detail: `起動時にS3から復元できなかったため、次のファイルの自動保存を止めています: ${restoreFailed.join(', ')}。ログインし直してからクリックで保存してください。`,
+    };
+  }
+  if (failed.length > 0) {
+    return {
+      text: '$(warning) 認証保存失敗',
+      level: 'error',
+      detail: `S3へ保存できませんでした: ${failed.join(', ')}。クリックで再試行します。`,
+    };
+  }
+  if (!Number.isSafeInteger(status?.lastSuccessAt)) {
+    return {
+      text: '$(cloud) 認証 未保存',
+      level: 'warning',
+      detail: 'S3への保存記録がありません。クリックで保存します。',
+    };
+  }
+  const ageMs = Math.max(0, nowMs - status.lastSuccessAt);
+  const text = `認証 ${Math.floor(ageMs / 60_000)}分前`;
+  if (ageMs > 3 * syncIntervalMs) {
+    return {
+      text: `$(warning) ${text}`,
+      level: 'warning',
+      detail: '定期保存が止まっている可能性があります。クリックで今すぐ保存します。',
+    };
+  }
+  return {
+    text: `$(cloud) ${text}`,
+    level: 'normal',
+    detail: 'S3の認証状態はこのVMの最新状態と一致しています。クリックで今すぐ保存します。',
+  };
+}
+
+module.exports = {
+  NOTIFY_MINUTES,
+  clockOffsetMs,
+  describeAuthSync,
+  dueNotification,
+  formatRemaining,
+  parseSessionDeadline,
+  severity,
+};

@@ -1,3 +1,4 @@
+const { execFile } = require('node:child_process');
 const fs = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
@@ -6,6 +7,9 @@ const timer = require('./session-timer');
 
 // Written by /opt/cloud-ide/lifecycle.py when the /run hook delivers the Edge deadline.
 const SESSION_FILE = path.join(os.homedir(), '.cache', 'omp-cloud-ide', 'session.json');
+// Written by lifecycle.py after every restore/save attempt.
+const AUTH_SYNC_FILE = path.join(os.homedir(), '.cache', 'omp-cloud-ide', 'auth-sync.json');
+const SYNC_INTERVAL_MS = Math.max(60, Number(process.env.AUTH_SYNC_INTERVAL_SECONDS) || 300) * 1000;
 const TICK_MS = 15_000;
 const CLOCK_SYNC_MS = 60_000;
 
@@ -40,7 +44,7 @@ function activate(context) {
       : 'ompCloudIde.openControl';
   status.show();
 
-  context.subscriptions.push(openControl, status, createLifetimeCountdown());
+  context.subscriptions.push(openControl, status, createLifetimeCountdown(), ...createAuthSyncStatus());
 }
 
 function createLifetimeCountdown() {
@@ -140,6 +144,54 @@ function createLifetimeCountdown() {
     focus.dispose();
     item.dispose();
   });
+}
+
+function createAuthSyncStatus() {
+  const item = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 98);
+  item.name = 'OMP Cloud IDE auth-state sync';
+  item.command = 'ompCloudIde.persistAuthState';
+  item.show();
+
+  const refresh = async () => {
+    const status = await fs
+      .readFile(AUTH_SYNC_FILE, 'utf8')
+      .then(JSON.parse, () => null)
+      .catch(() => null);
+    const view = timer.describeAuthSync(status, Date.now(), SYNC_INTERVAL_MS);
+    item.text = view.text;
+    item.tooltip = `OMP/GitHubの認証状態(S3): ${view.detail}`;
+    item.backgroundColor =
+      view.level === 'normal' ? undefined : new vscode.ThemeColor(`statusBarItem.${view.level}Background`);
+  };
+
+  let saving = false;
+  const persist = vscode.commands.registerCommand('ompCloudIde.persistAuthState', async () => {
+    if (saving) return;
+    saving = true;
+    try {
+      const { failed, output } = await vscode.window.withProgress(
+        { location: vscode.ProgressLocation.Notification, title: '認証状態をS3へ保存しています…' },
+        () =>
+          new Promise((resolve) => {
+            execFile('/usr/local/bin/persist-auth-state', { timeout: 150_000 }, (error, stdout, stderr) => {
+              resolve({ failed: Boolean(error), output: `${stdout}${stderr}`.trim() });
+            });
+          }),
+      );
+      if (failed) {
+        void vscode.window.showErrorMessage(`認証状態を保存できませんでした。\n${output}`);
+      } else {
+        void vscode.window.showInformationMessage('認証状態をS3へ保存しました。');
+      }
+    } finally {
+      saving = false;
+      await refresh();
+    }
+  });
+
+  void refresh();
+  const interval = setInterval(() => void refresh(), TICK_MS);
+  return [persist, item, new vscode.Disposable(() => clearInterval(interval))];
 }
 
 function validTimeZone(timeZone) {
