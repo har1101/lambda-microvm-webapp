@@ -268,6 +268,7 @@ OMPが書き込み中の`agent.db`を単純に`cp`すると、不整合なスナ
 - `persist-auth-state`はファイルごとの結果を表示し、失敗があれば非0で終了する。
 - 定期sync、hook、手動保存は同じ`fcntl.flock`のlockを使う。定期syncはlockを待たずにその周期を飛ばし、hookがlockを待っているときは定期syncの実行中のAWS呼び出しを打ち切ってhookを優先する。
 - 復元でNoSuchKey（初回起動では正常）以外の失敗が起きたkeyは`restoreFailed`に入れ、自動保存の対象から外す。未認証のローカルファイルでS3上の正しい状態を上書きしないためである。再ログイン後の手動保存で解除する。
+- 起動時の復元は3ファイルを同じ25秒deadlineで逐次取得すると、先頭のS3/KMS呼び出しが遅れただけで後続が`DeadlineExceeded`になる。先頭を1.8秒遅延させ、全体を2.5秒とした回帰テストで後続2件だけが失敗することを再現した。`/run`の取得だけを並列化し、各ファイルの原子的な置換と失敗時の自動保存停止は維持する。
 
 教訓は、「hookを失敗させない（fail-open）」ことと「結果を利用者が確認できる」ことを別々に設計することである。既知の制約として、手動保存がlockを保持している間（最大約2分）に来たSuspend hookは、待ちきれずに保存を飛ばすことがある。
 
@@ -521,7 +522,7 @@ Image buildやCloudFront更新を含むdeployは数分以上かかる。短いti
 - noncurrent version lifecycle rule
 - 認証状態保存（Pythonの`lifecycle_test.py`）: 初回のNoSuchKey、`restoreFailed`、ETagによる競合検出、sha256 skip、失敗記録、hook deadline、hookによる定期syncの打ち切り、`/run` hook本文のenvelope解析
 
-現在はJest 22件で、そのうち1件がPython unittestの`lifecycle_test.py`（9件）を実行する。新規起動の二重送信・補償、終了の二段階確認と曖昧な失敗、originへのCookie転送も確認する。
+現在はJest 22件で、そのうち1件がPython unittestの`lifecycle_test.py`（11件）を実行する。新規起動の二重送信・補償、終了の二段階確認と曖昧な失敗、originへのCookie転送、先頭S3取得が遅い場合と1件だけtimeoutした場合の復元も確認する。
 
 ### 11.2 CDK assertionの配列順に注意する
 
@@ -548,7 +549,7 @@ CDKは複数IAM actionを1つのStatementへまとめる。`Match.arrayWith`は�
 
 2026-09-25の追加E2Eでは、同じ起動フォームを2回POSTすると2回目は409、誤ったMicroVM IDの終了確認は拒否、正しいIDでのTerminate後に対象だけ`TERMINATED`となり行が一覧から消えることを確認した。Edge専用Cookieを送ったリクエストをcode-serverの`/proxy/3000/`経由で一時HTTP endpointへ通すと、origin側のCookie headerは空だった。テスト用VMだけを削除し、事前に記録した既存VMは維持された。
 
-ただし新規VMのうち1台は起動時に`omp/install-id`と`github/hosts.yml`の`認証復元失敗`を表示した。次の2台では`認証 0分前`となり、そのうち1台のVM内からS3 `get-object`も成功した。失敗原因は未特定であり、fail-openのhookが200を返すことと認証復元の成功は同一視できない。利用開始時とTerminate前にstatus barを確認する。
+当時の新規VMのうち1台で`omp/install-id`と`github/hosts.yml`が`認証復元失敗`になり、後続の2台は成功した。旧実装の逐次取得によるdeadline枯渇で同じ失敗の並びを再現し、並列取得へ変更した。デプロイ後の新規テストVM 2台では、3ファイルすべての復元と`認証 0分前`を確認し、Suspend/Resume後も維持された。ただし元の実機失敗コードは記録されておらず、同じ原因だったことやS3/KMS固有障害の解消までは証明できない。fail-openのhookが200を返すことと認証復元成功は同一視せず、利用開始時とTerminate前にstatus barを確認する。
 
 ### 11.4 SecretをE2Eログへ出さない
 

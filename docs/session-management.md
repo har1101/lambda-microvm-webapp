@@ -135,6 +135,8 @@ TerminateされたMicroVMのローカルディスクとRAM状態は戻せない�
 
 `/suspend`と`/terminate` hookは、`lifecycle.py`が40秒のdeadline(Image側のhook timeoutは45秒)内でOMPとGitHubの認証ファイルをS3へ保存する。各AWS CLI呼び出しは`min(25秒, 残り時間)`で打ち切るため、S3/KMSが応答しなくてもhookがtimeoutを超えて止まることはない。
 
+`/run`では3ファイルの`get-object`を共通25秒deadline内で並列実行する。旧実装の逐次実行では最初の取得が遅れると残り2件が`DeadlineExceeded`になった。ファイルごとの一時ファイル・原子的置換、`NoSuchKey`と実際の失敗の区別は変えていない。
+
 - sha256が前回保存と同じファイルは送らない。
 - 保存は`aws s3api put-object`で、`/run`の復元時に記録したETagと一致するときだけ書くETag楽観ロックである(S3に未作成なら`--if-none-match '*'`)。別MicroVMがより新しい状態を書いていれば上書きせず、`認証競合`として記録する。
 - `/run`で復元に失敗したkeyと競合したkeyは自動保存しない。未ログインのファイルでS3の正常な状態を上書きしないためである。
@@ -143,7 +145,7 @@ TerminateされたMicroVMのローカルディスクとRAM状態は戻せない�
 
 記録した結果はcode-serverのstatus barに`認証 N分前`、`認証保存失敗`、`認証復元失敗`、`認証競合`として表示され、クリックすると`persist-auth-state`で手動保存する。実行中MicroVMのstdout(`[lifecycle]`行)はCloudWatch Logsへ届かないため、保存結果はログではなくstatus barか`auth-sync.json`で確認する。Terminate後は確認できないので、Terminate前にstatus barを確認する。
 
-2026-09-25の新規VM E2Eでは、1台で`omp/install-id`と`github/hosts.yml`が`認証復元失敗`になり、後続の2台では成功した。原因は未特定。失敗したVMはそのkeyの自動保存を止めるので、利用開始時にstatus barを確認し、必要なら再ログイン後に明示的に`persist-auth-state`を実行する。
+2026-09-25の新規VM E2Eでは、1台で`omp/install-id`と`github/hosts.yml`が`認証復元失敗`になった。先頭取得を遅延させる回帰テストで同じ並びを再現し、並列化後の新規VM 2台では3ファイルすべてが復元された。元のVMの失敗コードは未取得なので、S3/KMS固有障害まで解消したとは断定しない。利用開始時にstatus barを確認し、実際に失敗したVMでは必要なら再ログイン後に明示的に`persist-auth-state`を実行する。
 
 ### 残り寿命の表示
 

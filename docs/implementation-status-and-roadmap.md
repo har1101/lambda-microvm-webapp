@@ -141,7 +141,7 @@ OMPとGitHubの認証状態はKMS暗号化されたS3へ保存される。ワー
 | OMP `agent.db`永続化 | 実装済み | SQLite backup API→`s3api put-object`。結果・VersionIdを`~/.cache/omp-cloud-ide/auth-sync.json`へ記録しstatus barに表示 |
 | OMP `install-id`永続化 | 実装済み | 他ファイルと同じdeadline・失敗記録の対象 |
 | GitHub CLI認証永続化 | 実装済み | `hosts.yml`→S3。保存結果をstatus barに表示 |
-| `/run`復元 | 実装済み | 25秒deadline内でatomic replace。未作成(NoSuchKey)は正常、その他の失敗は`restoreFailed`として記録し、そのkeyの自動保存を止める(未ログインのファイルでS3の正常な状態を上書きしない)。fail-openで200 |
+| `/run`復元 | 実装・検証済み | 25秒の共通deadline内で3ファイルを並列取得し、atomic replace。1つの遅延が後続を期限切れにしない。NoSuchKeyは正常、その他の失敗は`restoreFailed`に記録してそのkeyの自動保存を止める。fail-openで200 |
 | 5分定期保存 | 実装済み | ETag条件付き。sha256が前回保存と同じならskip。競合・復元失敗のkeyは自動保存しない。lockが使用中なら待たずにskipし、hookが待っていれば実行中のAWS呼び出しを中断して譲る |
 | `/suspend`保存 | 実装済み | 40秒deadline(hook timeout 45秒)でETag条件付き保存。失敗・競合は`auth-sync.json`へ記録し、Suspendを止めないfail-openで200。手動保存がlockを握っている間(最大約2分)は保存をskipし得る |
 | `/terminate`保存 | 実装済み | 同上 |
@@ -159,7 +159,7 @@ OMPとGitHubの認証状態はKMS暗号化されたS3へ保存される。ワー
 | AWS CDK TypeScript | 実装済み | 2リージョン・2スタック |
 | cdkd deploy | 実装・検証済み | `--all --full-wait` |
 | cdkd diff/dry-run | 実装済み | npm scripts |
-| IaC unit test | 実装・検証済み | Jest 22件(うち1件がPython `lifecycle_test.py`の9件を実行) |
+| IaC unit test | 実装・検証済み | Jest 22件(うち1件がPython `lifecycle_test.py`の11件を実行) |
 | Biome lint | 実装・検証済み | recommended rules |
 | TypeScript strict check | 実装・検証済み | `tsc --noEmit` |
 | GitHub Actions CI | 未実装 | workflowなし |
@@ -182,7 +182,7 @@ OMPとGitHubの認証状態はKMS暗号化されたS3へ保存される。ワー
 ```text
 npm run build
 npm run lint
-npm test -- --runInBand  # Jest 22 tests(Python lifecycle_test.py 9 testsを含む)
+npm test -- --runInBand  # Jest 22 tests(Python lifecycle_test.py 11 testsを含む)
 npm run diff             # deploy後は両Stack差分ゼロ
 ```
 
@@ -211,9 +211,11 @@ npm run diff             # deploy後は両Stack差分ゼロ
 
 このE2Eでは、login・chooser・Suspend・ResumeをCookie付きHTTPで操作し、ブラウザではcode-server UIだけを開いた。同梱のheadless ChromiumがEdgeのlogin/chooserページを描画するとSkia FontConfigで異常終了するためである(5.9.1節)。
 
-同日、起動・終了の安全策を反映したEdgeをデプロイし、テスト用MicroVMだけでフォームUUIDの二重POSTが409になること、追跡中のセッションを選択・接続できること、確認画面で誤ったIDが拒否されること、正しいIDでTerminateした後に`TERMINATED`を確認して行が消えること、access Cookieを残して選択画面へ戻ることを確認した。既存MicroVMは検証後も残った。新規VMのstatus barは`残り 7:59`を表示したが、1回の実行では`omp/install-id`と`github/hosts.yml`に`認証復元失敗`も表示された。後続の新規VMでは`認証 0分前`となったため、復元の安定性は未確認である。
+同日、起動・終了の安全策を反映したEdgeをデプロイし、テスト用MicroVMだけでフォームUUIDの二重POSTが409になること、追跡中のセッションを選択・接続できること、確認画面で誤ったIDが拒否されること、正しいIDでTerminateした後に`TERMINATED`を確認して行が消えること、access Cookieを残して選択画面へ戻ることを確認した。既存MicroVMは検証後も残った。新規VMのstatus barは`残り 7:59`を表示したが、1回の実行では`omp/install-id`と`github/hosts.yml`に`認証復元失敗`も表示された。
 
-別のテスト用MicroVMでは、IDE内でport 3000の一時的なHTTP endpointを起動し、CloudFrontの`/proxy/3000/headers`を通したCookie headerが空であることを確認した。access/session Cookieを付けたブラウザ側リクエストでも、originへは渡っていない。`/run`の認証復元はこのVMで全ファイル成功し、同じVMからのS3 `get-object`も成功したが、前述の失敗が一過性だった理由は未特定。
+別のテスト用MicroVMでは、IDE内でport 3000の一時的なHTTP endpointを起動し、CloudFrontの`/proxy/3000/headers`を通したCookie headerが空であることを確認した。access/session Cookieを付けたブラウザ側リクエストでも、originへは渡っていない。`/run`の認証復元はこのVMで全ファイル成功し、同じVMからのS3 `get-object`も成功した。当時は前述の失敗原因を特定できていなかった。
+
+その後、旧`/run`の先頭`get-object`を遅延させた回帰テストで、後続2ファイルが`DeadlineExceeded`になり、実機と同じ復元失敗の並びになることを再現した。3ファイルを共通deadline内で並列取得するImageをデプロイし、新規テストVMを2台連続で起動。両方で`auth-sync.json`の`restoreFailed=[]`、3ファイルのSHA-256記録、status barの`認証 0分前`、VM内からのS3取得成功を確認した。Suspend/Resume後も正常表示され、テストVMだけをTerminate・行削除し、既存VMは維持された。元の実機失敗のエラーコードは取得できていないため、同じ遅延が唯一の原因だったとは断定しない。
 
 ### 3.3 手動利用確認
 
@@ -238,7 +240,7 @@ npm run diff             # deploy後は両Stack差分ゼロ
 - 強制的な異常終了後の最大損失時間確認
 - 2台の実MicroVMが同時にOAuth refreshする競合試験(条件付き書き込み自体は実行Roleと実bucketで確認済み)
 - 8時間上限到達後の新規VMへの認証復元
-- `/run`認証復元の一過性失敗の原因特定と再現防止。2026-09-25の新規VMでは2ファイルが`restoreFailed`になり、直後に起動した別のVMでは全ファイル成功した。復元失敗時は自動保存がブロックされるため、そのVMで再ログインして手動保存する前にstatus barを確認する
+- `/run`復元失敗の実機エラーコード取得と継続監視。後続が期限切れになる逐次取得は再現・修正済みだが、過去の実機失敗コードは残っていない。S3/KMS固有障害は依然として`restoreFailed`になり、該当keyの自動保存が止まる
 - CloudFront/Lambda@Edgeのregional log横断調査
 - 残り寿命の60/15/5分通知と警告色の実機確認(実機で確認したのは開始直後とSuspend/Resume後の表示まで)
 - status bar項目のクリック(Suspend制御画面、手動保存、Source Control)の実ブラウザ操作。headless Chromiumでは文字glyphがほぼ描画されず、合成`element.click()`も効かないため自動化できていない
@@ -265,6 +267,7 @@ npm run diff             # deploy後は両Stack差分ゼロ
 次を実装した。
 
 - hookごとのdeadline(`/run` 25秒、`/suspend`・`/terminate` 40秒)。各AWS CLI呼び出しは`min(25秒, 残り時間)`で打ち切る
+- `/run`の3つのS3取得を並列化。遅い先頭取得に後続ファイルの時間を奪われないようにし、各ファイルの失敗隔離と共通25秒deadlineは維持する
 - fail-open policy: hookは常に200を返してRun/Suspend/Terminateを止めない。代わりに結果を`auth-sync.json`へ記録する
 - 手動command(`persist-auth-state`)は失敗ファイルがあれば非zeroで終了し、ファイルごとの結果を表示する
 - last-success、failed-files、restoreFailed、VersionId/ETagを`auth-sync.json`へ記録し、code-serverのstatus barに`認証 N分前`/`認証保存失敗`/`認証復元失敗`として表示する。クリックで手動保存

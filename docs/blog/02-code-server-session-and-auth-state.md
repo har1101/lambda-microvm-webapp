@@ -413,6 +413,7 @@ def sqlite_snapshot(source: Path, destination: Path) -> None:
 復元するときも、対象のファイルへ直接ダウンロードはしません。同じディレクトリの一時ファイルへダウンロードし、権限を`0600`にしてから`os.replace`で置き換えます。途中で失敗しても、既存のファイルが中途半端に上書きされることはありません。
 
 ```python:lifecycle.py
+# restore_file((key, target)) の抜粋。キーごとに別の一時ファイルを使う
 with tempfile.NamedTemporaryFile(dir=target.parent, delete=False) as tmp:
     temp_path = Path(tmp.name)
 try:
@@ -420,12 +421,12 @@ try:
                    "--bucket", BUCKET, "--key", f"{PREFIX}/{key}", str(temp_path))
     os.chmod(temp_path, 0o600)
     os.replace(temp_path, target)
-    files[key] = {"sha256": file_sha256(target), "etag": meta.get("ETag"), "versionId": meta.get("VersionId")}
+    return key, {"sha256": file_sha256(target),
+                 "etag": meta.get("ETag"), "versionId": meta.get("VersionId")}, None
 except SyncError as error:
     if error.code == "NoSuchKey":
-        files[key] = {"missing": True}  # 初回起動。最初の保存は新規作成だけにする
-    else:
-        failed.append(key)
+        return key, {"missing": True}, None
+    return key, None, error.code
 finally:
     temp_path.unlink(missing_ok=True)
 ```
@@ -433,6 +434,8 @@ finally:
 `aws s3 cp`ではなく`aws s3api get-object`を使っているのは、戻したオブジェクトのETagとVersionIdを記録するためです。ETagは後で書く楽観ロックに使います。
 
 `NoSuchKey`は初回起動なので正常です。それ以外の理由で復元できなかったファイルは`restoreFailed`に入れ、自動保存では送らないようにしています。復元に失敗したMicroVMのローカルファイルは未ログインの状態なので、それでS3の正しい認証情報を上書きしてしまわないためです。ログインし直して`persist-auth-state`を実行すると、この制限は外れます。このときはETagがわからないので、手動保存に限って無条件で書き込みます。
+
+旧実装ではこれを3ファイルに対して逐次呼び出し、先頭のS3取得が遅れると同じ25秒の期限を使い切って後続2ファイルが`DeadlineExceeded`になりました。先頭を遅延させた回帰テストで実機と同じ失敗の並びを再現したため、今は`ThreadPoolExecutor(max_workers=len(STATE_FILES))`で3件を同時に開始し、すべての結果が揃ってから`restoreFailed`を記録します。デプロイ後に起動した2台では3ファイルとも復元されましたが、元の実機失敗コードは記録されていなかったので、他のS3/KMSエラーまで防げるという意味ではありません。
 
 ## 保存の結果をステータスバーに出す
 最初の実装では、保存に失敗してもhook serverのログに出るだけでした。ところが調べてみると、実行中のMicroVMの標準出力(`[lifecycle]`の行)はCloudWatch Logsに届いていませんでした。Imageに設定したロググループに残るのは、Imageのbuildと検証のときの出力だけです。つまり、失敗しても誰も気づけない状態でした。

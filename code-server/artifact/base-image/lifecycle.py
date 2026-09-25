@@ -18,6 +18,7 @@ import threading
 import time
 import urllib.request
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -155,7 +156,7 @@ def file_sha256(path: Path) -> str:
 
 
 def restore_state(deadline: Deadline) -> None:
-    """Restores auth files on /run. Fail-open: the IDE starts even if S3 is unreachable.
+    """Restore auth files on /run without one slow download starving the others.
 
     A key whose restore failed is marked `restoreFailed`, and automatic syncs will
     not upload it, so an unauthenticated local file never overwrites good state in
@@ -165,46 +166,54 @@ def restore_state(deadline: Deadline) -> None:
         log("AUTH_STATE_BUCKET is unset; restore skipped")
         return
 
+    def restore_file(item: tuple[str, Path]) -> tuple[str, dict | None, str | None]:
+        key, target = item
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(dir=target.parent, delete=False) as tmp:
+            temp_path = Path(tmp.name)
+        try:
+            meta = run_aws(
+                deadline,
+                None,
+                "s3api",
+                "get-object",
+                "--bucket",
+                BUCKET,
+                "--key",
+                f"{PREFIX}/{key}",
+                str(temp_path),
+            )
+            os.chmod(temp_path, 0o600)
+            os.replace(temp_path, target)
+            return key, {
+                "sha256": file_sha256(target),
+                "etag": meta.get("ETag"),
+                "versionId": meta.get("VersionId"),
+            }, None
+        except SyncError as error:
+            if error.code == "NoSuchKey":
+                # First save must not replace an object another VM creates.
+                return key, {"missing": True}, None
+            return key, None, error.code
+        except OSError as error:
+            return key, None, type(error).__name__
+        finally:
+            temp_path.unlink(missing_ok=True)
+
     with sync_lock(deadline):
         files: dict[str, dict] = {}
         failed: list[str] = []
         restored = 0
-        for key, target in STATE_FILES.items():
-            target.parent.mkdir(parents=True, exist_ok=True)
-            with tempfile.NamedTemporaryFile(dir=target.parent, delete=False) as tmp:
-                temp_path = Path(tmp.name)
-            try:
-                meta = run_aws(
-                    deadline,
-                    None,
-                    "s3api",
-                    "get-object",
-                    "--bucket",
-                    BUCKET,
-                    "--key",
-                    f"{PREFIX}/{key}",
-                    str(temp_path),
-                )
-                os.chmod(temp_path, 0o600)
-                os.replace(temp_path, target)
-                files[key] = {
-                    "sha256": file_sha256(target),
-                    "etag": meta.get("ETag"),
-                    "versionId": meta.get("VersionId"),
-                }
-                restored += 1
-            except SyncError as error:
-                if error.code == "NoSuchKey":
-                    # First save must then create the object, not replace one another VM wrote.
-                    files[key] = {"missing": True}
-                else:
+        # Each subprocess shares the hook deadline, not its predecessor's
+        # remaining time. A slow first S3/KMS call cannot starve the other keys.
+        with ThreadPoolExecutor(max_workers=len(STATE_FILES)) as pool:
+            for key, record, error in pool.map(restore_file, STATE_FILES.items()):
+                if error:
                     failed.append(key)
-                    log(f"restore failed for {key}: {error.code}")
-            except OSError as error:
-                failed.append(key)
-                log(f"restore failed for {key}: {type(error).__name__}")
-            finally:
-                temp_path.unlink(missing_ok=True)
+                    log(f"restore failed for {key}: {error}")
+                elif record is not None:
+                    files[key] = record
+                    restored += not record.get("missing", False)
 
         attempted_at = now_ms()
         write_json_atomic(

@@ -38,6 +38,10 @@ FAKE_AWS = textwrap.dedent(
         print("An error occurred (AccessDenied) when calling the operation: denied", file=sys.stderr)
         sys.exit(254)
     stored = Path(os.environ["FAKE_S3_DIR"]) / key.replace("/", "__")
+    if operation == "get-object" and key == os.environ.get("FAKE_AWS_SLOW_GET_KEY"):
+        time.sleep(float(os.environ["FAKE_AWS_SLOW_GET_SECONDS"]))
+    if operation == "get-object" and key == os.environ.get("FAKE_AWS_HANG_GET_KEY"):
+        time.sleep(30)
     etag = lambda path: '"' + hashlib.md5(path.read_bytes()).hexdigest() + '"'
     if operation == "get-object":
         if not stored.exists():
@@ -103,6 +107,33 @@ class LifecycleTest(unittest.TestCase):
         status = self.status()
         self.assertEqual(status["restoreFailed"], [])
         self.assertIsInstance(status["lastSuccessAt"], int)
+
+    def test_slow_first_download_does_not_starve_other_auth_files(self) -> None:
+        for key in ("omp/agent.db", "omp/install-id", "github/hosts.yml"):
+            (self.s3 / ("personal__" + key.replace("/", "__"))).write_text(f"saved {key}\n")
+        os.environ["FAKE_AWS_SLOW_GET_KEY"] = "personal/omp/agent.db"
+        os.environ["FAKE_AWS_SLOW_GET_SECONDS"] = "1.8"
+
+        self.lifecycle.restore_state(self.lifecycle.Deadline(2.5))
+
+        self.assertEqual(self.status()["restoreFailed"], [])
+        for key, target in self.lifecycle.STATE_FILES.items():
+            self.assertEqual(target.read_text(), f"saved {key}\n")
+
+    def test_timed_out_download_only_blocks_its_own_auth_file(self) -> None:
+        for key in ("omp/agent.db", "omp/install-id", "github/hosts.yml"):
+            (self.s3 / ("personal__" + key.replace("/", "__"))).write_text(f"saved {key}\n")
+        os.environ["FAKE_AWS_HANG_GET_KEY"] = "personal/omp/agent.db"
+        started = time.monotonic()
+
+        self.lifecycle.restore_state(self.lifecycle.Deadline(2.5))
+
+        self.assertLess(time.monotonic() - started, 4)
+        self.assertEqual(self.status()["restoreFailed"], ["omp/agent.db"])
+        self.assertIsNone(self.status()["lastSuccessAt"])
+        self.assertFalse(self.lifecycle.STATE_FILES["omp/agent.db"].exists())
+        for key in ("omp/install-id", "github/hosts.yml"):
+            self.assertEqual(self.lifecycle.STATE_FILES[key].read_text(), f"saved {key}\n")
 
     def test_failed_restore_blocks_automatic_uploads_until_manual_save(self) -> None:
         # Stored state exists in S3 but cannot be read (e.g. KMS/S3 outage).

@@ -24,7 +24,7 @@ The SQLite database is copied with Python's SQLite backup API, never as a live-f
 
 Several MicroVMs share the same S3 keys, so every save is conditional on the ETag this VM last restored or wrote. If another MicroVM saved newer state first, the write is refused and the status bar shows `認証競合` instead of silently replacing the newer credentials. Run `persist-auth-state --overwrite` only when this VM's credentials should win.
 
-Check the auth status bar after each new MicroVM starts and before terminating it. A 2026-09-25 deployed run showed `認証復元失敗` for `omp/install-id` and `github/hosts.yml`, while two later fresh VMs restored all files; the intermittent cause is not yet identified. On a failed VM, automatic saves of those keys remain blocked. Reauthenticate there and run `persist-auth-state` explicitly only when you intend that VM's credentials to become the saved state.
+Check the auth status bar after each new MicroVM starts and before terminating it. A previous run failed to restore `omp/install-id` and `github/hosts.yml`: three sequential S3 downloads shared a 25-second `/run` budget, so a slow first download could exhaust the time left for the others. The downloads now run concurrently; a delayed-first-download regression test passes, and two deployed fresh VMs restored all three files. The original VM's exact error codes were not captured, so other S3/KMS failures remain possible. On a failed VM, automatic saves of affected keys stay blocked; reauthenticate and run `persist-auth-state` only when you intend that VM's credentials to become the saved state.
 
 ## Deployment boundary
 

@@ -828,7 +828,7 @@ GitHub CLIは通常OSのcredential storeへtokenを保存し、credential store�
 
 | タイミング | 処理 | 期限 |
 | --- | --- | --- |
-| `/run` hook | S3から3ファイルを復元し、各objectのETag(objectがなければ「なし」)を記録する | 25秒 |
+| `/run` hook | S3の3ファイルを同時に取得し、各objectのETag(objectがなければ「なし」)を記録する | 25秒 |
 | 5分ごと | 前回確認した内容から変わったファイルだけをS3へ保存する。ロックが使用中ならその回は飛ばす | 120秒 |
 | `/suspend` hook | 変わったファイルだけを保存する | 40秒 |
 | `/terminate` hook | 同上 | 40秒 |
@@ -842,7 +842,7 @@ hookの期限は、Image定義のtimeout(`/run` 30秒、`/suspend`・`/terminate
 
 - `agent.db`は動作中のOMPが書き込んでいる可能性がある。そのままコピーすると壊れたDBを保存し得るため、Pythonの`sqlite3.Connection.backup()`で一時ファイルへ整合性のある複製を作ってからアップロードする。
 - 復元時は、対象と同じディレクトリの一時ファイルへダウンロードし、権限を`0600`にしてから`os.replace`で置き換える。途中で失敗しても既存ファイルを半端に上書きしない。
-- S3操作はAWS CLIの`aws s3api get-object`と`aws s3api put-object`で行い、応答のETagとVersionIdを記録する。AWS CLIの各呼び出しは「25秒」と「処理全体の期限までの残り時間」の短い方でtimeoutする。残りが1秒を切ったら、それ以上呼び出さずに失敗として記録する。
+- S3操作はAWS CLIの`aws s3api get-object`と`aws s3api put-object`で行い、応答のETagとVersionIdを記録する。`/run`では3つの`get-object`を並列に開始し、1つ目の遅延が後続ファイルの時間枠を奪わないようにする。各呼び出しは「25秒」と「共通deadlineまでの残り時間」の短い方でtimeoutし、全件が終わってから復元結果を記録する。保存の`put-object`は従来どおり逐次実行する。
 - 保存の前に、複製したファイルのSHA-256を前回確認した値(復元時または前回保存時)と比べ、同じならアップロードしない。定期保存、hook、手動保存のどれでも同じである(`--overwrite`だけは比較せずに書く)。
 - fail-openにしている。hookは保存・復元の成否に関係なく必ず200を返し、MicroVMの起動・Suspend・終了を止めない。結果は`~/.cache/omp-cloud-ide/auth-sync.json`へ記録する(10.4節)。
 
@@ -936,7 +936,7 @@ lifecycle ruleにはprefixを付けず、Bucket全体を対象にしている。
 - 競合は検出するだけで、別のVMが保存した新しい状態を競合中のVMへ取り込む機能はない。競合中のVMでログインし直すか、新しいMicroVMを起動して最新の状態を復元する。
 - 楽観ロックを入れる前のImageから起動したMicroVMは、今も条件なしで書き込む。
 - 新しいMicroVMで復元し、OMPとGitHubが使えるところまでを確かめる自動E2Eはまだない。
-- 2026-09-25のデプロイE2Eでは1台の新規VMで`omp/install-id`と`github/hosts.yml`が`認証復元失敗`となり、その後の2台では全ファイル成功した。原因は未特定。fail-openで起動は継続するため、status barで復元結果を確認してから使う。
+- 2026-09-25のデプロイE2Eでは1台の新規VMで`omp/install-id`と`github/hosts.yml`が`認証復元失敗`となった。旧実装は3回のS3取得を25秒の共通期限で逐次実行しており、先頭取得を遅延させる回帰テストで同じ2ファイルが`DeadlineExceeded`になることを再現した。新Imageでは取得を並列化し、2台の新規VMで3ファイルすべての復元とSuspend/Resume後の正常表示を確認した。元の実機失敗のエラーコードは記録されていないため、他のS3/KMS障害まで解消したとは断定しない。起動後はstatus barで結果を確認する。
 
 ## 11. IAM
 
