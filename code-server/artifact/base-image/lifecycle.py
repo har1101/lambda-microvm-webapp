@@ -22,6 +22,7 @@ AGENT_DIR = Path(os.environ.get("PI_CODING_AGENT_DIR", HOME / ".omp" / "agent"))
 BUCKET = os.environ.get("AUTH_STATE_BUCKET", "")
 PREFIX = os.environ.get("AUTH_STATE_PREFIX", "personal").strip("/")
 SYNC_INTERVAL = max(60, int(os.environ.get("AUTH_SYNC_INTERVAL_SECONDS", "300")))
+SESSION_FILE = HOME / ".cache" / "omp-cloud-ide" / "session.json"
 
 STATE_FILES = {
     "omp/agent.db": AGENT_DIR / "agent.db",
@@ -72,6 +73,36 @@ def restore_state() -> None:
             finally:
                 temp_path.unlink(missing_ok=True)
         log(f"restored {restored} auth-state file(s)")
+
+
+def record_session(body: bytes) -> None:
+    """Write the MicroVM lifetime deadline read by the IDE status bar.
+
+    Lambda wraps RunMicrovm's runHookPayload string as
+    {"microvmId": ..., "runHookPayload": "..."}; the Edge puts expiresAt
+    (epoch ms) inside that string. The VM itself cannot query GetMicrovm.
+    """
+    try:
+        envelope = json.loads(body)
+        payload = json.loads(envelope.get("runHookPayload") or "{}")
+        expires_at = payload.get("expiresAt")
+    except (json.JSONDecodeError, AttributeError, TypeError):
+        log("run hook body did not contain a JSON runHookPayload")
+        return
+    if not isinstance(expires_at, int) or isinstance(expires_at, bool) or expires_at <= 0:
+        log("run hook payload has no expiresAt; session deadline unknown")
+        return
+
+    session = {"microvmId": str(envelope.get("microvmId", "")), "expiresAt": expires_at}
+    try:
+        SESSION_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile("w", dir=SESSION_FILE.parent, delete=False) as tmp:
+            json.dump(session, tmp)
+        os.replace(tmp.name, SESSION_FILE)
+    except OSError as error:
+        log(f"could not record session deadline: {type(error).__name__}")
+        return
+    log("recorded session deadline")
 
 
 def sqlite_snapshot(source: Path, destination: Path) -> None:
@@ -139,13 +170,7 @@ class HookHandler(BaseHTTPRequestHandler):
             return
 
         if self.path == f"{HOOK_PREFIX}/run":
-            if payload:
-                try:
-                    run_payload = json.loads(payload)
-                    if isinstance(run_payload, dict) and run_payload.get("microvmId"):
-                        log("received run hook for a new MicroVM")
-                except json.JSONDecodeError:
-                    log("run hook payload was not JSON")
+            record_session(payload)
             restore_state()
             self.respond(200)
             return

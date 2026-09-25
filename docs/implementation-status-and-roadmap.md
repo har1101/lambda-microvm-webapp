@@ -1,6 +1,6 @@
 # OMP Cloud IDEの実装状況・未実装項目・改善ロードマップ
 
-最終更新: 2026-09-24
+最終更新: 2026-09-25
 対象: `code-server/`配下の個人用OMP Cloud IDE実装
 基準コミット: `6c46d65`以降
 
@@ -130,6 +130,7 @@ OMPとGitHubの認証状態はKMS暗号化されたS3へ保存される。ワー
 | VS Code日本語化 | 実装済み | Japanese language pack |
 | YAML/Python/Docker extension | 実装済み | Image build時に導入 |
 | Suspend control extension | 部分実装 | HTTPS制御画面を開くがCloudFront URLがImage内に固定 |
+| MicroVM残り寿命表示 | 実装済み | Edgeが`RunMicrovm`直前に計算した期限を`/run` hook経由で渡し、status barへ`残り H:MM`、30分/10分で警告色、60/15/5分で通知。VM内時計はS3 `Date` headerで毎分補正。deploy後の新規VMのみ対象、Suspend/Resumeを跨ぐ実機E2Eは未完 |
 | リポジトリ自動clone | 未実装 | 起動後に手動clone |
 | project依存の自動install | 未実装 | 各リポジトリで手動 |
 
@@ -503,9 +504,9 @@ S3 Versioningはあるが、どのVersionへ戻すかは手動である。次を
 - egress/network connection
 - lifecycle daemonと定期sync thread
 
-#### 5.16 run hook payload契約を揃える
+#### 5.16 run hook payload契約を活用する
 
-Edgeは`sessionId`を渡す一方、hookは`microvmId`を探しており、どちらも現在は状態管理へ使っていない。schemaを一致させてログ・競合制御・session別prefixへ活用するか、不要ならpayload自体を削除する。
+Lambdaは`/run`へ`{"microvmId": ..., "runHookPayload": "<RunMicrovmへ渡した文字列>"}`を送る。現在Edgeは`runHookPayload`へ`{"sessionId", "expiresAt"}`を入れ、`lifecycle.py`は`expiresAt`と`microvmId`だけを`~/.cache/omp-cloud-ide/session.json`へ書いてstatus barの残り寿命表示に使う。`sessionId`はbearer Cookie値なのでVM内へ保存しない。`microvmId`をログ・競合制御・session別S3 prefixへ活用する余地は残っている。
 
 #### 5.17 保持とcleanupのRunbookを作る
 

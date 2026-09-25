@@ -122,6 +122,10 @@ TerminateされたMicroVMのローカルディスクとRAM状態は戻せない�
 
 `maximumDurationInSeconds=28800`はRUNNINGとSUSPENDEDを合わせたMicroVMの総寿命である。Suspend保持の設定が別に8時間あっても、起動から8時間を超えて同じMicroVMへ戻れるという意味ではない。
 
+### 残り寿命の表示
+
+Edgeは`RunMicrovm`直前に`expiresAt = now + 8時間`を計算して`runHookPayload`へ入れ、`/run` hookがMicroVM内へ記録する。code-serverのstatus barはこの値から`残り H:MM`を表示し、終了前に未push変更の確認を促す。セッション選択画面は`GetMicrovm`の`startedAt + maximumDurationInSeconds`から`Ends ... (Xh Ym left)`を表示する。どちらもこの機能のdeploy後に起動したMicroVMから有効で、それ以前のVMは`残り時間不明`になる。
+
 ## 今回修正した障害の原因
 
 以前のorigin-response Lambda@Edgeは、MicroVM originがHTMLナビゲーションに対して一時的に`502`または`504`を返すと、`mvm-session` Cookieを即座に削除して`/session/start`へ送っていた。

@@ -1,7 +1,7 @@
 {
   "name": "omp-cloud-ide-controls",
   "displayName": "OMP Cloud IDE Controls",
-  "description": "Adds a status-bar shortcut to suspend or resume the personal OMP Cloud IDE.",
+  "description": "Adds status-bar shortcuts to suspend the personal OMP Cloud IDE and shows the remaining MicroVM lifetime.",
   "version": "0.1.0",
   "publisher": "har1101",
   "engines": {
@@ -29,6 +29,11 @@
           "type": "string",
           "default": "https://dmwv39galzn4v.cloudfront.net/session/control",
           "description": "HTTPS URL embedded in the Cloud IDE suspend/resume control tab."
+        },
+        "ompCloudIde.timeZone": {
+          "type": "string",
+          "default": "Asia/Tokyo",
+          "description": "IANA time zone used to show when the MicroVM lifetime ends."
         }
       }
     }

@@ -2,6 +2,7 @@
 !jest.config.js
 !artifact/edge/index.js
 !artifact/edge-response/index.js
+!artifact/base-image/omp-cloud-ide-controls/*.js
 *.d.ts
 node_modules
 

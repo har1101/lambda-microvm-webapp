@@ -138,6 +138,9 @@ exports.handler = async (event) => {
 
 async function startSession() {
   const id = randomUUID();
+  // Measured before RunMicrovm, so this is never later than the service-side
+  // startedAt + maximumDurationInSeconds that actually terminates the MicroVM.
+  const expiresAt = Date.now() + cfg.MAX_DURATION_SEC * 1000;
   const run = await mvm.send(
     new RunMicrovmCommand({
       imageIdentifier: cfg.IMAGE_ARN,
@@ -150,7 +153,7 @@ async function startSession() {
         suspendedDurationSeconds: cfg.SUSPENDED_SEC,
       },
       maximumDurationInSeconds: cfg.MAX_DURATION_SEC,
-      runHookPayload: JSON.stringify({ sessionId: id }),
+      runHookPayload: JSON.stringify({ sessionId: id, expiresAt }),
     }),
   );
 
@@ -283,6 +286,9 @@ async function listAvailableSessions() {
           imageVersion: microvm.imageVersion ?? '',
           paused: item.paused?.BOOL === true,
           createdAt: Number(item.createdAt?.N ?? 0),
+          expiresAt: microvm.startedAt
+            ? new Date(microvm.startedAt).getTime() + (microvm.maximumDurationInSeconds ?? cfg.MAX_DURATION_SEC) * 1000
+            : 0,
           ttl: Number(item.ttl?.N ?? 0),
         };
       } catch (error) {
@@ -610,7 +616,13 @@ function loginPageResponse(errorMessage = '', status = '200') {
   };
 }
 
-function sessionSelectionResponse({ sessions, currentSessionId = '', errorMessage = '', status = '200' }) {
+function sessionSelectionResponse({
+  sessions,
+  currentSessionId = '',
+  errorMessage = '',
+  status = '200',
+  now = Date.now(),
+}) {
   const error = errorMessage ? `<p class="error" role="alert">${escapeHtml(errorMessage)}</p>` : '';
   const sessionCards = sessions.length
     ? sessions
@@ -621,13 +633,16 @@ function sessionSelectionResponse({ sessions, currentSessionId = '', errorMessag
           const created = session.createdAt
             ? new Date(session.createdAt).toISOString()
             : 'Created before session history timestamps were enabled';
+          const lifetime = session.expiresAt
+            ? ` · Ends ${new Date(session.expiresAt).toISOString()} (${formatRemaining(session.expiresAt - now)})`
+            : '';
           return [
             `<article class="session${isCurrent ? ' current' : ''}">`,
             '<div class="session-heading">',
             `<strong>${escapeHtml(session.microvmId)}</strong>`,
             `<span class="state ${escapeHtml(String(session.state).toLowerCase())}">${escapeHtml(session.state)}</span>`,
             '</div>',
-            `<p>Image ${escapeHtml(session.imageVersion || 'unknown')} · ${escapeHtml(created)}</p>`,
+            `<p>Image ${escapeHtml(session.imageVersion || 'unknown')} · ${escapeHtml(created)}${escapeHtml(lifetime)}</p>`,
             isCurrent ? '<p class="current-label">Currently selected in this browser</p>' : '',
             '<form method="post" action="/session/select">',
             '<input type="hidden" name="action" value="attach">',
@@ -868,6 +883,12 @@ function isHtmlNavigation(headers) {
   return (headers.accept || []).some((header) => header.value.includes('text/html'));
 }
 
+function formatRemaining(ms) {
+  if (ms <= 0) return 'lifetime reached';
+  const totalMinutes = Math.floor(ms / 60000);
+  return `${Math.floor(totalMinutes / 60)}h ${totalMinutes % 60}m left`;
+}
+
 function escapeHtml(value) {
   return String(value)
     .replaceAll('&', '&amp;')
@@ -922,5 +943,6 @@ exports.__test = {
   sessionAttachedResponse,
   sessionControlResponse,
   sessionSelectionResponse,
+  startSession,
   signAccessCookie,
 };

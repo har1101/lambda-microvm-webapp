@@ -1,4 +1,13 @@
+const fs = require('node:fs/promises');
+const os = require('node:os');
+const path = require('node:path');
 const vscode = require('vscode');
+const timer = require('./session-timer');
+
+// Written by /opt/cloud-ide/lifecycle.py when the /run hook delivers the Edge deadline.
+const SESSION_FILE = path.join(os.homedir(), '.cache', 'omp-cloud-ide', 'session.json');
+const TICK_MS = 15_000;
+const CLOCK_SYNC_MS = 60_000;
 
 function activate(context) {
   const rawUrl = vscode.workspace.getConfiguration('ompCloudIde').get('controlUrl', '');
@@ -31,7 +40,115 @@ function activate(context) {
       : 'ompCloudIde.openControl';
   status.show();
 
-  context.subscriptions.push(openControl, status);
+  context.subscriptions.push(openControl, status, createLifetimeCountdown());
+}
+
+function createLifetimeCountdown() {
+  const item = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 99);
+  item.name = 'OMP Cloud IDE remaining lifetime';
+  item.command = 'workbench.view.scm';
+  item.show();
+
+  const timeZone = validTimeZone(vscode.workspace.getConfiguration('ompCloudIde').get('timeZone', 'Asia/Tokyo'));
+  const clockUrl = process.env.AWS_REGION
+    ? `https://s3.${process.env.AWS_REGION}.amazonaws.com/`
+    : 'https://s3.amazonaws.com/';
+  const notified = new Set();
+  let expiresAt = null;
+  let clockOffset = 0;
+  let clockSynced = false;
+  let lastClockSync = 0;
+
+  async function syncClock() {
+    lastClockSync = Date.now();
+    const sentAt = Date.now();
+    try {
+      const response = await fetch(clockUrl, { method: 'HEAD', signal: AbortSignal.timeout(5_000) });
+      const offset = timer.clockOffsetMs(response.headers.get('date'), sentAt, Date.now());
+      if (offset !== null) {
+        clockOffset = offset;
+        clockSynced = true;
+      }
+    } catch {
+      // Keep the previous offset; the tooltip reports whether one was ever measured.
+    }
+  }
+
+  async function refresh() {
+    if (expiresAt === null) {
+      expiresAt = await fs.readFile(SESSION_FILE, 'utf8').then(timer.parseSessionDeadline, () => null);
+    }
+    if (Date.now() - lastClockSync >= CLOCK_SYNC_MS) {
+      await syncClock();
+    }
+    render();
+  }
+
+  function render() {
+    if (expiresAt === null) {
+      item.text = '$(clock) 残り時間不明';
+      item.tooltip =
+        'MicroVMの終了予定時刻を取得できません。期限表示に対応する前に起動したVMか、/run hookが期限を受け取れませんでした。';
+      item.backgroundColor = undefined;
+      return;
+    }
+
+    const remaining = expiresAt - (Date.now() + clockOffset);
+    const level = timer.severity(remaining);
+    item.text = remaining > 0 ? `$(clock) 残り ${timer.formatRemaining(remaining)}` : '$(clock) 寿命到達';
+    item.backgroundColor = level === 'normal' ? undefined : new vscode.ThemeColor(`statusBarItem.${level}Background`);
+    const endsAt = new Date(expiresAt).toLocaleString('ja-JP', { timeZone, timeZoneName: 'short' });
+    const clockNote = clockSynced ? `時計補正 ${Math.round(clockOffset / 1000)}秒` : '時計補正未実施（VM内時計を使用）';
+    item.tooltip = `MicroVMはRUNNING/SUSPENDEDを問わず ${endsAt} に終了します（${clockNote}）。クリックでソース管理を開きます。`;
+
+    const due = timer.dueNotification(remaining, notified);
+    if (due !== undefined) {
+      for (const minutes of timer.NOTIFY_MINUTES) {
+        if (minutes >= due) notified.add(minutes);
+      }
+      void vscode.window
+        .showWarningMessage(
+          `Cloud IDEのMicroVMは残り約${Math.max(1, Math.floor(remaining / 60_000))}分で終了し、workspaceは失われます。未commit・未pushの変更を確認してください。`,
+          'ソース管理を開く',
+        )
+        .then((choice) => choice && vscode.commands.executeCommand('workbench.view.scm'));
+    }
+  }
+
+  let running = false;
+  const tick = () => {
+    if (running) return;
+    running = true;
+    refresh()
+      .catch((error) => console.error('OMP Cloud IDE countdown refresh failed', error))
+      .finally(() => {
+        running = false;
+      });
+  };
+  tick();
+  const interval = setInterval(tick, TICK_MS);
+  // Reconnecting after Resume focuses the window; resync before the next tick.
+  const focus = vscode.window.onDidChangeWindowState((state) => {
+    if (state.focused) {
+      lastClockSync = 0;
+      tick();
+    }
+  });
+
+  return new vscode.Disposable(() => {
+    clearInterval(interval);
+    focus.dispose();
+    item.dispose();
+  });
+}
+
+function validTimeZone(timeZone) {
+  try {
+    new Intl.DateTimeFormat('ja-JP', { timeZone });
+    return timeZone;
+  } catch {
+    return 'UTC';
+  }
 }
 
 function deactivate() {}

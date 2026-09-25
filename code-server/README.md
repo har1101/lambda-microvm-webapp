@@ -89,6 +89,8 @@ Opening `/login` only renders the access form; it does not call `RunMicrovm`. Af
 
 The editor status bar contains **Suspend Cloud IDE**. It opens `/session/control` through code-server's HTTPS URL opener; press **Suspend Cloud IDE** there to suspend the current browser's MicroVM. This two-step control is deliberate: the suspend API must be called outside the MicroVM, and the control plane marks the session paused before requesting the snapshot so code-server WebSocket reconnects cannot immediately wake it again.
 
+Next to it, the status bar shows the remaining MicroVM lifetime (`残り H:MM`). The Edge passes a deadline in the `/run` hook payload, because a MicroVM cannot look up its own `startedAt`; the lifetime counts both RUNNING and SUSPENDED time. The item turns yellow at 30 minutes and red at 10 minutes, and a notification at 60, 15, and 5 minutes asks you to commit and push. MicroVMs started before this feature was deployed show `残り時間不明`.
+
 While paused, regular editor requests are blocked at Lambda@Edge. Press **Resume editor** on the control page to resume explicitly. A suspended MicroVM incurs snapshot storage and snapshot operation charges, but no compute charge. The current idle policy also automatically suspends a session after five minutes without endpoint traffic and terminates it after eight suspended hours; an open code-server tab can generate traffic, so use the explicit button when you are finished for now.
 
 ## Implementation status

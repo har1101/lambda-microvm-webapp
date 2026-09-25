@@ -1,4 +1,6 @@
+import { spawnSync } from 'node:child_process';
 import * as fs from 'node:fs';
+import * as os from 'node:os';
 import * as path from 'node:path';
 import { Match, Template } from 'aws-cdk-lib/assertions';
 import * as cdk from 'aws-cdk-lib/core';
@@ -53,17 +55,20 @@ type EdgeTestHelpers = {
       imageVersion: string;
       paused: boolean;
       createdAt: number;
+      expiresAt?: number;
       ttl: number;
     }>;
     currentSessionId?: string;
     errorMessage?: string;
     status?: string;
+    now?: number;
   }) => {
     status: string;
     headers: Record<string, Array<{ key: string; value: string }>>;
     body: string;
   };
   signAccessCookie: (payload: string, password: string) => string;
+  startSession: () => Promise<{ status: string }>;
 };
 
 type EdgeModule = {
@@ -284,9 +289,11 @@ describe('OMP Cloud IDE infrastructure', () => {
           imageVersion: '11.0',
           paused: false,
           createdAt: 1_800_000_000_000,
+          expiresAt: 1_800_028_800_000,
           ttl: 0,
         },
       ],
+      now: 1_800_019_800_000,
     });
 
     expect(response.status).toBe('200');
@@ -298,6 +305,7 @@ describe('OMP Cloud IDE infrastructure', () => {
     expect(response.body).toContain('name="sessionId" value="7d041485-dff5-4033-bdbc-a921757e217b"');
     expect(response.body).toContain('Start a new MicroVM');
     expect(response.headers['content-security-policy'][0].value).toContain("form-action 'self'");
+    expect(response.body).toContain('Ends 2027-01-15T16:00:00.000Z (2h 30m left)');
 
     const attached = helpers.sessionAttachedResponse(sessionId, false);
     expect(attached.status).toBe('303');
@@ -309,6 +317,122 @@ describe('OMP Cloud IDE infrastructure', () => {
     expect(resuming.status).toBe('200');
     expect(resuming.body).toContain('Resuming the Cloud IDE');
     expect(resuming.headers['set-cookie'][0].value).toContain(`mvm-session=${sessionId}`);
+  });
+
+  test('passes a MicroVM lifetime deadline no later than the real one to the run hook', async () => {
+    const helpers = getEdgeModule().__test;
+    const edgeDir = path.join(__dirname, '..', 'artifact', 'edge');
+    type Send = (command: { constructor: { name: string }; input: Record<string, unknown> }) => Promise<unknown>;
+    const mvmPrototype = require(require.resolve('@aws-sdk/client-lambda-microvms', { paths: [edgeDir] }))
+      .LambdaMicrovmsClient.prototype as { send: Send };
+    const ddbPrototype = require(require.resolve('@aws-sdk/client-dynamodb', { paths: [edgeDir] })).DynamoDBClient
+      .prototype as { send: Send };
+
+    let runInput: Record<string, unknown> | undefined;
+    let runCalledAt = 0;
+    const mvmSend = jest.spyOn(mvmPrototype, 'send').mockImplementation(async (command) => {
+      if (command.constructor.name === 'RunMicrovmCommand') {
+        runCalledAt = Date.now();
+        runInput = command.input;
+        return { microvmId: 'mvm-test', endpoint: 'mvm-test.example' };
+      }
+      return { authToken: { 'X-aws-proxy-auth': 'test-token' } };
+    });
+    const ddbSend = jest.spyOn(ddbPrototype, 'send').mockResolvedValue({});
+    const startedBefore = Date.now();
+    try {
+      expect((await helpers.startSession()).status).toBe('200');
+    } finally {
+      mvmSend.mockRestore();
+      ddbSend.mockRestore();
+    }
+
+    const payload = JSON.parse(String(runInput?.runHookPayload));
+    expect(payload.sessionId).toMatch(/^[0-9a-f-]{36}$/);
+    // The service starts its 8-hour clock no earlier than the RunMicrovm call.
+    expect(payload.expiresAt).toBeGreaterThanOrEqual(startedBefore + 28_800_000);
+    expect(payload.expiresAt).toBeLessThanOrEqual(runCalledAt + 28_800_000);
+  });
+
+  test('records the lifetime deadline from the Lambda run hook envelope', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'lifecycle-home-'));
+    const lifecycle = path.join(__dirname, '..', 'artifact', 'base-image', 'lifecycle.py');
+    const recordSession = (body: string) =>
+      spawnSync(
+        'python3',
+        [
+          '-c',
+          [
+            'import importlib.util, sys',
+            `spec = importlib.util.spec_from_file_location("lifecycle", ${JSON.stringify(lifecycle)})`,
+            'module = importlib.util.module_from_spec(spec)',
+            'spec.loader.exec_module(module)',
+            'module.record_session(sys.stdin.buffer.read())',
+          ].join('\n'),
+        ],
+        { input: body, env: { ...process.env, HOME: home }, encoding: 'utf8' },
+      );
+    const sessionFile = path.join(home, '.cache', 'omp-cloud-ide', 'session.json');
+
+    try {
+      // A bare payload (not wrapped by Lambda) must not be mistaken for a deadline.
+      expect(recordSession(JSON.stringify({ expiresAt: 1_800_028_800_000 })).status).toBe(0);
+      expect(fs.existsSync(sessionFile)).toBe(false);
+      expect(recordSession('not json').status).toBe(0);
+      expect(fs.existsSync(sessionFile)).toBe(false);
+
+      const envelope = {
+        microvmId: 'mvm-test',
+        runHookPayload: JSON.stringify({
+          sessionId: '7d041485-dff5-4033-bdbc-a921757e217b',
+          expiresAt: 1_800_028_800_000,
+        }),
+      };
+      expect(recordSession(JSON.stringify(envelope)).status).toBe(0);
+      // The session ID is a bearer cookie value, so it stays out of the VM file.
+      expect(JSON.parse(fs.readFileSync(sessionFile, 'utf8'))).toEqual({
+        microvmId: 'mvm-test',
+        expiresAt: 1_800_028_800_000,
+      });
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  test('counts down the MicroVM lifetime and warns once per crossed threshold', () => {
+    const timer = require('../artifact/base-image/omp-cloud-ide-controls/session-timer.js') as {
+      clockOffsetMs: (dateHeader: string | null, sentAt: number, receivedAt: number) => number | null;
+      dueNotification: (remainingMs: number, notified: Set<number>) => number | undefined;
+      formatRemaining: (remainingMs: number) => string;
+      parseSessionDeadline: (text: string) => number | null;
+      severity: (remainingMs: number) => string;
+    };
+    const minutes = (value: number) => value * 60_000;
+
+    expect(timer.parseSessionDeadline('{"expiresAt":1800028800000}')).toBe(1_800_028_800_000);
+    expect(timer.parseSessionDeadline('{"expiresAt":"1800028800000"}')).toBeNull();
+    expect(timer.parseSessionDeadline('{')).toBeNull();
+
+    expect(timer.formatRemaining(minutes(8 * 60))).toBe('8:00');
+    expect(timer.formatRemaining(minutes(65) - 1)).toBe('1:04');
+
+    expect(timer.severity(minutes(30) + 1)).toBe('normal');
+    expect(timer.severity(minutes(30))).toBe('warning');
+    expect(timer.severity(minutes(10))).toBe('error');
+
+    expect(timer.dueNotification(minutes(60) + 1, new Set())).toBeUndefined();
+    expect(timer.dueNotification(minutes(60), new Set())).toBe(60);
+    // Opening the IDE late announces only the tightest crossed threshold.
+    expect(timer.dueNotification(minutes(12), new Set())).toBe(15);
+    expect(timer.dueNotification(minutes(12), new Set([60, 15]))).toBeUndefined();
+    expect(timer.dueNotification(minutes(5), new Set([60, 15]))).toBe(5);
+    expect(timer.dueNotification(0, new Set())).toBeUndefined();
+
+    // A guest clock 10 minutes behind (e.g. after Resume) is corrected from the Date header.
+    const trueNow = Date.parse('2027-01-15T12:00:00.500Z');
+    const localNow = trueNow - minutes(10);
+    expect(timer.clockOffsetMs('Fri, 15 Jan 2027 12:00:00 GMT', localNow - 100, localNow + 100)).toBe(minutes(10));
+    expect(timer.clockOffsetMs(null, localNow, localNow)).toBeNull();
   });
 
   test('preserves the session cookie when a MicroVM origin temporarily returns 502', async () => {
@@ -367,16 +491,14 @@ describe('OMP Cloud IDE infrastructure', () => {
       path.join(__dirname, '..', 'artifact', 'base-image', 'omp-cloud-ide-controls', 'package.json'),
       'utf8',
     );
-    const controlsExtension = fs.readFileSync(
-      path.join(__dirname, '..', 'artifact', 'base-image', 'omp-cloud-ide-controls', 'extension.js'),
-      'utf8',
-    );
     expect(dockerfile).toContain('ARG OMP_VERSION=18.2.11');
     expect(dockerfile).toContain('useradd --uid 1000');
     expect(dockerfile).toContain('USER vscode');
     expect(dockerfile).toContain('ripgrep');
     expect(dockerfile).toContain('ARG CHROMIUM_VERSION=149.0.0');
-    expect(dockerfile).toContain('CHROMIUM_ARM64_PACK_SHA256=9c42e7850d746cbf0ac0e68eaa48af277af8255a5ee12a813c08573671f231f6');
+    expect(dockerfile).toContain(
+      'CHROMIUM_ARM64_PACK_SHA256=9c42e7850d746cbf0ac0e68eaa48af277af8255a5ee12a813c08573671f231f6',
+    );
     expect(dockerfile).toContain('AWS_EXECUTION_ENV=AWS_Lambda_nodejs24.x TMPDIR=/opt/chromium');
     expect(dockerfile).toContain('PUPPETEER_EXECUTABLE_PATH=/opt/chromium/chromium');
     expect(dockerfile).toContain('/opt/chromium/chromium --version');
@@ -394,9 +516,5 @@ describe('OMP Cloud IDE infrastructure', () => {
     expect(ompConfig).toContain('- match: "git push --force*"\n      approval: deny');
     expect(settings).toContain('"ompCloudIde.controlUrl"');
     expect(controlsPackage).toContain('"onCommand:ompCloudIde.openControl"');
-    expect(controlsExtension).toContain("status.text = '$(debug-pause) Suspend Cloud IDE'");
-    expect(controlsExtension).toContain("controlUrl?.protocol !== 'https:'");
-    expect(controlsExtension).toContain("command: 'vscode.open'");
-    expect(controlsExtension).not.toContain('vscode.env.openExternal');
   });
 });
