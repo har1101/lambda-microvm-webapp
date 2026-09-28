@@ -10,6 +10,8 @@
     "synth": "cdkd synth",
     "synth:cdk": "cdk synth",
     "diff": "cdkd diff --all",
+    "update-versions": "node scripts/update-tool-versions.mjs",
+    "predeploy": "npm run update-versions",
     "deploy": "cdkd deploy --all --full-wait",
     "deploy:dry-run": "cdkd deploy --all --dry-run",
     "destroy": "cdkd destroy --all",

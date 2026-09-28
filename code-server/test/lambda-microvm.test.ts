@@ -882,7 +882,9 @@ describe('OMP Cloud IDE infrastructure', () => {
       path.join(__dirname, '..', 'artifact', 'base-image', 'omp-cloud-ide-controls', 'package.json'),
       'utf8',
     );
-    expect(dockerfile).toContain('ARG OMP_VERSION=18.2.11');
+    // scripts/update-tool-versions.mjs rewrites these lines to the latest releases on predeploy.
+    expect(dockerfile).toMatch(/^ARG OMP_VERSION=\d+\.\d+\.\d+$/m);
+    expect(dockerfile).toMatch(/^ARG CODE_SERVER_VERSION=\d+\.\d+\.\d+$/m);
     expect(dockerfile).toContain('useradd --uid 1000');
     expect(dockerfile).toContain('USER vscode');
     expect(dockerfile).toContain('ripgrep');

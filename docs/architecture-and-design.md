@@ -220,9 +220,9 @@ DynamoDBとSecrets ManagerをEdge側(`us-east-1`)に置いた理由は、Lambda@
 
 ### 4.7 開発ツールをImageへ焼き込む
 
-- 決めたこと: code-server、OMP、Node.js、Bun、Python、uv、GitHub CLI、AWS CLI、LSP、Chromium、VS Code拡張をImage build時に入れ、主要ツールはversionを固定する。
-- 理由: MicroVMは最大8時間の使い捨てなので、起動のたびにダウンロードすると時間がかかり、結果も毎回変わり得る。Imageはスナップショットから起動するため、事前に入れたツールは起動直後から使える。
-- 受け入れたこと: ツールを更新するたびにImageの再buildが必要になる。
+- 決めたこと: code-server、OMP、Node.js、Bun、Python、uv、GitHub CLI、AWS CLI、LSP、Chromium、VS Code拡張をImage build時に入れ、主要ツールはversionを固定する。ただしcode-serverとOMPは、`npm run deploy`の`predeploy`で`scripts/update-tool-versions.mjs`が最新版へ書き換える。
+- 理由: MicroVMは最大8時間の使い捨てなので、起動のたびにダウンロードすると時間がかかり、結果も毎回変わり得る。Imageはスナップショットから起動するため、事前に入れたツールは起動直後から使える。code-serverとOMPは更新が速く、変更内容を個別に確認する運用もしないため、deployごとに追従させる。
+- 受け入れたこと: ツールを更新するたびにImageの再buildが必要になる。code-serverとOMPは、互換性のない版が出てもdeploy時にそのまま入る。deployしない限り更新されない。
 
 ### 4.8 Cognitoを使わず、パスワードフォームとHMAC Cookieにする
 
@@ -689,10 +689,10 @@ Image定義にも`INTERNET_EGRESS`を指定している。Dockerfileの実行中
 
 | ツール | version | 取得元 | 検証 |
 | --- | --- | --- | --- |
-| code-server | 4.126.0 | coder/code-server GitHub Releases(RPM) | versionのみ |
+| code-server | 4.139.1(deploy時に最新へ更新) | coder/code-server GitHub Releases(RPM) | versionのみ |
 | Node.js | 24.21.0 | nodejs.org | versionのみ |
 | Bun | 1.3.14 | oven-sh/bun GitHub Releases | versionのみ |
-| OMP(`@oh-my-pi/pi-coding-agent`) | 18.2.11 | npm(`bun install --global`) | versionのみ |
+| OMP(`@oh-my-pi/pi-coding-agent`) | 18.4.0(deploy時に最新へ更新) | npm(`bun install --global`) | versionのみ |
 | GitHub CLI | 2.96.0 | cli/cli GitHub Releases | versionのみ |
 | AWS CLI | 2.34.45 | awscli.amazonaws.com | versionのみ |
 | uv / uvx | 0.12.18 | astral-sh/uv GitHub Releases | versionのみ |
@@ -1126,7 +1126,7 @@ code-server/
 | origin-response | 502でsession Cookieを消さないこと |
 | セッション起動・終了 | 二重POSTの条件付きclaim、登録失敗時の補償、ページングした未追跡VM照合、ID確認と二段階Terminate、API結果不明時の通信遮断・再試行・終了確認後の行削除 |
 | origin-request | 期限切れtokenの更新失敗時に転送しないこと、Edge専用Cookieを除去してorigin固有Cookieを保持すること |
-| Image | OMPのversion固定、非rootでの実行、Chromium、Suspend拡張の存在 |
+| Image | OMPとcode-serverのversionが固定形式であること(自動更新スクリプトの前提)、非rootでの実行、Chromium、Suspend拡張の存在 |
 
 Lambda@Edgeやセッション処理を変えたときは、デプロイ後に「ログイン → 選択画面 → 新規起動 → code-server表示 → Suspend → Resume → 確認付きTerminate → 終了と行削除」を確認する。2026-09-25の検証では起動フォームの二重POSTが409になり、確認画面で誤ったIDを拒否し、テスト用MicroVMだけが`TERMINATED`となってDynamoDB行が削除され、既存MicroVMは残った。EdgeのHTML画面は同梱headless ChromiumのSkia FontConfigで描画が異常終了するためCookie付きHTTPで操作し、code-server UIをブラウザで表示した。一時的なE2Eスクリプトであり、リポジトリには未収録。
 

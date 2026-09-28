@@ -226,12 +226,12 @@ Lambda@Edgeに同梱しているAWS SDKです。
 | `@aws-sdk/client-dynamodb` | セッション表の読み書き |
 | `@aws-sdk/client-secrets-manager` | ログインパスワードの取得 |
 
-MicroVM Imageに入れている主なツールです。どれもARM64版を使い、versionを固定しています。
+MicroVM Imageに入れている主なツールです。どれもARM64版を使い、Dockerfileでversionを固定しています。ただしcode-serverとOMPだけは、`npm run deploy`のたびにその時点の最新版へ自動で書き換えています(後述)。
 
 | ツール | version |
 | --- | --- |
-| code-server | 4.126.0 |
-| OMP(`@oh-my-pi/pi-coding-agent`) | 18.2.11 |
+| code-server | 4.139.1(deploy時に最新へ更新) |
+| OMP(`@oh-my-pi/pi-coding-agent`) | 18.4.0(deploy時に最新へ更新) |
 | Node.js | 24.21.0 |
 | Bun | 1.3.14 |
 | GitHub CLI | 2.96.0 |
@@ -287,8 +287,8 @@ Dockerfileのベースは、AWSが公開している`public.ecr.aws/lambda/micro
 ```dockerfile:Dockerfile
 FROM public.ecr.aws/lambda/microvms:al2023-minimal
 
-ARG CODE_SERVER_VERSION=4.126.0
-ARG OMP_VERSION=18.2.11
+ARG CODE_SERVER_VERSION=4.139.1
+ARG OMP_VERSION=18.4.0
 # 省略
 
 RUN /usr/sbin/groupadd --gid 1000 vscode \
@@ -319,6 +319,25 @@ exec code-server \
 `--auth none`でcode-serverの認証を切っている理由は、後ほど認証の章で説明します。
 
 ちなみにImageはARM64で作っています。OMPのブラウザ機能で使うARM64向けのChromiumを用意するのに少し工夫が必要だったので、その話は別の記事にしました。
+
+## code-serverとOMPはdeployのたびに最新版へ上げる
+Imageに焼き込むということは、放っておくとバージョンがずっと古いままになるということです。code-serverとOMPは更新が速いので、ここだけは`npm run deploy`のたびに最新版へ上げるようにしました。
+
+npmには、`deploy`の前に`predeploy`という名前のscriptを自動で実行する仕組みがあります。これを使って、deployの直前に次のことをしています。
+
+1. code-serverはGitHub Releasesの最新版(arm64のRPMがあることも確認)、OMPはnpmの`latest`を調べる
+2. Dockerfileの`ARG CODE_SERVER_VERSION=`と`ARG OMP_VERSION=`の行を書き換える
+3. そのまま`cdkd deploy`が走る
+
+```json:package.json
+"update-versions": "node scripts/update-tool-versions.mjs",
+"predeploy": "npm run update-versions",
+"deploy": "cdkd deploy --all --full-wait",
+```
+
+Dockerfileが変わると、CDKがS3 Assetとして上げるzipのハッシュも変わります。するとMicroVM Imageの`CodeArtifact`が変わったことになり、Imageが作り直されます。逆に新しい版が出ていなければDockerfileはそのままなので、Imageの無駄な作り直しも起きません。
+
+なお、新しいImageが使われるのは次に起動するMicroVMからです。動いているMicroVMのバージョンは変わりません。
 
 ## MicroVMの起動パラメータ
 MicroVMの起動はLambda@Edgeが担当します。`RunMicrovm`の呼び出しはこんな感じです。
@@ -497,6 +516,154 @@ code-serverは`--auth none`で起動しています。一見こわい設定で�
 なので現状は、「自分が書くコードと、自分が選んだリポジトリだけを動かす個人環境」という前提で使っています。Edge専用のaccess/session Cookieは認証後にcode-serverへ転送する前に除去しますが、同じoriginのアプリからcontrol画面を操作できる問題や同一UIDの認証ファイルは残ります。根本策はcontrol画面をIDEとは別のホスト名に分けることです。
 
 # Lambda MicroVMへの接続フロー
+
+## そもそもLambda MicroVMにはどうやって接続するのか
+具体的なフローに入る前に、Lambda MicroVMへの接続方法そのものを整理しておきます。
+
+EC2のようにIPアドレスへSSHしたり、任意のportへ直接つないだりするものではありません。外からMicroVMへ入る経路は、AWSがMicroVMごとに払い出すHTTPSのURL(MicroVM endpoint)の1つだけです。AWSのLambda MicroVM開発者ガイドには、次のように書かれています。
+
+> Every MicroVM gets a unique public HTTPS endpoint URL, assigned when you call `run-microvm`. You connect to your application running inside the MicroVM through this URL.
+
+https://docs.aws.amazon.com/lambda/latest/dg/microvms-launching.html
+
+endpointは`RunMicrovm`のレスポンスの`endpoint`で返ってくるホスト名で、ドキュメントの例では`abc123def456.lambda-microvm.us-east-1.on.aws`のような形をしています。1つのendpointは1台のMicroVMだけに対応し、複数台に振り分けることはありません。なお、MicroVM endpointで外から受け付けるには、`RunMicrovm`でingressのネットワークコネクター(今回は`ALL_INGRESS`)を指定しておく必要があります。
+
+### リバースプロキシとは
+この先の説明には「リバースプロキシ」という言葉が何度も出てくるので、先に説明しておきます。
+
+プロキシ(proxy)は「代理」という意味で、通信の間に入って代わりにリクエストを送る中継役のサーバーのことです。そのうちリバースプロキシは、**サーバーの手前に立って、サーバーの代わりにリクエストを受け付ける中継役**です。
+
+```mermaid
+flowchart LR
+    C["クライアント<br/>(ブラウザなど)"] -- "① リクエスト" --> RP["リバースプロキシ"]
+    RP -- "② 転送" --> S["本当のサーバー"]
+    S -- "③ レスポンス" --> RP
+    RP -- "④ レスポンスを返す" --> C
+```
+
+会社の代表電話にたとえると分かりやすいです。お客さんは代表番号(リバースプロキシ)に電話するだけで、担当者の内線番号(本当のサーバー)は知りません。受付が用件を聞き、相手を確認したうえで担当者へ回してくれます。お客さんから見ると、ずっと代表番号と話しているように見えます。
+
+リバースプロキシは中継するついでに、いろいろな仕事をこなせます。
+
+| 仕事 | 内容 |
+| --- | --- |
+| 転送先を決める | リクエストの中身を見て、どのサーバーへ回すかを決める |
+| 認証 | 許可されていないリクエストを、サーバーへ届く前に断る |
+| ヘッダーの書き換え | 転送するときに、ヘッダーを足したり消したりする |
+| HTTPSの処理 | クライアントとのHTTPS通信を引き受ける |
+
+nginxやALB、CloudFrontも、よくリバースプロキシとして使われています。ちなみに、社内ネットワークから外のWebサイトへ出ていくときに通る「プロキシ」は、クライアント側の代理をするものでフォワードプロキシと呼ばれます。代理する向きが逆なので「リバース」です。
+
+このシステムでは、ブラウザとcode-serverの間にリバースプロキシが**2段**入っています。
+
+```mermaid
+flowchart LR
+    B["ブラウザ"] --> RP1["リバースプロキシ1<br/>CloudFront + Lambda@Edge<br/>(自分で作った部分)"]
+    RP1 --> RP2["リバースプロキシ2<br/>MicroVM endpoint<br/>(AWS管理)"]
+    RP2 --> CS["code-server :8080"]
+```
+
+| | 転送先を決める | 認証 | ヘッダーの書き換え |
+| --- | --- | --- | --- |
+| リバースプロキシ1(CloudFront + Lambda@Edge) | セッションCookieからDynamoDBを引き、そのMicroVMのendpointへ | ログインCookieを検証する | `X-aws-proxy-auth`、`Host`、`Origin`を付け、Edge専用Cookieを消す |
+| リバースプロキシ2(MicroVM endpoint) | port 8080へ | tokenを検証する | `X-aws-proxy-*`を消す |
+
+ブラウザから見るとCloudFrontが、code-serverから見るとMicroVM endpointが、それぞれ話し相手に見えています。どちらも間に中継役がいることを意識しなくて済むのが、リバースプロキシのいいところです。
+
+### MicroVM endpointがやっていること
+MicroVM endpointの正体は、AWSが管理しているリバースプロキシです。届いたリクエストに対して、次の処理をしてからMicroVMの中のportへ転送します。
+
+```mermaid
+flowchart LR
+    C["クライアント"] -- "HTTPS<br/>X-aws-proxy-auth: token" --> EP["MicroVM endpoint<br/>(AWS管理のプロキシ)"]
+    subgraph VM["Lambda MicroVM"]
+        CS["code-server :8080"]
+        HK["hook server :9000"]
+    end
+    EP -- "① tokenを検証<br/>② 転送先portを決める<br/>③ X-aws-proxy-*を除去" --> CS
+    EP -. "tokenで8080番しか許可していないので403" .-> HK
+```
+
+1. `X-aws-proxy-auth`ヘッダーのtokenを検証する。tokenがない、期限切れ、別のMicroVM用なら403を返す
+2. 転送先のportを決める。`X-aws-proxy-port`ヘッダー、WebSocketのサブプロトコル(`lambda-microvms.port.N`)の順に見て、どちらもなければ8080番
+3. そのportがtokenの`allowedPorts`に入っていなければ403を返す
+4. `X-aws-proxy-*`ヘッダーを取り除いて、MicroVMの中のportへ転送する
+
+https://docs.aws.amazon.com/lambda/latest/dg/microvms-networking.html
+
+つまり、MicroVMのアプリにつなぐのに必要なのは次の3つだけです。
+
+| 必要なもの | 手に入れ方 | このプロジェクトでの値 |
+| --- | --- | --- |
+| 宛先のホスト名 | `RunMicrovm`のレスポンスの`endpoint` | DynamoDBに保存 |
+| token | `CreateMicrovmAuthToken`のレスポンスの`X-aws-proxy-auth` | port 8080だけ、60分。DynamoDBに保存 |
+| 転送先のport | `X-aws-proxy-port`ヘッダー、または省略して8080 | 省略(code-serverが8080で待っているので、デフォルトのままでよい) |
+
+手元から試すなら、curlでこう叩くだけです。
+
+```bash
+curl "https://${ENDPOINT}/" -H "X-aws-proxy-auth: ${TOKEN}"
+```
+
+`X-aws-proxy-port`を省略しているので8080番、つまりcode-serverへ届き、code-serverのHTMLが返ってきます。逆に`X-aws-proxy-port: 9000`を付けてhook serverを狙っても、tokenが8080番しか許可していないので403で弾かれます。
+
+### なぜブラウザからendpointへ直接つながないのか
+ここまでの話だけなら、ブラウザでMicroVM endpointのURLを開けばよさそうに見えます。ところが、ブラウザでは素直にいきません。
+
+- アドレスバーにURLを打ったり、リンクをクリックしたりしたときの通信には、`X-aws-proxy-auth`のような任意のヘッダーを付けられない
+- JavaScriptの`WebSocket`も任意のヘッダーを付けられない。AWSはこのためにtokenをサブプロトコルで渡す方法を用意しているが、そうするとtokenをブラウザのJavaScriptに渡すことになる
+- そもそもcode-serverは自分で作ったアプリではないので、「すべての通信にtokenを付ける」ように改造できない
+
+そこで、ブラウザとMicroVM endpointの間に「tokenを付けて中継する係」を置くことにしました。それがCloudFront + Lambda@Edgeです。ブラウザはいつもの感覚でCloudFrontのURLを開くだけで、tokenの付与はすべてLambda@Edgeが代わりにやります。
+
+## ブラウザにcode-serverの画面が表示されるまで
+セッションを選び終わった状態で、ブラウザがCloudFrontのURL(`https://xxxx.cloudfront.net/`)を開いたときに起きていることを順番に追います。
+
+```mermaid
+sequenceDiagram
+    participant B as ブラウザ
+    participant CF as CloudFront
+    participant E as Lambda@Edge<br/>(origin-request)
+    participant D as DynamoDB
+    participant EP as MicroVM endpoint
+    participant CS as code-server :8080
+    B->>CF: GET /(ログインCookie、セッションCookie付き)
+    CF->>E: origin-requestイベント
+    E->>E: ログインCookieを検証
+    E->>D: GetItem(セッションCookieのUUID)
+    D-->>E: endpoint, token
+    E-->>CF: originをendpointに差し替え、<br/>Host / Origin / X-aws-proxy-authを設定
+    CF->>EP: GET /(HTTPS)
+    EP->>EP: tokenを検証、port 8080を選択、<br/>X-aws-proxy-*を除去
+    EP->>CS: GET /
+    CS-->>B: VS CodeのHTML(EP、CFを経由して返る)
+    B->>CF: GET /static/...(JS・CSS)
+    Note over CF,CS: 1リクエストごとに上と同じ経路を通る
+    B->>CF: WebSocketのupgradeリクエスト
+    Note over CF,CS: upgradeリクエストも同じ経路を通り、<br/>確立後はこの接続の上でデータが流れる
+```
+
+1. ブラウザがCloudFrontへ`GET /`を送る。ブラウザが知っているのはCloudFrontのドメインとCookieだけ
+2. CloudFrontのキャッシュは無効にしているので、すべてのリクエストでorigin-requestのLambda@Edgeが呼ばれる
+3. Lambda@EdgeがログインCookieを検証し、セッションCookieのUUIDでDynamoDBからendpointとtokenを読む
+4. Lambda@Edgeがリクエストのoriginをendpointへ差し替え、`Host`、`Origin`、`X-aws-proxy-auth`を付けてCloudFrontに返す。URLのパスはそのまま
+5. CloudFrontが、差し替え後のendpointへHTTPSで転送する
+6. MicroVM endpointがtokenを検証し、`X-aws-proxy-port`がないので8080番のcode-serverへ転送する
+7. code-serverがVS CodeのHTMLを返す。レスポンスは来た道を戻り、ブラウザにはCloudFrontから返ってきたように見える
+8. ブラウザがHTMLを読み、JSやCSSを取りにいく。これも1リクエストずつ同じ経路を通る
+9. VS CodeのJSがブラウザで動き出し、`wss://xxxx.cloudfront.net/...`へWebSocketをつなぐ。最初のupgradeリクエストも同じ経路を通り、接続が確立した後はその上でターミナルやファイル操作のデータが流れ続ける
+
+ポイントは、ブラウザとcode-serverが、お互いに相手の本当の場所を知らないことです。
+
+| 立場 | 見えているもの | 見えていないもの |
+| --- | --- | --- |
+| ブラウザ | CloudFrontのドメイン、ログインCookie、セッションCookie(UUIDだけ) | MicroVM endpoint、token、MicroVM ID |
+| Lambda@Edge | すべて(DynamoDB経由) | なし |
+| code-server | endpointのホスト名(`Host`と`Origin`)、code-server自身のCookie | CloudFrontのドメイン、token、Edge専用Cookie |
+
+code-serverから見ると、自分のendpointへ直接アクセスされているのと同じに見えます。ブラウザから見ると、CloudFrontの上でVS Codeが動いているように見えます。この2つの見え方のズレを埋めているのがLambda@Edgeによる書き換えで、後で出てくる`Origin`ヘッダーの書き換えもその一部です。
+
+なお、画面を描いているのはMicroVMではなくブラウザです。code-serverはVS CodeのUIをHTMLとJSとして配り、ブラウザ上で動くUIがWebSocketでMicroVM側のファイルやターミナルを操作しています。この仕組みは次の記事で詳しく書きます。
 
 ## 新しいMicroVMを起動するとき
 ログイン後、セッション選択画面で「Start a new MicroVM」を押したときの流れです。

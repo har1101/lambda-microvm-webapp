@@ -362,7 +362,7 @@ code-server、Node.js、Bun、GitHub CLI、AWS CLI、uv、ripgrepはすべてarm
 
 ### 8.3 version pinだけでなくchecksumも必要
 
-主要なtop-levelツールはversion固定しているが、完全再現可能ではない。現在checksum検証しているのはripgrepとChromium packであり、他の直接ダウンロード成果物には未実装である。`dnf` package、VS Code extension、base imageの実体、OMPのtransitive dependencyは完全固定されていない。Edge SDKはlockfileと`npm ci`で現在解決結果を固定しているが、manifestは一部caret rangeである。
+主要なtop-levelツールはversion固定しているが、完全再現可能ではない。code-serverとOMPは`npm run deploy`のたびに最新版へ書き換わる。現在checksum検証しているのはripgrepとChromium packであり、他の直接ダウンロード成果物には未実装である。`dnf` package、VS Code extension、base imageの実体、OMPのtransitive dependencyは完全固定されていない。Edge SDKはlockfileと`npm ci`で現在解決結果を固定しているが、manifestは一部caret rangeである。
 
 version固定は再現性を上げるが、配布物改ざんや同一タグ差し替えへの対策としてはchecksumまたは署名検証が必要である。
 

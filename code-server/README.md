@@ -54,6 +54,8 @@ AWS_PROFILE=fukuchi AWS_REGION=ap-northeast-1 npm run deploy
 
 The normal deploy uses `--full-wait` so the MicroVM image build and CloudFront distribution are ready before it returns.
 
+`npm run deploy` first runs `predeploy` (`npm run update-versions`), which rewrites `ARG CODE_SERVER_VERSION` and `ARG OMP_VERSION` in `artifact/base-image/Dockerfile` to the latest code-server GitHub release (with an arm64 RPM) and the npm `latest` of `@oh-my-pi/pi-coding-agent`. A changed Dockerfile changes the image asset hash, so the MicroVM image is rebuilt; if both are already current, nothing is rewritten and the image is not rebuilt. New versions apply to MicroVMs started after the deploy. `deploy:dry-run` does not run the updater. The script fails the deploy if either lookup fails.
+
 ## First access
 
 1. Read `DistributionUrl`, `BasicAuthUsername`, and `AccessPasswordSecretArn` from the edge stack outputs.
@@ -105,7 +107,7 @@ Commit and push all workspace changes first; termination destroys the VM's local
 
 ## Implementation status
 
-The deployable personal-IDE path is implemented: Tokyo MicroVM image, CloudFront/Lambda@Edge access control, code-server, pinned OMP, Bun/Node/Python/uv, GitHub CLI OAuth without PAT, AWS CLI, language servers, `ripgrep`, headless Chromium for OMP browser E2E, encrypted lifecycle persistence, explicit suspend/resume, and `cdkd` deployment.
+The deployable personal-IDE path is implemented: Tokyo MicroVM image, CloudFront/Lambda@Edge access control, code-server, OMP, Bun/Node/Python/uv, GitHub CLI OAuth without PAT, AWS CLI, language servers, `ripgrep`, headless Chromium for OMP browser E2E, encrypted lifecycle persistence, explicit suspend/resume, and `cdkd` deployment.
 
 The original design document is not implemented literally in these intentionally superseded areas:
 
@@ -113,7 +115,7 @@ The original design document is not implemented literally in these intentionally
 - GitHub Enterprise support was replaced by normal `github.com` OAuth using `gh auth login --web`.
 - The workspace remains MicroVM-local and ephemeral. Clone a repository after startup; authentication state persists, repository contents do not.
 
-OMP sign-in for Anthropic and OpenAI Codex and the code-server browser flow have been exercised. OpenCode Go login/model calls and a full private-repository clone/edit/test/push/PR workflow are still manual verification items. Base-image dependency updates are pinned and deployed manually; no recurring image-update automation is configured.
+OMP sign-in for Anthropic and OpenAI Codex and the code-server browser flow have been exercised. OpenCode Go login/model calls and a full private-repository clone/edit/test/push/PR workflow are still manual verification items. code-server and OMP are bumped to their latest releases on every `npm run deploy`; other base-image dependencies are pinned and updated manually. No scheduled deploy is configured.
 
 ## Operations
 

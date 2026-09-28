@@ -102,7 +102,7 @@ OMPとGitHubの認証状態はKMS暗号化されたS3へ保存される。ワー
 
 | 項目 | 状態 | 現状 |
 | --- | --- | --- |
-| OMP preinstall | 実装・検証済み | version固定、起動直後から利用可能 |
+| OMP preinstall | 実装・検証済み | `npm run deploy`ごとに最新版へ更新してImageへ焼き込む。起動直後から利用可能 |
 | Claude subscription | 実装・利用確認済み | OMP OAuth情報を`agent.db`へ保存 |
 | OpenAI Codex subscription | 実装・利用確認済み | OMP OAuth情報を`agent.db`へ保存 |
 | OpenCode Go設定 | 実装済み | model role/fallback設定あり、モデル呼び出しの正式E2Eは未完 |
