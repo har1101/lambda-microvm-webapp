@@ -1,8 +1,8 @@
 # OMP Cloud IDEの実装状況・未実装項目・改善ロードマップ
 
-最終更新: 2026-09-25
+最終更新: 2026-09-29
 対象: `code-server/`配下の個人用OMP Cloud IDE実装
-基準: 2026-09-25時点の実装とデプロイ検証
+基準: 2026-09-29時点の実装とデプロイ検証
 
 この文書は、現時点で何が実装・検証済みか、何が部分実装または未実装か、次にどの改善を行うべきかを独立して判断できるようにまとめたものである。
 
@@ -131,7 +131,7 @@ OMPとGitHubの認証状態はKMS暗号化されたS3へ保存される。ワー
 | ripgrep/jq/tree等 | 実装済み | Imageへ事前導入 |
 | VS Code日本語化 | 実装済み | Japanese language pack |
 | YAML/Python/Docker extension | 実装済み | Image build時に導入 |
-| Suspend control extension | 部分実装 | HTTPS制御画面を開くがCloudFront URLがImage内に固定 |
+| Suspend control extension | 実装済み(実機確認待ち) | HTTPS制御画面を開く。control URLはImageに固定せず、Edgeが`runHookPayload`で渡した値を`session.json`から読む。deploy前に起動したVMではURLがなくエラー表示 |
 | MicroVM残り寿命表示 | 実装・検証済み | Edgeが`RunMicrovm`直前に計算した期限を`/run` hook経由で渡し、status barへ`残り H:MM`、30分/10分で警告色、60/15/5分で通知。VM内時計はS3 `Date` headerで毎分補正(実機ではSuspend 3分→Resume後も補正-1秒で、ゲスト時計の遅れは観測されなかった)。deploy後の新規VMのみ対象 |
 | リポジトリ自動clone | 未実装 | 起動後に手動clone |
 | project依存の自動install | 未実装 | 各リポジトリで手動 |
@@ -172,7 +172,7 @@ OMPとGitHubの認証状態はKMS暗号化されたS3へ保存される。ワー
 | branch protection/required checks | 未実装 | `main`未保護 |
 | dependency update automation | 未実装 | 手動pin更新 |
 | automated deployed E2E | 未実装 | 手動実行 |
-| 複数環境の並行deploy | 未実装 | resource名・control URL・生成config pathが環境非対応 |
+| 複数環境の並行deploy | 未実装 | resource名・生成config pathが環境非対応(control URLは実行時注入済み) |
 | retained resource cleanup | 未実装 | Lambda@Edge旧Version、KMS等の棚卸しRunbookなし(S3非現行Versionはlifecycleで失効) |
 
 ## 3. 現在の検証実績
@@ -264,7 +264,7 @@ npm run diff             # deploy後は両Stack差分ゼロ
 | GitHub Enterprise | 通常`github.com` | 実要件に合わせた |
 | PATまたは外部Secret | `gh auth login --web` OAuth | PATを使わない要件 |
 | root相当`vscode` | UID/GID 1000 | OMP shell実行時の影響を低減 |
-| native HTTP Basic | HTMLフォーム+Cookie | 埋め込みブラウザ互換性 |
+| native HTTP Basic | Cognito Managed Login + 不透明なEdgeセッションCookie | 埋め込みブラウザ互換性、MFA、サーバー側失効(途中でHTMLフォーム+Cookieを経由) |
 | Cookieなしで自動新規起動 | 選択画面 | 既存作業の孤立と不要起動を防止 |
 | Browserは後回し | ARM64 ChromiumをImage同梱 | OMP自身のE2Eを標準化 |
 
@@ -346,7 +346,7 @@ main merge: prod Environment承認後にdeploy + E2E
 必要事項:
 
 - 固定のImage/Table/Secret/Role/Bucket/Headers Policy名を環境suffixまたは別accountで分離する
-- Image内に固定されたcontrol URLを相対化またはruntime注入する
+- ~~Image内に固定されたcontrol URLを相対化またはruntime注入する~~(実装済み: Edgeが`runHookPayload`で注入)
 - synth時に共有source directoryへ`config.json`を書き込むraceを解消し、環境別outputへ生成する
 - PR synthでは非秘密のaccount/regionを明示注入する（現状`CDK_DEFAULT_ACCOUNT`必須）
 - `staging`/`main`ブランチと環境の1:1対応
@@ -442,7 +442,7 @@ MicroVM proxy tokenは現状60分である。短命化（例: 15〜30分）とre
 
 #### 5.9 Supply chain検証を揃える
 
-現在checksumがあるのは一部の配布物だけである。code-server、Node、Bun、GitHub CLI、AWS CLI、uvもchecksum/署名検証を追加する。
+code-server RPM、Node、Bun、GitHub CLI、AWS CLI、uv、ripgrep、Chromium packの直接ダウンロードはDockerfileのSHA-256 ARGと`sha256sum -c`で検証する(実装済み)。code-serverのhashはdeploy時に`scripts/update-tool-versions.mjs`がrelease assetの`digest`から更新する。AWS CLIは公式がPGP署名しか公開していないため、取得したファイルから算出したhash(trust-on-first-use)であり、PGP署名検証への置き換えが残る。OMPはnpm registryのintegrityに頼る。`dnf` package、VS Code extension、npm global LSP packageのtransitive dependency、base image digestは未固定である。
 
 さらに次を検討する。
 
@@ -522,11 +522,9 @@ AWS APIはPENDINGやUNKNOWNを返す可能性があり、`GetMicrovm`成功だ�
 - 現在の課金状態の説明
 - Resume進捗のpolling
 - 失敗時のretryボタン
-- logout
-- terminate
-- stale session非表示/削除
+- stale session非表示
 - PENDING/RESUMING進捗とtimeout
-- Image内の固定control URLをcurrent originから導出
+- ~~Image内の固定control URLをcurrent originから導出~~(実装済み: Edgeが`runHookPayload`で注入)
 
 ### P2: 可用性と復旧性を高める
 
@@ -562,7 +560,7 @@ code-serverのstatus barへの表示は実装済みである(5.0節)。`認証 N
 
 #### 5.16 run hook payloadの活用を広げる
 
-Lambdaは`/run`へ`{"microvmId": ..., "runHookPayload": "<RunMicrovmへ渡した文字列>"}`を送る。残り寿命表示のため、Edgeは`RunMicrovm`直前に計算した`expiresAt`を`runHookPayload`の`{"sessionId", "expiresAt"}`に入れ、`lifecycle.py`はこのenvelopeを解釈して`{microvmId, expiresAt}`を`~/.cache/omp-cloud-ide/session.json`へ書く(実装済み)。VMは自分の`startedAt`を知る手段(`GetMicrovm`権限や環境変数)を持たないため、期限はEdgeから渡している。`sessionId`はbearer Cookie値なのでVM内へ保存しない。
+Lambdaは`/run`へ`{"microvmId": ..., "runHookPayload": "<RunMicrovmへ渡した文字列>"}`を送る。Edgeは`RunMicrovm`直前に計算した`expiresAt`と、Distributionのドメインから組み立てた`controlUrl`を`runHookPayload`の`{"sessionId", "expiresAt", "controlUrl"}`に入れ、`lifecycle.py`はこのenvelopeを解釈して`{microvmId, expiresAt, controlUrl}`を`~/.cache/omp-cloud-ide/session.json`へ書く(実装済み。`controlUrl`は`https://`で始まる場合だけ保存)。VMは自分の`startedAt`を知る手段(`GetMicrovm`権限や環境変数)を持たないため、期限はEdgeから渡している。`sessionId`はbearer Cookie値なのでVM内へ保存しない。
 
 未活用: 記録済みの`microvmId`を、保存結果の記録、認証競合の診断、session別S3 prefixへ使う余地がある。
 
@@ -584,12 +582,12 @@ Lambdaは`/run`へ`{"microvmId": ..., "runHookPayload": "<RunMicrovmへ渡した
 4. control originとproxy originの分離
 5. 明示Terminate UI(実装済み: 5.3節)
 6. E2Eスクリプト正式化
-7. checksum・version pin拡充
+7. checksum・version pin拡充(直接ダウンロード成果物のSHA-256は実装済み。dnf・VS Code拡張・base image digestが残る)
 
 ### Phase B: CI/CDと運用監視
 
 1. `staging`/`main`設計
-2. 固定resource名/control URL/config生成の環境対応
+2. 固定resource名/config生成の環境対応(control URLは実行時注入済み)
 3. GitHub OIDC Role
 4. PR品質ゲート
 5. staging自動deploy

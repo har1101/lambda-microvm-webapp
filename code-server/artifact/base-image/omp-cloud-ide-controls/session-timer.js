@@ -16,6 +16,17 @@ function parseSessionDeadline(text) {
   return Number.isSafeInteger(expiresAt) && expiresAt > 0 ? expiresAt : null;
 }
 
+/** Returns the HTTPS control page URL the Edge passed through the session file, or null. */
+function parseControlUrl(text) {
+  let url;
+  try {
+    url = new URL(JSON.parse(text)?.controlUrl);
+  } catch {
+    return null;
+  }
+  return url.protocol === 'https:' ? url.toString() : null;
+}
+
 /** Formats a positive remaining duration as H:MM, rounding down. */
 function formatRemaining(remainingMs) {
   const totalMinutes = Math.floor(Math.max(0, remainingMs) / 60_000);
@@ -114,6 +125,7 @@ module.exports = {
   describeAuthSync,
   dueNotification,
   formatRemaining,
+  parseControlUrl,
   parseSessionDeadline,
   severity,
 };

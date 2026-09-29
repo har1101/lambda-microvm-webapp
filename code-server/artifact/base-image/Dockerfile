@@ -1,13 +1,23 @@
 FROM public.ecr.aws/lambda/microvms:al2023-minimal
 
+# Every directly downloaded artifact is verified against a pinned SHA-256.
+# `npm run update-versions` rewrites CODE_SERVER_VERSION/CODE_SERVER_ARM64_RPM_SHA256
+# and OMP_VERSION; update the other pairs together by hand.
 ARG CODE_SERVER_VERSION=4.139.1
+ARG CODE_SERVER_ARM64_RPM_SHA256=34e38458bfad5dd68dce20aa3b5d7b89dd9632ac516e109c21fa0ebbb5fca95e
 ARG BUN_VERSION=1.3.14
+ARG BUN_ARM64_ZIP_SHA256=a27ffb63a8310375836e0d6f668ae17fa8d8d18b88c37c821c65331973a19a3b
 ARG OMP_VERSION=18.4.3
 ARG GH_VERSION=2.96.0
+ARG GH_ARM64_TAR_SHA256=06f86ec7103d41993b76cd78072f43595c34aaa56506d971d9860e67140bf909
 ARG AWS_CLI_VERSION=2.34.45
+ARG AWS_CLI_ARM64_ZIP_SHA256=bf29e06a06fb9bac2a3803931e6618a9f7c9f4c6632ec3b587184850b8f03433
 ARG NODE_VERSION=24.21.0
+ARG NODE_ARM64_TAR_SHA256=6ad1325edbdb5649c379b75a237147a666c95d4f9ae8d340fef2d1575d289ad2
 ARG UV_VERSION=0.12.18
+ARG UV_ARM64_TAR_SHA256=afb6291f3f0a6b4521fc67b947822506c41dde5b60d2189dd8f3695b2ac8c9e7
 ARG RIPGREP_VERSION=15.2.0
+ARG RIPGREP_ARM64_TAR_SHA256=800b1e7206afe799dfb5a6901f23147cfaabe0e52210538100f61e86e1740915
 ARG CHROMIUM_VERSION=149.0.0
 ARG CHROMIUM_ARM64_PACK_SHA256=9c42e7850d746cbf0ac0e68eaa48af277af8255a5ee12a813c08573671f231f6
 
@@ -29,18 +39,20 @@ RUN dnf install -y \
 
 RUN curl -fsSL "https://github.com/BurntSushi/ripgrep/releases/download/${RIPGREP_VERSION}/ripgrep-${RIPGREP_VERSION}-aarch64-unknown-linux-musl.tar.gz" \
       -o /tmp/ripgrep.tar.gz \
-    && echo "800b1e7206afe799dfb5a6901f23147cfaabe0e52210538100f61e86e1740915  /tmp/ripgrep.tar.gz" | sha256sum -c - \
+    && echo "${RIPGREP_ARM64_TAR_SHA256}  /tmp/ripgrep.tar.gz" | sha256sum -c - \
     && tar -xzf /tmp/ripgrep.tar.gz -C /tmp \
     && install -m 0755 "/tmp/ripgrep-${RIPGREP_VERSION}-aarch64-unknown-linux-musl/rg" /usr/local/bin/rg \
     && rm -rf /tmp/ripgrep.tar.gz "/tmp/ripgrep-${RIPGREP_VERSION}-aarch64-unknown-linux-musl"
 
 RUN curl -fsSL "https://github.com/coder/code-server/releases/download/v${CODE_SERVER_VERSION}/code-server-${CODE_SERVER_VERSION}-arm64.rpm" \
       -o /tmp/code-server.rpm \
+    && echo "${CODE_SERVER_ARM64_RPM_SHA256}  /tmp/code-server.rpm" | sha256sum -c - \
     && rpm -U /tmp/code-server.rpm \
     && rm -f /tmp/code-server.rpm
 
 RUN curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-arm64.tar.xz" \
       -o /tmp/node.tar.xz \
+    && echo "${NODE_ARM64_TAR_SHA256}  /tmp/node.tar.xz" | sha256sum -c - \
     && tar -xJf /tmp/node.tar.xz -C /usr/local --strip-components=1 \
     && rm -f /tmp/node.tar.xz \
     && npm install --global \
@@ -53,6 +65,7 @@ RUN curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-l
 
 RUN curl -fsSL "https://github.com/oven-sh/bun/releases/download/bun-v${BUN_VERSION}/bun-linux-aarch64.zip" \
       -o /tmp/bun.zip \
+    && echo "${BUN_ARM64_ZIP_SHA256}  /tmp/bun.zip" | sha256sum -c - \
     && unzip -q /tmp/bun.zip -d /tmp \
     && install -m 0755 /tmp/bun-linux-aarch64/bun /usr/local/bin/bun \
     && rm -rf /tmp/bun.zip /tmp/bun-linux-aarch64
@@ -88,18 +101,21 @@ ENV LD_LIBRARY_PATH=/opt/chromium/al2023/lib:/opt/chromium
 
 RUN curl -fsSL "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_arm64.tar.gz" \
       -o /tmp/gh.tar.gz \
+    && echo "${GH_ARM64_TAR_SHA256}  /tmp/gh.tar.gz" | sha256sum -c - \
     && tar -xzf /tmp/gh.tar.gz -C /tmp \
     && install -m 0755 "/tmp/gh_${GH_VERSION}_linux_arm64/bin/gh" /usr/local/bin/gh \
     && rm -rf /tmp/gh.tar.gz "/tmp/gh_${GH_VERSION}_linux_arm64"
 
 RUN curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-aarch64-${AWS_CLI_VERSION}.zip" \
       -o /tmp/awscliv2.zip \
+    && echo "${AWS_CLI_ARM64_ZIP_SHA256}  /tmp/awscliv2.zip" | sha256sum -c - \
     && unzip -q /tmp/awscliv2.zip -d /tmp \
     && /tmp/aws/install \
     && rm -rf /tmp/aws /tmp/awscliv2.zip
 
 RUN curl -fsSL "https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/uv-aarch64-unknown-linux-gnu.tar.gz" \
       -o /tmp/uv.tar.gz \
+    && echo "${UV_ARM64_TAR_SHA256}  /tmp/uv.tar.gz" | sha256sum -c - \
     && tar -xzf /tmp/uv.tar.gz -C /tmp \
     && install -m 0755 /tmp/uv-aarch64-unknown-linux-gnu/uv /usr/local/bin/uv \
     && install -m 0755 /tmp/uv-aarch64-unknown-linux-gnu/uvx /usr/local/bin/uvx \

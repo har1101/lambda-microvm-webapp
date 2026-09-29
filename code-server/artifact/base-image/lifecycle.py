@@ -491,16 +491,18 @@ def persist_state(
 
 
 def record_session(body: bytes) -> None:
-    """Write the MicroVM lifetime deadline read by the IDE status bar.
+    """Write the MicroVM lifetime deadline and control page URL read by the IDE status bar.
 
     Lambda wraps RunMicrovm's runHookPayload string as
     {"microvmId": ..., "runHookPayload": "..."}; the Edge puts expiresAt
-    (epoch ms) inside that string. The VM itself cannot query GetMicrovm.
+    (epoch ms) and controlUrl inside that string. The VM itself cannot query
+    GetMicrovm, and the image is not tied to one CloudFront domain.
     """
     try:
         envelope = json.loads(body)
         payload = json.loads(envelope.get("runHookPayload") or "{}")
         expires_at = payload.get("expiresAt")
+        control_url = payload.get("controlUrl")
     except (json.JSONDecodeError, AttributeError, TypeError):
         log("run hook body did not contain a JSON runHookPayload")
         return
@@ -508,8 +510,13 @@ def record_session(body: bytes) -> None:
         log("run hook payload has no expiresAt; session deadline unknown")
         return
 
+    session = {"microvmId": str(envelope.get("microvmId", "")), "expiresAt": expires_at}
+    if isinstance(control_url, str) and control_url.startswith("https://"):
+        session["controlUrl"] = control_url
+    else:
+        log("run hook payload has no HTTPS controlUrl; suspend control unavailable")
     try:
-        write_json_atomic(SESSION_FILE, {"microvmId": str(envelope.get("microvmId", "")), "expiresAt": expires_at})
+        write_json_atomic(SESSION_FILE, session)
     except OSError as error:
         log(f"could not record session deadline: {type(error).__name__}")
         return

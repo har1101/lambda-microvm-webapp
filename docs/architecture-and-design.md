@@ -585,7 +585,7 @@ sequenceDiagram
 | `idlePolicy.maxIdleDurationSeconds` | 300 | 5分間通信がなければ自動でSuspendする |
 | `idlePolicy.suspendedDurationSeconds` | 28800 | Suspendが8時間続いたら終了する |
 | `maximumDurationInSeconds` | 28800 | RUNNINGとSUSPENDEDを合わせた総寿命。8時間で終了する |
-| `runHookPayload` | `{"sessionId": "<UUID>", "expiresAt": <epoch ms>}` | `/run` hookへ渡す文字列。`expiresAt`は`RunMicrovm`直前の時刻+8時間で、実際の終了時刻より遅くならない |
+| `runHookPayload` | `{"sessionId": "<UUID>", "expiresAt": <epoch ms>, "controlUrl": "https://<Distributionのドメイン>/session/control"}` | `/run` hookへ渡す文字列。`expiresAt`は`RunMicrovm`直前の時刻+8時間で、実際の終了時刻より遅くならない。`controlUrl`はリクエストを受けたDistributionのドメインから組み立てる |
 
 `maximumDurationInSeconds`はSuspend中の時間も含む。`suspendedDurationSeconds`が8時間でも、起動から8時間たてばMicroVMは終了する。
 
@@ -723,13 +723,13 @@ Image定義にも`INTERNET_EGRESS`を指定している。Dockerfileの実行中
 
 | ツール | version | 取得元 | 検証 |
 | --- | --- | --- | --- |
-| code-server | 4.139.1(deploy時に最新へ更新) | coder/code-server GitHub Releases(RPM) | versionのみ |
-| Node.js | 24.21.0 | nodejs.org | versionのみ |
-| Bun | 1.3.14 | oven-sh/bun GitHub Releases | versionのみ |
-| OMP(`@oh-my-pi/pi-coding-agent`) | 18.4.0(deploy時に最新へ更新) | npm(`bun install --global`) | versionのみ |
-| GitHub CLI | 2.96.0 | cli/cli GitHub Releases | versionのみ |
-| AWS CLI | 2.34.45 | awscli.amazonaws.com | versionのみ |
-| uv / uvx | 0.12.18 | astral-sh/uv GitHub Releases | versionのみ |
+| code-server | 4.139.1(deploy時に最新へ更新) | coder/code-server GitHub Releases(RPM) | SHA-256(deploy時にrelease assetの`digest`から更新) |
+| Node.js | 24.21.0 | nodejs.org | SHA-256(`SHASUMS256.txt`) |
+| Bun | 1.3.14 | oven-sh/bun GitHub Releases | SHA-256(releaseの`SHASUMS256.txt`) |
+| OMP(`@oh-my-pi/pi-coding-agent`) | 18.4.0(deploy時に最新へ更新) | npm(`bun install --global`) | versionのみ(npm registryのintegrity) |
+| GitHub CLI | 2.96.0 | cli/cli GitHub Releases | SHA-256(releaseの`checksums.txt`) |
+| AWS CLI | 2.34.45 | awscli.amazonaws.com | SHA-256(公式はPGP署名のみのため、取得したファイルから算出したtrust-on-first-use) |
+| uv / uvx | 0.12.18 | astral-sh/uv GitHub Releases | SHA-256(releaseの`.sha256`) |
 | ripgrep | 15.2.0 | BurntSushi/ripgrep GitHub Releases | SHA-256 |
 | Chromium(Sparticuz arm64 pack) | 149.0.0 | Sparticuz/chromium GitHub Releases | SHA-256、build時に`--version`を実行 |
 | TypeScript | 7.0.2 | npm | versionのみ |
@@ -738,7 +738,7 @@ Image定義にも`INTERNET_EGRESS`を指定している。Dockerfileの実行中
 | bash-language-server | 5.8.1 | npm | versionのみ |
 | yaml-language-server | 1.24.0 | npm | versionのみ |
 
-このほか`dnf`でgit、python3、pip、jq、tree、zip系などを入れている。`dnf`のパッケージ、VS Code拡張、ベースイメージ、npmの依存先はversionを固定していない。
+直接ダウンロードする成果物は、DockerfileのSHA-256 ARG(`CODE_SERVER_ARM64_RPM_SHA256`など)と`sha256sum -c`で検証する。`scripts/update-tool-versions.mjs`はcode-serverのversionと一緒に`CODE_SERVER_ARM64_RPM_SHA256`も書き換え、release assetに`digest`がなければ失敗する。このほか`dnf`でgit、python3、pip、jq、tree、zip系などを入れている。`dnf`のパッケージ、VS Code拡張、ベースイメージ(digest)、npmの依存先(LSPのtransitive dependencyを含む)はversionやchecksumを固定していない。SBOM生成や脆弱性scanもない。
 
 ### 9.4 起動プロセス
 
@@ -769,7 +769,7 @@ hookの有効化とtimeoutはImage定義(`Hooks`プロパティ)で設定し、�
 | `/suspend` | Suspend前 | 45秒 | 前回から変わった認証状態をS3へ保存して200(40秒以内。失敗しても200) |
 | `/terminate` | 終了前 | 45秒 | `/suspend`と同じ |
 
-`/run`のリクエスト本文には、Lambdaが注入する`microvmId`と、Lambda@Edgeが渡した`runHookPayload`(`{"sessionId": ..., "expiresAt": ...}`という文字列)が入る。`lifecycle.py`は`expiresAt`と`microvmId`を`~/.cache/omp-cloud-ide/session.json`へ書く。MicroVM内には自分の`startedAt`を取得する手段(`GetMicrovm`権限や環境変数)がないため、Edgeから期限を渡す。bearer Cookie値である`sessionId`は保存しない。
+`/run`のリクエスト本文には、Lambdaが注入する`microvmId`と、Lambda@Edgeが渡した`runHookPayload`(`{"sessionId": ..., "expiresAt": ..., "controlUrl": ...}`という文字列)が入る。`lifecycle.py`は`microvmId`、`expiresAt`、`controlUrl`を`~/.cache/omp-cloud-ide/session.json`へ書く。`controlUrl`は`https://`で始まる場合だけ保存し、それ以外は捨ててログに残す(期限は記録する)。MicroVM内には自分の`startedAt`を取得する手段(`GetMicrovm`権限や環境変数)がないため、Edgeから期限を渡す。bearer Cookie値である`sessionId`は保存しない。
 
 hook serverは5分ごとの定期保存スレッドも動かす。定期保存は前回から変わったファイルだけをアップロードする。期限、ロック、失敗時の扱いは10.3節に書く。
 
@@ -785,7 +785,6 @@ hook serverは5分ごとの定期保存スレッドも動かす。定期保存�
 | `files.autoSave` | afterDelay | 保存忘れを防ぐ |
 | `security.workspace.trust.enabled` | false | 信頼確認のダイアログを出さない(12章の前提に関係する) |
 | `chat.disableAIFeatures` | true | VS Code組み込みのAI機能を使わず、OMPに集約する |
-| `ompCloudIde.controlUrl` | CloudFrontの`/session/control` | Suspend拡張が開くURL |
 | `ompCloudIde.timeZone` | `Asia/Tokyo`(拡張の既定値) | 残り寿命tooltipの終了時刻表示 |
 
 表示言語は`argv.json`の`{"locale":"ja"}`で日本語にしている。
@@ -802,7 +801,7 @@ Image build時に入れる拡張:
 
 | 表示 | 読むもの | クリックしたとき |
 | --- | --- | --- |
-| `Suspend Cloud IDE` | `ompCloudIde.controlUrl` | `vscode.open`で制御画面を開く。URLがHTTPSでなければエラーを表示して開かない |
+| `Suspend Cloud IDE` | `~/.cache/omp-cloud-ide/session.json`の`controlUrl` | `vscode.open`で制御画面を開く。URLが見つかるまでは15秒ごとにファイルを読み直し、見つかる前のクリックではコマンド`ompCloudIde.openControl`がファイルを読み直して、URLがなければエラーを表示する |
 | `残り H:MM` | `~/.cache/omp-cloud-ide/session.json`の`expiresAt` | ソース管理ビューを開く |
 | `認証 N分前`など | `~/.cache/omp-cloud-ide/auth-sync.json` | コマンド`ompCloudIde.persistAuthState`(「OMP Cloud IDE: Save Auth State to S3」)で`persist-auth-state`を実行し、結果を通知する |
 
@@ -812,7 +811,7 @@ MicroVMのゲスト時計はNTPで同期していないため、Suspend/Resume�
 
 認証状態の表示の意味は10.4節に書く。
 
-`ompCloudIde.controlUrl`には特定のCloudFrontドメインが書き込まれている。Distributionを作り直すとSuspendボタンが古いURLを開く(16章)。
+control URLはImageに書き込まず、起動のたびにEdgeが`runHookPayload`で渡す。Distributionを作り直してもImageが古いURLを指すことはない。この仕組みのdeploy前に起動したVMには`controlUrl`がないため、Suspendボタンはエラーを表示する。
 
 ### 9.7 OMPの設定
 
@@ -1105,10 +1104,9 @@ AWS CLIでは有効なSSOセッションでも、cdkd内部のNode.js SDKが`Tok
 ### 13.5 複数環境を並べられない理由
 
 - スタック名、Image名、IAM Role名、DynamoDB表名、Secret名が固定である。
-- `ompCloudIde.controlUrl`に特定のCloudFrontドメインが書かれている。
 - synthが共有のパス`artifact/edge/config.json`へ書き込むため、同じチェックアウトで並行してsynthすると競合する。
 
-staging環境やGitHub Actionsによるデプロイを入れる前に、名前への環境サフィックス付与、生成物の一時ディレクトリ化、control URLの実行時注入が必要になる。
+staging環境やGitHub Actionsによるデプロイを入れる前に、名前への環境サフィックス付与と生成物の一時ディレクトリ化が必要になる(control URLは実行時注入済み)。
 
 ### 13.6 `.gitignore`が`*.js`を無視すること
 
@@ -1185,9 +1183,8 @@ Lambda@Edgeやセッション処理を変えたときは、デプロイ後に「
 | 永続化 | `/resume` hookが何も確認しない |
 | セキュリティ | 同一originの開発アプリから制御画面を操作できる |
 | セキュリティ | WAFがない(試行制限はCognitoのロックアウトのみ)。利用者ごとのセッション所有・S3 prefix・実行Roleの分離がない |
-| セキュリティ | 一部の外部成果物はchecksumを検証していない |
+| セキュリティ | `dnf`パッケージ、VS Code拡張、npmのtransitive dependency、ベースイメージはchecksum/digestを固定していない |
 | 運用 | origin-responseが開発アプリ自身の502/504も選択画面へ戻す |
-| 運用 | control URLがImageに固定されている |
 | 運用 | CI/CD、アラーム、ダッシュボードがない。Lambda@Edgeのログが各リージョンに分散する |
 | 運用 | Lambda@Edgeの旧Versionを掃除する手順がない。S3の非現行Versionは30日/最新10世代のlifecycleで保持を制限する |
 | 運用 | `.gitignore`の`*.js`により、例外行のないディレクトリへ追加した`.js`がcommitから漏れる(13.6節) |

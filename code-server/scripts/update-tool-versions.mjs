@@ -22,11 +22,17 @@ async function latestCodeServer() {
   const release = await getJson('https://api.github.com/repos/coder/code-server/releases/latest');
   const version = release.tag_name.replace(/^v/, '');
   // The Dockerfile installs the arm64 RPM; refuse a release that does not ship it.
-  const asset = `code-server-${version}-arm64.rpm`;
-  if (!release.assets.some((a) => a.name === asset)) {
-    throw new Error(`code-server ${version} has no ${asset} release asset`);
+  const name = `code-server-${version}-arm64.rpm`;
+  const asset = release.assets.find((a) => a.name === name);
+  if (!asset) {
+    throw new Error(`code-server ${version} has no ${name} release asset`);
   }
-  return version;
+  // GitHub records the SHA-256 of every uploaded release asset; the image build verifies it.
+  const sha256 = /^sha256:([0-9a-f]{64})$/.exec(asset.digest ?? '')?.[1];
+  if (!sha256) {
+    throw new Error(`${name}: release asset has no sha256 digest (${JSON.stringify(asset.digest)})`);
+  }
+  return { version, sha256 };
 }
 
 async function latestOmp() {
@@ -35,19 +41,23 @@ async function latestOmp() {
 }
 
 const [codeServer, omp] = await Promise.all([latestCodeServer(), latestOmp()]);
-const targets = { CODE_SERVER_VERSION: codeServer, OMP_VERSION: omp };
+const targets = {
+  CODE_SERVER_VERSION: [codeServer.version, /^\d+\.\d+\.\d+$/],
+  CODE_SERVER_ARM64_RPM_SHA256: [codeServer.sha256, /^[0-9a-f]{64}$/],
+  OMP_VERSION: [omp, /^\d+\.\d+\.\d+$/],
+};
 
 let dockerfile = readFileSync(DOCKERFILE, 'utf8');
-for (const [arg, version] of Object.entries(targets)) {
-  if (!/^\d+\.\d+\.\d+$/.test(version)) {
-    throw new Error(`${arg}: unexpected version string ${JSON.stringify(version)}`);
+for (const [arg, [value, format]] of Object.entries(targets)) {
+  if (!format.test(value)) {
+    throw new Error(`${arg}: unexpected value ${JSON.stringify(value)}`);
   }
   const line = new RegExp(`^ARG ${arg}=(.+)$`, 'm');
   const current = dockerfile.match(line)?.[1];
   if (current === undefined) {
     throw new Error(`ARG ${arg} not found in ${DOCKERFILE.pathname}`);
   }
-  console.log(current === version ? `${arg} ${current} (latest)` : `${arg} ${current} -> ${version}`);
-  dockerfile = dockerfile.replace(line, `ARG ${arg}=${version}`);
+  console.log(current === value ? `${arg} ${current} (latest)` : `${arg} ${current} -> ${value}`);
+  dockerfile = dockerfile.replace(line, `ARG ${arg}=${value}`);
 }
 writeFileSync(DOCKERFILE, dockerfile);

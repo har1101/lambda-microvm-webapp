@@ -366,7 +366,7 @@ code-server、Node.js、Bun、GitHub CLI、AWS CLI、uv、ripgrepはすべてarm
 
 ### 8.3 version pinだけでなくchecksumも必要
 
-主要なtop-levelツールはversion固定しているが、完全再現可能ではない。code-serverとOMPは`npm run deploy`のたびに最新版へ書き換わる。現在checksum検証しているのはripgrepとChromium packであり、他の直接ダウンロード成果物には未実装である。`dnf` package、VS Code extension、base imageの実体、OMPのtransitive dependencyは完全固定されていない。Edge SDKはlockfileと`npm ci`で現在解決結果を固定しているが、manifestは一部caret rangeである。
+主要なtop-levelツールはversion固定しているが、完全再現可能ではない。code-serverとOMPは`npm run deploy`のたびに最新版へ書き換わる(code-server RPMのSHA-256もrelease assetの`digest`から同時に書き換える)。直接ダウンロードする成果物(code-server RPM、Node、Bun、GitHub CLI、AWS CLI、uv、ripgrep、Chromium pack)はDockerfileのSHA-256 ARGと`sha256sum -c`で検証する。ただしAWS CLIは公式がPGP署名しか公開していないため、取得したファイルから算出したhash(trust-on-first-use)である。`dnf` package、VS Code extension、base imageの実体(digest)、OMPやLSPのtransitive dependencyは完全固定されていない。Edge SDKはlockfileと`npm ci`で現在解決結果を固定しているが、manifestは一部caret rangeである。
 
 version固定は再現性を上げるが、配布物改ざんや同一タグ差し替えへの対策としてはchecksumまたは署名検証が必要である。
 
@@ -405,9 +405,9 @@ Suspendボタン用extensionの`package.json`を追加した際、実装本体`e
 
 ### 9.5 Image内へ環境固有URLを固定すると再作成・複数環境で壊れる
 
-現在、code-server設定とcontrol extensionのdefault URLには特定CloudFront DistributionのURLが固定されている。Distributionを再作成した場合やstaging/prodを並行展開した場合、Suspendボタンが旧環境を開く。
+以前は、code-server設定とcontrol extensionのdefault URLに特定CloudFront DistributionのURLが固定されていた。Distributionを再作成した場合やstaging/prodを並行展開した場合、Suspendボタンが旧環境を開く。
 
-control URLはdeploy時にImageへ焼き直すより、現在のbrowser originから相対URLで導出するか、起動時設定として注入すべきである。E2EでもCDK OutputのDistribution URLとcontrol URLの一致を確認する。
+現在はImageにURLを書かず、Edgeが起動時に受けたDistributionのドメインから`https://<domain>/session/control`を組み立てて`runHookPayload`で渡し、`lifecycle.py`が`session.json`へ記録する(`https://`以外は捨てる)。extensionはこのファイルからURLを読む。この変更前に起動したVMにはURLがなく、Suspendボタンはエラーを表示する。E2EではCDK OutputのDistribution URLと`session.json`の`controlUrl`の一致を確認する。
 
 ### 9.6 run hookの本文はLambdaが包み直す。Resume処理も放置しない
 
@@ -415,7 +415,7 @@ control URLはdeploy時にImageへ焼き直すより、現在のbrowser origin�
 
 以前のこの節には「Edgeは`sessionId`を渡すが、hookは`microvmId`を探していて合っていない」と書いていたが、これは誤りだった。`microvmId`はLambdaが必ず入れるので、hook側の参照は正しく動いていた。Edgeが渡した値は`runHookPayload`の中に文字列として入っている。
 
-現在の実装では、Edgeが`runHookPayload`へ`{"sessionId", "expiresAt"}`のJSON文字列を入れる。`lifecycle.py`は外側を`json.loads`した後、`runHookPayload`をもう一度`json.loads`して`expiresAt`を読み、`microvmId`と一緒に`~/.cache/omp-cloud-ide/session.json`へ書く。`sessionId`はbearerとして働くCookieの値なので、VM内には保存しない。
+現在の実装では、Edgeが`runHookPayload`へ`{"sessionId", "expiresAt", "controlUrl"}`のJSON文字列を入れる。`lifecycle.py`は外側を`json.loads`した後、`runHookPayload`をもう一度`json.loads`して`expiresAt`と`controlUrl`を読み、`microvmId`と一緒に`~/.cache/omp-cloud-ide/session.json`へ書く。`sessionId`はbearerとして働くCookieの値なので、VM内には保存しない。
 
 `runHookPayload`を使うときは、次の2点を押さえる。
 
@@ -482,9 +482,9 @@ S3、KMS、DynamoDB、MicroVM ImageのLogical ID変更はデータや接続へ�
 
 ### 10.6 現在のIaCはそのままではstaging/prodを並行展開できない
 
-Stack、Image、IAM Role、DynamoDB table、Secretなどの名前が固定で、control extensionにも特定Distribution URLが固定されている。同一accountへ2環境をdeployすると名前衝突または誤ったcontrol先が生じる。
+Stack、Image、IAM Role、DynamoDB table、Secretなどの名前が固定である。同一accountへ2環境をdeployすると名前衝突が生じる。control URLは起動時に`runHookPayload`で注入するため、Imageは特定Distributionに縛られない。
 
-さらにsynthは`artifact/edge/config.json`という共有source pathへ設定を書き出すため、同じcheckoutで環境別synthを並列実行するとraceになり得る。GitHub Actions化の前に、環境suffix/別account、生成物用一時directory、control URLのruntime注入、PR synth用の明示account IDを設計する。
+さらにsynthは`artifact/edge/config.json`という共有source pathへ設定を書き出すため、同じcheckoutで環境別synthを並列実行するとraceになり得る。GitHub Actions化の前に、環境suffix/別account、生成物用一時directory、PR synth用の明示account IDを設計する。
 
 `cdkd`は実行資格情報でAWS APIを直接呼ぶため、CIでは環境別GitHub OIDC Roleとpermission boundaryを用意し、静的AWS keyを置かない。
 

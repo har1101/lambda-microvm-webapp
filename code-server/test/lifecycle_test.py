@@ -352,9 +352,27 @@ class LifecycleTest(unittest.TestCase):
         self.lifecycle.record_session(b"not json")
         self.assertFalse(session_file.exists())
 
-        payload = json.dumps({"sessionId": "7d041485-dff5-4033-bdbc-a921757e217b", "expiresAt": 1_800_028_800_000})
+        payload = json.dumps(
+            {
+                "sessionId": "7d041485-dff5-4033-bdbc-a921757e217b",
+                "expiresAt": 1_800_028_800_000,
+                "controlUrl": "https://d111.cloudfront.net/session/control",
+            }
+        )
         self.lifecycle.record_session(json.dumps({"microvmId": "mvm-test", "runHookPayload": payload}).encode())
         # The session ID is a bearer cookie value, so it stays out of the VM file.
+        self.assertEqual(
+            json.loads(session_file.read_text()),
+            {
+                "microvmId": "mvm-test",
+                "expiresAt": 1_800_028_800_000,
+                "controlUrl": "https://d111.cloudfront.net/session/control",
+            },
+        )
+
+        # A non-HTTPS control URL is dropped; the deadline is still recorded.
+        payload = json.dumps({"expiresAt": 1_800_028_800_000, "controlUrl": "http://evil.example/"})
+        self.lifecycle.record_session(json.dumps({"microvmId": "mvm-test", "runHookPayload": payload}).encode())
         self.assertEqual(
             json.loads(session_file.read_text()), {"microvmId": "mvm-test", "expiresAt": 1_800_028_800_000}
         )

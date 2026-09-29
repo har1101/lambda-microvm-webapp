@@ -14,37 +14,44 @@ const TICK_MS = 15_000;
 const CLOCK_SYNC_MS = 60_000;
 
 function activate(context) {
-  const rawUrl = vscode.workspace.getConfiguration('ompCloudIde').get('controlUrl', '');
-  let controlUrl;
-  try {
-    controlUrl = new URL(rawUrl);
-  } catch {
-    controlUrl = undefined;
-  }
+  context.subscriptions.push(...createSuspendControl(), createLifetimeCountdown(), ...createAuthSyncStatus());
+}
 
-  const openControl = vscode.commands.registerCommand('ompCloudIde.openControl', async () => {
-    if (controlUrl?.protocol !== 'https:') {
-      void vscode.window.showErrorMessage('OMP Cloud IDE control URL must be a valid HTTPS URL.');
-      return;
-    }
-    await vscode.commands.executeCommand('vscode.open', controlUrl.toString());
-  });
-
+function createSuspendControl() {
   const status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
   status.name = 'OMP Cloud IDE suspend control';
   status.text = '$(debug-pause) Suspend Cloud IDE';
   status.tooltip = 'Open the suspend/resume controls';
-  status.command =
-    controlUrl?.protocol === 'https:'
-      ? {
-          command: 'vscode.open',
-          title: 'Open Cloud IDE controls',
-          arguments: [controlUrl.toString()],
-        }
-      : 'ompCloudIde.openControl';
+  status.command = 'ompCloudIde.openControl';
   status.show();
 
-  context.subscriptions.push(openControl, status, createLifetimeCountdown(), ...createAuthSyncStatus());
+  // The /run hook records the control URL of the distribution that started
+  // this MicroVM; the image itself is not bound to one CloudFront domain.
+  let controlUrl = null;
+  const readControlUrl = () => fs.readFile(SESSION_FILE, 'utf8').then(timer.parseControlUrl, () => null);
+  const openControl = vscode.commands.registerCommand('ompCloudIde.openControl', async () => {
+    controlUrl ??= await readControlUrl();
+    if (controlUrl === null) {
+      void vscode.window.showErrorMessage(
+        '制御画面のURLを取得できません。control URLの実行時注入に対応する前に起動したVMか、/run hookが受け取れませんでした。',
+      );
+      return;
+    }
+    await vscode.commands.executeCommand('vscode.open', controlUrl);
+  });
+
+  // Bind the URL directly to the status bar item once known, so the click
+  // opens the tab synchronously within the browser's user gesture.
+  const load = async () => {
+    controlUrl ??= await readControlUrl();
+    if (controlUrl === null) return;
+    clearInterval(interval);
+    status.command = { command: 'vscode.open', title: 'Open Cloud IDE controls', arguments: [controlUrl] };
+  };
+  const interval = setInterval(load, TICK_MS);
+  void load();
+
+  return [openControl, status, new vscode.Disposable(() => clearInterval(interval))];
 }
 
 function createLifetimeCountdown() {

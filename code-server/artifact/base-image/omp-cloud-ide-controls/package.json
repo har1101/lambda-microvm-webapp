@@ -30,11 +30,6 @@
     "configuration": {
       "title": "OMP Cloud IDE",
       "properties": {
-        "ompCloudIde.controlUrl": {
-          "type": "string",
-          "default": "https://dmwv39galzn4v.cloudfront.net/session/control",
-          "description": "HTTPS URL embedded in the Cloud IDE suspend/resume control tab."
-        },
         "ompCloudIde.timeZone": {
           "type": "string",
           "default": "Asia/Tokyo",

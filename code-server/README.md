@@ -105,7 +105,7 @@ New starts use a form UUID and a conditional DynamoDB claim to avoid duplicate M
 
 ## Suspend and resume
 
-The editor status bar contains **Suspend Cloud IDE**. It opens `/session/control` through code-server's HTTPS URL opener; press **Suspend Cloud IDE** there to suspend the current browser's MicroVM. This two-step control is deliberate: the suspend API must be called outside the MicroVM, and the control plane marks the session paused before requesting the snapshot so code-server WebSocket reconnects cannot immediately wake it again.
+The editor status bar contains **Suspend Cloud IDE**. It opens `/session/control` through code-server's HTTPS URL opener; press **Suspend Cloud IDE** there to suspend the current browser's MicroVM. This two-step control is deliberate: the suspend API must be called outside the MicroVM, and the control plane marks the session paused before requesting the snapshot so code-server WebSocket reconnects cannot immediately wake it again. The control URL is not baked into the image: the Edge builds it from the CloudFront distribution domain and passes it in the `/run` hook payload, and the hook records it in `~/.cache/omp-cloud-ide/session.json`. MicroVMs started before this was deployed have no control URL, so the button shows an error there.
 
 Next to it, the status bar shows the remaining MicroVM lifetime (`残り H:MM`). The Edge passes a deadline in the `/run` hook payload, because a MicroVM cannot look up its own `startedAt`; the lifetime counts both RUNNING and SUSPENDED time. The item turns yellow at 30 minutes and red at 10 minutes, and a notification at 60, 15, and 5 minutes asks you to commit and push. MicroVMs started before this feature was deployed show `残り時間不明`.
 
@@ -125,7 +125,7 @@ The original design document is not implemented literally in these intentionally
 - GitHub Enterprise support was replaced by normal `github.com` OAuth using `gh auth login --web`.
 - The workspace remains MicroVM-local and ephemeral. Clone a repository after startup; authentication state persists, repository contents do not.
 
-OMP sign-in for Anthropic and OpenAI Codex and the code-server browser flow have been exercised. OpenCode Go login/model calls and a full private-repository clone/edit/test/push/PR workflow are still manual verification items. code-server and OMP are bumped to their latest releases on every `npm run deploy`; other base-image dependencies are pinned and updated manually. No scheduled deploy is configured.
+OMP sign-in for Anthropic and OpenAI Codex and the code-server browser flow have been exercised. OpenCode Go login/model calls and a full private-repository clone/edit/test/push/PR workflow are still manual verification items. code-server and OMP are bumped to their latest releases on every `npm run deploy` (the code-server RPM SHA-256 is updated from the release asset digest); other base-image dependencies are pinned and updated manually. Every directly downloaded artifact (code-server, Node.js, Bun, GitHub CLI, AWS CLI, uv, ripgrep, Chromium) is verified against a pinned SHA-256; dnf packages, VS Code extensions, npm transitive dependencies, and the base image digest are not pinned. No scheduled deploy is configured.
 
 ## Operations
 

@@ -78,7 +78,7 @@ exports.handler = async (event) => {
   }
 
   if (request.uri === '/session/select') {
-    return handleSessionSelection(request, sessionId);
+    return handleSessionSelection(request, sessionId, siteOrigin);
   }
   if (request.uri === '/session/start') {
     return redirectToSessionSelect();
@@ -168,7 +168,7 @@ exports.handler = async (event) => {
   return request;
 };
 
-async function startSession(requestId) {
+async function startSession(requestId, siteOrigin) {
   // The chooser renders a fresh UUID into each "new" form. Using it as the
   // session ID and claiming it before RunMicrovm means a double-submitted form
   // starts one MicroVM, not two.
@@ -213,7 +213,9 @@ async function startSession(requestId) {
           suspendedDurationSeconds: cfg.SUSPENDED_SEC,
         },
         maximumDurationInSeconds: cfg.MAX_DURATION_SEC,
-        runHookPayload: JSON.stringify({ sessionId: id, expiresAt }),
+        // The image is shared by every distribution, so the IDE learns the
+        // control page URL from the origin that started it, not from a build-time constant.
+        runHookPayload: JSON.stringify({ sessionId: id, expiresAt, controlUrl: `${siteOrigin}/session/control` }),
       }),
     );
   } catch (error) {
@@ -306,7 +308,7 @@ function startingPageResponse(id) {
   };
 }
 
-async function handleSessionSelection(request, currentSessionId) {
+async function handleSessionSelection(request, currentSessionId, siteOrigin) {
   if (request.method === 'GET' || request.method === 'HEAD') {
     return chooserResponse({
       currentSessionId,
@@ -327,7 +329,7 @@ async function handleSessionSelection(request, currentSessionId) {
 
   const action = form.get('action');
   if (action === 'new') {
-    return startSession(form.get('requestId'));
+    return startSession(form.get('requestId'), siteOrigin);
   }
   if (action === 'terminate-confirm' || action === 'terminate') {
     return handleTermination(form, currentSessionId, action === 'terminate');

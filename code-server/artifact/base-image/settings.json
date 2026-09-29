@@ -4,6 +4,5 @@
   "files.autoSave": "afterDelay",
   "terminal.integrated.defaultProfile.linux": "bash",
   "security.workspace.trust.enabled": false,
-  "chat.disableAIFeatures": true,
-  "ompCloudIde.controlUrl": "https://dmwv39galzn4v.cloudfront.net/session/control"
+  "chat.disableAIFeatures": true
 }

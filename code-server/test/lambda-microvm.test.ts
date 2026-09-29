@@ -629,8 +629,8 @@ describe('OMP Cloud IDE infrastructure', () => {
     expect(resuming.headers['set-cookie'][0].value).toContain(`mvm-session=${sessionId}`);
   });
 
-  test('passes a MicroVM lifetime deadline no later than the real one to the run hook', async () => {
-    const helpers = getEdgeModule().__test;
+  test('passes the lifetime deadline and control URL of the starting distribution to the run hook', async () => {
+    const edge = getEdgeModule();
     let runCalledAt = 0;
     const startedBefore = Date.now();
     const { calls } = await withAwsMocks(
@@ -640,7 +640,17 @@ describe('OMP Cloud IDE infrastructure', () => {
           return { microvmId: 'mvm-test', endpoint: 'mvm-test.example' };
         },
       },
-      async () => expect((await helpers.startSession()).status).toBe('200'),
+      async () => {
+        const response = await edge.handler(
+          edgeEvent({
+            method: 'POST',
+            uri: '/session/select',
+            headers: { cookie: [{ key: 'Cookie', value: ACCESS_COOKIE }] },
+            body: { encoding: 'text', data: new URLSearchParams({ action: 'new' }).toString() },
+          }),
+        );
+        expect(response.status).toBe('200');
+      },
     );
 
     const payload = JSON.parse(String(calls.find((c) => c.name === 'RunMicrovmCommand')?.input.runHookPayload));
@@ -648,6 +658,8 @@ describe('OMP Cloud IDE infrastructure', () => {
     // The service starts its 8-hour clock no earlier than the RunMicrovm call.
     expect(payload.expiresAt).toBeGreaterThanOrEqual(startedBefore + 28_800_000);
     expect(payload.expiresAt).toBeLessThanOrEqual(runCalledAt + 28_800_000);
+    // The shared image learns the control page from the distribution that started it.
+    expect(payload.controlUrl).toBe('https://d111.cloudfront.net/session/control');
   });
 
   test('terminates a new MicroVM that could not be registered', async () => {
@@ -1008,6 +1020,7 @@ describe('OMP Cloud IDE infrastructure', () => {
       clockOffsetMs: (dateHeader: string | null, sentAt: number, receivedAt: number) => number | null;
       dueNotification: (remainingMs: number, notified: Set<number>) => number | undefined;
       formatRemaining: (remainingMs: number) => string;
+      parseControlUrl: (text: string) => string | null;
       parseSessionDeadline: (text: string) => number | null;
       severity: (remainingMs: number) => string;
       describeAuthSync: (
@@ -1021,6 +1034,11 @@ describe('OMP Cloud IDE infrastructure', () => {
     expect(timer.parseSessionDeadline('{"expiresAt":1800028800000}')).toBe(1_800_028_800_000);
     expect(timer.parseSessionDeadline('{"expiresAt":"1800028800000"}')).toBeNull();
     expect(timer.parseSessionDeadline('{')).toBeNull();
+    expect(timer.parseControlUrl('{"controlUrl":"https://d111.cloudfront.net/session/control"}')).toBe(
+      'https://d111.cloudfront.net/session/control',
+    );
+    expect(timer.parseControlUrl('{"controlUrl":"javascript:alert(1)"}')).toBeNull();
+    expect(timer.parseControlUrl('{"expiresAt":1800028800000}')).toBeNull();
 
     expect(timer.formatRemaining(minutes(8 * 60))).toBe('8:00');
     expect(timer.formatRemaining(minutes(65) - 1)).toBe('1:04');
@@ -1115,7 +1133,6 @@ describe('OMP Cloud IDE infrastructure', () => {
   test('pins OMP and runs code-server as an unprivileged user', () => {
     const dockerfile = fs.readFileSync(path.join(__dirname, '..', 'artifact', 'base-image', 'Dockerfile'), 'utf8');
     const ompConfig = fs.readFileSync(path.join(__dirname, '..', 'artifact', 'base-image', 'omp-config.yml'), 'utf8');
-    const settings = fs.readFileSync(path.join(__dirname, '..', 'artifact', 'base-image', 'settings.json'), 'utf8');
     const controlsPackage = fs.readFileSync(
       path.join(__dirname, '..', 'artifact', 'base-image', 'omp-cloud-ide-controls', 'package.json'),
       'utf8',
@@ -1145,7 +1162,6 @@ describe('OMP Cloud IDE infrastructure', () => {
     );
     expect(ompConfig).toContain('- match: "rm -rf *"\n      approval: deny');
     expect(ompConfig).toContain('- match: "git push --force*"\n      approval: deny');
-    expect(settings).toContain('"ompCloudIde.controlUrl"');
     expect(controlsPackage).toContain('"onCommand:ompCloudIde.openControl"');
   });
 });

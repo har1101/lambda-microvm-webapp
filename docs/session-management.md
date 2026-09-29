@@ -150,7 +150,7 @@ TerminateされたMicroVMのローカルディスクとRAM状態は戻せない�
 
 ### 残り寿命の表示
 
-Edgeは`RunMicrovm`直前に`expiresAt = now + 8時間`を計算して`runHookPayload`へ入れ、`/run` hookがMicroVM内の`~/.cache/omp-cloud-ide/session.json`へ記録する。実際の期限より遅くならないよう、`RunMicrovm`より前の時刻で計算している。VMは自分の起動時刻を知る手段を持たないため、期限はEdgeから渡す。`runHookPayload`には`sessionId`も入るが、bearer Cookie値なのでVM内へは保存しない。
+Edgeは`RunMicrovm`直前に`expiresAt = now + 8時間`を計算して`runHookPayload`へ入れ、`/run` hookがMicroVM内の`~/.cache/omp-cloud-ide/session.json`へ記録する。実際の期限より遅くならないよう、`RunMicrovm`より前の時刻で計算している。VMは自分の起動時刻を知る手段を持たないため、期限はEdgeから渡す。`runHookPayload`には`sessionId`も入るが、bearer Cookie値なのでVM内へは保存しない。同じpayloadでEdgeはDistributionのドメインから組み立てたcontrol URL(`https://<domain>/session/control`)も渡し、hookは`https://`で始まる場合だけ`session.json`の`controlUrl`へ記録する。Suspendボタンはこれを開く。
 
 code-serverのstatus barはこの値から`残り H:MM`を表示し、残り30分以下で黄色、10分以下で赤にする。残り60/15/5分を過ぎるたびに1回だけ通知し、commit/pushを促す(遅れて開いた場合は最も近い閾値だけ)。クリックするとSource Controlを開く。MicroVMの時計はNTP同期されないため、S3 regional endpointの`Date` headerで毎分とwindow focus時に補正する。実機では3分のSuspend→Resume後も補正は-1秒で、ゲスト時計の遅れは観測されなかった。
 
