@@ -605,7 +605,7 @@ Lambdaは`/run`へ`{"microvmId": ..., "runHookPayload": "<RunMicrovmへ渡した
 1. lifecycle timeout/失敗通知/last-success(実装済み: 5.0節)
 2. 新規作成orphanのcompensationとchooser reconciliation(実装済み: 5.3節)
 3. auth-state競合防止とS3 Version lifecycle(実装済み: 5.1節、5.17節)
-4. control originとproxy originの分離
+4. control originとproxy originの分離(未着手。設計は5.7.1節)
 5. 明示Terminate UI(実装済み: 5.3節)
 6. E2Eスクリプト正式化(実装済み: 5.6節)
 7. checksum・version pin拡充(直接ダウンロード成果物のSHA-256は実装済み。dnf・VS Code拡張・base image digestが残る)
