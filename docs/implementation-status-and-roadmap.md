@@ -171,7 +171,7 @@ OMPとGitHubの認証状態はKMS暗号化されたS3へ保存される。ワー
 | GitHub Environment/承認 | 未実装 | Environmentなし |
 | branch protection/required checks | 未実装 | `main`未保護 |
 | dependency update automation | 未実装 | 手動pin更新 |
-| automated deployed E2E | 未実装 | 手動実行 |
+| automated deployed E2E | 実装済み(手動起動) | `npm run e2e`(`scripts/e2e.mjs`)。CI/scheduleからの自動実行は未実装 |
 | 複数環境の並行deploy | 未実装 | resource名・生成config pathが環境非対応(control URLは実行時注入済み) |
 | retained resource cleanup | 未実装 | Lambda@Edge旧Version、KMS等の棚卸しRunbookなし(S3非現行Versionはlifecycleで失効) |
 
@@ -379,20 +379,19 @@ main merge: prod Environment承認後にdeploy + E2E
 
 Lambda@Edgeのログは実行リージョンへ分散し得るため、中央集約または調査手順が必要である。
 
-#### 5.6 E2Eスクリプトをリポジトリへ正式実装する
+#### 5.6 E2Eスクリプトをリポジトリへ正式実装する(実装済み 2026-09-29)
 
-今回の一時スクリプトで検証したフローを、再実行可能なテストへする。
+`code-server/scripts/e2e.mjs`(`npm run e2e`)として実装し、実環境で24項目の成功を確認した。
 
-安全要件:
+- 未認証の302/401、`/auth/login`からCognitoへのPKCE付きredirectを確認する。Cognito Managed LoginのTOTPは人手が必要なため、その先は一時的なEdgeサインイン行(`sub=e2e-test`、1時間)をDynamoDBへ直接書いて代替し、終了時に削除する
+- chooserのフォームで新規MicroVMを1台だけ起動し、code-server readiness、`/vscode-remote-resource`経由でVM内の`session.json`(microvmId・期限・control URL)と`auth-sync.json`(`restoreFailed=[]`、復元ファイルのSHA-256)を確認する
+- 明示Suspend直後に通常通信が`/session/control`へ302されること、`SUSPENDED`到達、Resume後に同じVMへ戻ること、誤ったID入力の拒否、Terminate後の`TERMINATED`と行削除を確認する
+- 実行前の生存MicroVMを保護対象としてsnapshotし、終了時に全て生存していることを確認する。cleanupはフォームUUIDから辿れる今回作成したIDだけを対象にし、保護対象は決して終了しない。`TERMINATED`を確認できなければsession行を残す
+- `artifact/edge/config.json`はJestのsynthでも架空accountの値に書き換わるため、実行accountと一致しなければ中止する(`npm run synth`で再生成)
 
-- 実行前の生存MicroVM IDを保護対象としてsnapshot
-- test tag/session metadataを付与
-- cleanupは作成したIDだけ
-- Secretはruntime injectionし、ログへ出さない
-- timeoutや途中失敗でもfinally cleanup
-- selector、editor、Suspend/Resumeのscreenshotをartifact化
+未対応: screenshotのartifact化、CI/scheduleからの実行、test tagの付与(Lambda MicroVMのtag APIを使っていない)。
 
-2026-09-25のdeployed E2Eで分かった実装上の注意:
+過去のdeployed E2Eで分かった実装上の注意:
 
 - 同梱のheadless ChromiumはEdgeのlogin/chooserページでabortするため(5.9.1節)、login・chooser・Suspend・ResumeはCookie付きHTTPで操作し、ブラウザはcode-server UIだけに使う
 - code-serverはready後に`/`へ`./?folder=...`への302を返すので、readiness probeに使える
@@ -581,7 +580,7 @@ Lambdaは`/run`へ`{"microvmId": ..., "runHookPayload": "<RunMicrovmへ渡した
 3. auth-state競合防止とS3 Version lifecycle(実装済み: 5.1節、5.17節)
 4. control originとproxy originの分離
 5. 明示Terminate UI(実装済み: 5.3節)
-6. E2Eスクリプト正式化
+6. E2Eスクリプト正式化(実装済み: 5.6節)
 7. checksum・version pin拡充(直接ダウンロード成果物のSHA-256は実装済み。dnf・VS Code拡張・base image digestが残る)
 
 ### Phase B: CI/CDと運用監視

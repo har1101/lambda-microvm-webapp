@@ -127,6 +127,17 @@ The original design document is not implemented literally in these intentionally
 
 OMP sign-in for Anthropic and OpenAI Codex and the code-server browser flow have been exercised. OpenCode Go login/model calls and a full private-repository clone/edit/test/push/PR workflow are still manual verification items. code-server and OMP are bumped to their latest releases on every `npm run deploy` (the code-server RPM SHA-256 is updated from the release asset digest); other base-image dependencies are pinned and updated manually. Every directly downloaded artifact (code-server, Node.js, Bun, GitHub CLI, AWS CLI, uv, ripgrep, Chromium) is verified against a pinned SHA-256; dnf packages, VS Code extensions, npm transitive dependencies, and the base image digest are not pinned. No scheduled deploy is configured.
 
+## Deployed E2E test
+
+After each deploy, run the end-to-end check against the real distribution:
+
+```bash
+AWS_PROFILE=fukuchi AWS_REGION=ap-northeast-1 npm run synth   # regenerates artifact/edge/config.json for this account
+AWS_PROFILE=fukuchi npm run e2e                               # or: node scripts/e2e.mjs --url https://<distribution>
+```
+
+`scripts/e2e.mjs` checks the unauthenticated redirects and the Cognito PKCE redirect, then writes a temporary one-hour Edge sign-in row (`sub=e2e-test`) directly to the auth table because Managed Login needs a human TOTP. It starts one MicroVM from the chooser, reads `session.json` and `auth-sync.json` inside it through code-server's remote-resource endpoint, suspends, resumes, and terminates it through the confirmation form. MicroVMs that were alive before the run are recorded first, never terminated, and verified afterwards; cleanup touches only the MicroVM and rows this run created. `npm test` overwrites `config.json` with a fake account, so the script refuses to run until `synth` has regenerated it.
+
 ## Operations
 
 Inspect cdkd state and deployment events:
