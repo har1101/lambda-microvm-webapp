@@ -163,6 +163,13 @@ FATAL: SkFontMgr_FontConfigInterface.cpp:163 Not implemented
 
 また、ステータスバーの項目に合成の`element.click()`を送っても反応しませんでした。本物のマウスクリックが必要ですが、文字が描画されていないと位置を当てにくく、安定しません。フォントまわりが直るまでは、Chromiumで確認するのはcode-serverの画面に絞るのが無難です。
 
+## Cognitoのログイン画面はHTTPだけでは確認できない
+その後、ログインをCognitoのManaged Loginに移しました。Managed LoginはJavaScriptで動く画面なので、これまでのように`fetch`でログインを済ませることができません。TOTPの登録まで含めて確認するには、本物のブラウザで画面を操作する必要がありました。
+
+そこで検証のときだけ、PlaywrightのLinux arm64向けChromiumを使いました。そのままでは`libatk`や`libgbm`などのライブラリが足りずに起動しません。root権限もなかったので、`dnf download --resolve`で足りないRPMを落とし、中身をユーザー領域に展開して`LD_LIBRARY_PATH`で読ませました。
+
+起動したあとは、Cognitoの画面が真っ白のまま描画されませんでした。ログには`Could not find any font`が並んでいて、フォントが1つもないことが原因でした。DejaVuとNotoのフォントも同じように展開し、それだけを参照する`fonts.conf`を`FONTCONFIG_FILE`で指定すると、ログイン、TOTPの登録、セッション選択、code-serverの表示、サインアウトまでブラウザで通せました。この一時的な環境は、検証が終わったあとに削除しています。
+
 # まとめ
 ARM64のLambda MicroVMでヘッドレスChromiumを使うために、Sparticuz/chromiumのarm64 packをImageのbuild時に展開しました。
 

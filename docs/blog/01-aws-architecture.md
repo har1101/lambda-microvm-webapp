@@ -39,8 +39,8 @@ code-serverの画面表示、中断と再開、OMPとGitHubの認証情報の持
 # 作ったもの
 使う側から見ると、ざっくりこんな流れです。
 
-1. CloudFrontのURLを開くと、ログイン画面が出る
-2. ログインすると、セッション選択画面に移る
+1. CloudFrontのURLを開くと、Cognitoのログイン画面(Managed Login)が出る
+2. メールアドレス・パスワード・TOTPでログインすると、セッション選択画面に移る
 3. 既存のMicroVMに接続するか、新しいMicroVMを起動するかを選ぶ
 4. code-serverが開くので、ターミナルで`omp`を起動して開発する
 5. 作業を中断するときは、ステータスバーのボタンからSuspendする
@@ -67,8 +67,9 @@ flowchart LR
         CF["CloudFront"]
         ORQ["Lambda@Edge<br/>origin-request"]
         ORS["Lambda@Edge<br/>origin-response"]
-        DDB[("DynamoDB<br/>セッション表")]
-        SM[("Secrets Manager<br/>ログインパスワード")]
+        DDB[("DynamoDB<br/>セッション表・ログインセッション表")]
+        COG["Cognito User Pool<br/>Managed Login"]
+        SSM[("SSM Parameter<br/>Pool / Client ID")]
     end
 
     subgraph APNE1["ap-northeast-1(東京)"]
@@ -86,7 +87,9 @@ flowchart LR
     CF --> ORQ
     CF --> ORS
     ORQ --> DDB
-    ORQ --> SM
+    ORQ --> SSM
+    B -- "ログイン" --> COG
+    ORQ -- "code交換・ID token検証" --> COG
     ORQ -- "起動・停止・再開<br/>token発行" --> API
     ORQ -- "originを差し替えて中継" --> EP
     EP --> CS
@@ -99,10 +102,11 @@ flowchart LR
 | コンポーネント | 役割 |
 | --- | --- |
 | CloudFront | ブラウザから見た唯一の入口 |
-| Lambda@Edge(origin-request) | ログイン、セッション選択画面、MicroVMの起動・停止・再開、MicroVMへの中継 |
+| Lambda@Edge(origin-request) | Cognitoとのログイン処理、セッション選択画面、MicroVMの起動・停止・再開、MicroVMへの中継 |
 | Lambda@Edge(origin-response) | MicroVMが一時的に502/504を返したときに選択画面へ戻す |
-| DynamoDB | ブラウザとMicroVMの対応関係、MicroVM endpoint、MicroVM用のtokenを保存する |
-| Secrets Manager | ログインパスワードを保存する |
+| DynamoDB | ブラウザとMicroVMの対応関係、MicroVM endpoint、MicroVM用のtoken、ログイン済みブラウザのセッションを保存する |
+| Cognito User Pool | 利用者のパスワードとTOTPを管理し、ログイン画面を提供する |
+| SSM Parameter | Lambda@Edgeが実行時に読むUser Pool ID・Client ID |
 | Lambda MicroVM | code-serverとOMPを動かす。1セッションにつき1台 |
 | S3 + KMS | OMPとGitHub CLIの認証ファイルを暗号化して保存する |
 
@@ -120,9 +124,9 @@ https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/lambda-at-edg
 | スタック | リージョン | 中身 |
 | --- | --- | --- |
 | `OmpCloudIdeMicrovmStack` | ap-northeast-1 | MicroVM Image、S3、KMS、MicroVM用のIAM Role |
-| `OmpCloudIdeEdgeStack` | us-east-1 | CloudFront、Lambda@Edge、DynamoDB、Secrets Manager |
+| `OmpCloudIdeEdgeStack` | us-east-1 | CloudFront、Lambda@Edge、DynamoDB、Cognito User Pool、SSM Parameter |
 
-DynamoDBとSecrets Managerをus-east-1に置いたのは、Lambda@Edgeがリクエストのたびに読みにいくからです。
+DynamoDBとCognitoをus-east-1に置いたのは、Lambda@Edgeがリクエストのたびに(Cognitoはログインのたびに)呼びにいくからです。
 
 2スタック間では、CDKのクロスリージョン参照を使っていません。`lib/config.ts`に固定の名前を書いておき、そこからARNを組み立てて両方のスタックで使い回しています。
 
@@ -137,7 +141,7 @@ export const executionRoleArn = `arn:aws:iam::${config.account}:role/omp-cloud-i
 
 | 状態 | 置き場所 | 寿命 |
 | --- | --- | --- |
-| ログインしているか | 署名付きCookie | 8時間 |
+| ログインしているか | ランダム値のCookieと、そのハッシュを入れたDynamoDB | 8時間 |
 | どのMicroVMにつなぐか | Cookie(UUIDだけ)とDynamoDB | 8時間 |
 | MicroVM endpointに入るためのtoken | DynamoDB | 60分(自動更新) |
 | OMPとGitHubのログイン情報 | MicroVMのローカルとS3 | MicroVMをまたいで続く |
@@ -224,7 +228,9 @@ Lambda@Edgeに同梱しているAWS SDKです。
 | --- | --- |
 | `@aws-sdk/client-lambda-microvms` | MicroVMのRun / Get / Suspend / Resume、token発行 |
 | `@aws-sdk/client-dynamodb` | セッション表の読み書き |
-| `@aws-sdk/client-secrets-manager` | ログインパスワードの取得 |
+| `@aws-sdk/client-ssm` | User Pool ID・Client IDの取得 |
+| `@aws-sdk/client-cognito-identity-provider` | client secretの取得 |
+| `aws-jwt-verify` | CognitoのID tokenの検証 |
 
 MicroVM Imageに入れている主なツールです。どれもARM64版を使い、Dockerfileでversionを固定しています。ただしcode-serverとOMPだけは、`npm run deploy`のたびにその時点の最新版へ自動で書き換えています(後述)。
 
@@ -415,55 +421,68 @@ flowchart LR
 
 | 層 | 検証する主体 | 検証するもの | ブラウザが持つか |
 | --- | --- | --- | --- |
-| ① Webアプリの認証 | Lambda@Edge | ログインCookieの署名と期限 | 持つ |
+| ① Webアプリの認証 | Lambda@Edge | ログインCookieに対応するDynamoDBの行と期限 | 持つ |
 | ② Lambda MicroVMの認証 | AWS(MicroVM endpoint) | proxy tokenの対象MicroVM、port、期限 | 持たない |
 
 ## ① Webアプリの認証
-ブラウザからCloudFrontのURLを開くと、Lambda@Edgeが自前のログインフォームを返します。
+ログインにはAmazon Cognitoを使っています。利用者は私1人なので、User Poolは管理者だけがユーザーを作れる設定にし、セルフサインアップはできません。MFAはTOTP必須です。ログイン画面はCognitoのManaged Loginをそのまま使っています。
+
+ポイントは、CognitoのtokenをブラウザにもCookieにも入れていないことです。Lambda@EdgeがBFF(Backend for Frontend)として認可コードを受け取り、ID tokenを1回だけ検証したら捨てます。ブラウザに渡すのは、ランダムな値のCookieだけです。
 
 ```mermaid
 sequenceDiagram
     participant B as ブラウザ
     participant E as Lambda@Edge
-    participant S as Secrets Manager
-    B->>E: GET /login
-    E-->>B: ログインフォーム
-    B->>E: POST /login(ユーザー名・パスワード)
-    E->>S: GetSecretValue(5分キャッシュ)
-    S-->>E: パスワード
-    E->>E: timingSafeEqualで比較
-    E-->>B: 303 /session/select + ログインCookie
+    participant D as DynamoDB
+    participant C as Cognito
+    B->>E: GET /auth/login
+    E->>D: login#35;state(nonce, PKCE verifier)を保存
+    E-->>B: 302 Cognito /oauth2/authorize + state Cookie
+    B->>C: メールアドレス・パスワード・TOTP
+    C-->>B: 302 /auth/callback?code&state
+    B->>E: GET /auth/callback
+    E->>D: login#35;stateを削除して取り出す(1回限り)
+    E->>C: /oauth2/token(code + client secret + verifier)
+    C-->>E: ID token
+    E->>E: 署名・issuer・audience・nonceを検証
+    E->>D: sess#35;Cookieのハッシュを保存(8時間)
+    E-->>B: 200(meta refreshで/session/selectへ)+ ログインCookie
 ```
 
-パスワードは、CDKでSecrets Managerに32文字のランダム値を生成させています。ログインに成功すると、Lambda@Edgeが次のようなCookieを発行します。
+ログインが終わると、Lambda@Edgeは次のようなCookieを発行し、DynamoDBにはそのSHA-256だけを保存します。
 
 ```js:artifact/edge/index.js
-function createAccessCookie(password, now = Date.now()) {
-  const expiresAt = Math.floor(now / 1000) + cfg.ACCESS_COOKIE_MAX_AGE_SEC; // 8時間後
-  const payload = String(expiresAt);
-  const signature = signAccessCookie(payload, password);
-  return `${cfg.ACCESS_COOKIE_NAME}=${payload}.${signature}; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=${cfg.ACCESS_COOKIE_MAX_AGE_SEC}`;
+function authSessionKey(accessCookie) {
+  return `sess#${createHash('sha256').update(accessCookie).digest('base64url')}`;
 }
 
-function signAccessCookie(payload, password) {
-  return createHmac('sha256', password).update(`omp-cloud-ide:${payload}`).digest('base64url');
+function createAccessCookie(value) {
+  return `${cfg.ACCESS_COOKIE_NAME}=${value}; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=${cfg.ACCESS_COOKIE_MAX_AGE_SEC}`;
 }
 ```
 
-Cookieの値は「有効期限.署名」という形で、署名はパスワードを鍵にしたHMAC-SHA256です。Lambda@Edgeはリクエストのたびに次を確認します。
+Cookieの値は32バイトの乱数です。Lambda@Edgeはリクエストのたびに、このハッシュでDynamoDBの行を引き、期限が切れていないかを確認します。DynamoDBのTTLはすぐには消してくれないので、期限はコードの側でも見ています。ログアウトは行を消すだけなので、サーバー側ですぐに失効させられます。
 
-1. 有効期限が過ぎていないか
-2. 有効期限が「今から8時間+60秒」より先になっていないか
-3. 署名を計算し直して一致するか
+認証用の行と、どのMicroVMにつなぐかの行は、2つの`GetItem`を並列に投げて読んでいます。もともとリクエストのたびにMicroVMの行を読んでいたので、認証が増えてもDynamoDBの往復は1回のままです。
 
-2つ目のチェックは、署名が正しくても寿命が長すぎるCookieを拒否するためのものです。万が一パスワードが漏れて長期間有効なCookieを作られても、受け付けないようにしています。
+### 注意点: callbackで302を返すとログインがループする
+callbackの最後で`/session/select`へ302を返すと、そのリダイレクトはCognitoのドメインから始まったクロスサイトのナビゲーションの続きになります。ブラウザはこの流れの中では`SameSite=Strict`のCookieを送らないので、発行したばかりのログインCookieが届かず、またログイン画面へ戻されてしまいます。
 
-パスワードそのものはCookieに入りません。パスワードを変えると署名鍵も変わるので、発行済みのCookieは全部無効になります。個人用なので、これを「全端末からのログアウト」代わりにしています。
+そこでcallbackは200のHTMLを返し、`<meta http-equiv="refresh">`で`/session/select`へ移るようにしました。こうすると同じサイトから始まる新しいナビゲーションになり、Cookieが送られます。
+
+逆に、`/auth/login`で発行するstate用のCookieは、Cognitoから戻ってくるときに届かないといけないので`SameSite=Lax`にし、`Path=/auth/callback`に絞っています。
+
+### Lambda@Edgeに設定を渡す
+Lambda@Edgeでは環境変数が使えません。さらに、User Pool IDやClient IDはデプロイ時に決まるので、そのまま`config.json`へ書くとアセットのハッシュが安定しません。そこで、IDは固定名のSSM Parameter(`/omp-cloud-ide/cognito`)に置き、Lambda@Edgeが実行時に読んでいます。
+
+client secretは、CloudFormationの`Fn::GetAtt`では取り出せません(`ClientSecret`の戻り値はサポートされていません)。なのでLambda@Edgeが`DescribeUserPoolClient`でCognitoから直接取得し、5分キャッシュしています。secretがImageやパラメータに残りません。
 
 ### なぜこの形にしたのか
-最初はHTTPのBasic認証で作っていました。ただ、Chromeでは問題なく動くのに、とある埋め込みブラウザではBasic認証のダイアログが一瞬出て閉じてしまいました。ブラウザの実装に左右されるのがつらかったので、Lambda@EdgeがHTMLのフォームを返す方式に切り替えています。
+最初はHTTPのBasic認証で作っていました。ただ、Chromeでは問題なく動くのに、とある埋め込みブラウザではBasic認証のダイアログが一瞬出て閉じてしまいました。そこでLambda@EdgeがHTMLのフォームを返し、Secrets Managerのパスワードで照合してHMAC署名付きCookieを発行する方式に切り替えました。
 
-Cognitoなどを使う案もありましたが、利用者は私1人なので、ユーザー管理やMFAよりもリソースの少なさを優先しました。その代わり、MFAやログイン試行回数の制限はありません。複数人で使うことになったら、Cognito+OIDCへ移行するつもりです。
+ただ、この方式にはMFAもログイン試行回数の制限もなく、ログアウトもパスワードを変える以外に方法がありませんでした。Cognitoに移すと、パスワードの保管、TOTP、ロックアウト(5回失敗すると待ち時間が指数的に伸び、最大15分ほど)をCognito側に任せられます。料金面でも、Essentialsプランは月10,000 MAUまで無料枠に収まります。
+
+なお、User Poolに入っているユーザーは全員が全MicroVMにアクセスできます。セッションを利用者ごとに分けたり、S3の認証状態を利用者ごとに分けたりはしていません。2人目を追加するなら、先にそこを作る必要があります。
 
 ## ② Lambda MicroVMの認証
 Lambda MicroVMは、1台ごとに専用のHTTPS endpointを持ちます。AWSのLambda MicroVM開発者ガイドのNetworkingのページには、次のように書かれています。
@@ -510,7 +529,7 @@ code-serverは`--auth none`で起動しています。一見こわい設定で�
 ## この構成で守れていないもの
 正直に書いておくと、守れていないものもあります。
 
-- ログイン画面、セッション選択画面、code-server、code-serverの`/proxy/<port>/`で動かす開発中のアプリは、すべて同じCloudFrontのoriginにあります。`SameSite=Strict`は外部サイトからのCSRFを防ぎますが、同じoriginで動くアプリからのリクエストは防げません。
+- セッション選択画面、制御画面、code-server、code-serverの`/proxy/<port>/`で動かす開発中のアプリは、すべて同じCloudFrontのoriginにあります(ログイン画面だけはCognitoのドメインです)。`SameSite=Strict`は外部サイトからのCSRFを防ぎますが、同じoriginで動くアプリからのリクエストは防げません。
 - cloneしたコード、依存パッケージのinstall script、VS Code拡張、OMPは、全部同じUID 1000で動きます。OMPやGitHubの認証ファイルは、MicroVM内のコードから読めます。
 
 なので現状は、「自分が書くコードと、自分が選んだリポジトリだけを動かす個人環境」という前提で使っています。Edge専用のaccess/session Cookieは認証後にcode-serverへ転送する前に除去しますが、同じoriginのアプリからcontrol画面を操作できる問題や同一UIDの認証ファイルは残ります。根本策はcontrol画面をIDEとは別のホスト名に分けることです。
@@ -629,9 +648,9 @@ sequenceDiagram
     participant CS as code-server :8080
     B->>CF: GET /(ログインCookie、セッションCookie付き)
     CF->>E: origin-requestイベント
-    E->>E: ログインCookieを検証
-    E->>D: GetItem(セッションCookieのUUID)
-    D-->>E: endpoint, token
+    E->>D: GetItem × 2を並列に(ログインCookieのハッシュ、セッションCookieのUUID)
+    D-->>E: ログインの期限、endpoint, token
+    E->>E: ログインの期限を確認
     E-->>CF: originをendpointに差し替え、<br/>Host / Origin / X-aws-proxy-authを設定
     CF->>EP: GET /(HTTPS)
     EP->>EP: tokenを検証、port 8080を選択、<br/>X-aws-proxy-*を除去
@@ -645,7 +664,7 @@ sequenceDiagram
 
 1. ブラウザがCloudFrontへ`GET /`を送る。ブラウザが知っているのはCloudFrontのドメインとCookieだけ
 2. CloudFrontのキャッシュは無効にしているので、すべてのリクエストでorigin-requestのLambda@Edgeが呼ばれる
-3. Lambda@EdgeがログインCookieを検証し、セッションCookieのUUIDでDynamoDBからendpointとtokenを読む
+3. Lambda@Edgeが、ログインCookieのハッシュとセッションCookieのUUIDでDynamoDBを並列に読み、ログインの期限を確かめてからendpointとtokenを使う
 4. Lambda@Edgeがリクエストのoriginをendpointへ差し替え、`Host`、`Origin`、`X-aws-proxy-auth`を付けてCloudFrontに返す。URLのパスはそのまま
 5. CloudFrontが、差し替え後のendpointへHTTPSで転送する
 6. MicroVM endpointがtokenを検証し、`X-aws-proxy-port`がないので8080番のcode-serverへ転送する
@@ -699,7 +718,7 @@ sequenceDiagram
 ## 2回目以降のリクエスト
 MicroVMが起動した後は、ブラウザからのリクエストをすべてLambda@Edge(origin-request)が受けて、MicroVMへ中継します。
 
-1. ログインCookieを検証する
+1. ログインCookieのハッシュでDynamoDBの行を読み、期限を確かめる(次の読み取りと並列)
 2. セッションCookieのUUIDでDynamoDBを読む
 3. tokenの残りが15分を切っていたら更新する。失効済みで更新に失敗したら503を返す
 4. CloudFrontのoriginをMicroVM endpointに差し替える
@@ -737,7 +756,7 @@ CloudFrontの設定の要点です。
 | キャッシュ | CachingDisabled | 全部が利用者ごとの動的な応答なので |
 | origin request policy | AllViewerExceptHostHeader | CookieやWebSocketのヘッダーをoriginへ渡す。HostはLambda@Edgeが設定する |
 | 許可メソッド | ALLOW_ALL | フォームのPOSTやcode-serverのAPIを通す |
-| Lambda@Edgeの`includeBody` | true | ログインフォームと選択画面のPOST本文を読むため |
+| Lambda@Edgeの`includeBody` | true | 選択画面や制御画面のフォームのPOST本文を読むため |
 
 ## WebSocketも同じ経路を通る
 code-serverは、ブラウザとの間でWebSocketを使います。CloudFront開発者ガイドによると、WebSocketは最初にHTTPのupgradeリクエストを送って接続を確立します。

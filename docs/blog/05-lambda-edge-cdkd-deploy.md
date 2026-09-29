@@ -24,7 +24,7 @@ AWS Lambda MicroVMの上に自分専用のCloud IDEを作り、そのIaCをAWS C
 | スタック | リージョン | 中身 |
 | --- | --- | --- |
 | `OmpCloudIdeMicrovmStack` | ap-northeast-1 | MicroVM Image、S3、KMS、IAM Role |
-| `OmpCloudIdeEdgeStack` | us-east-1 | CloudFront、Lambda@Edge、DynamoDB、Secrets Manager |
+| `OmpCloudIdeEdgeStack` | us-east-1 | CloudFront、Lambda@Edge、DynamoDB、Cognito User Pool、SSM Parameter |
 
 この構成をデプロイしていて、Lambda@Edge、CDK、cdkdまわりでいくつかハマりました。この記事ではそれをまとめます。
 
@@ -61,10 +61,12 @@ this.writeEdgeConfig(edgeAssetDir, {
   TABLE: config.edge.tableName,
   IMAGE_ARN: imageArn,
   EXECUTION_ROLE_ARN: executionRoleArn,
-  // Lambda@Edge does not support environment variables. Embed the stable
-  // secret name instead of an unresolved CDK token so asset hashes remain
-  // deterministic and Secrets Manager resolves the current ARN at runtime.
-  AUTH_SECRET_ID: config.edge.accessSecretName,
+  // Lambda@Edge does not support environment variables. Embed only stable
+  // names here so asset hashes stay deterministic; the generated User Pool
+  // and Client IDs are resolved at runtime from the SSM parameter.
+  AUTH_TABLE: config.edge.authTableName,
+  COGNITO_DOMAIN: cognitoDomain,
+  COGNITO_PARAMETER_NAME: config.edge.cognitoParameterName,
   // 省略
 });
 ```
@@ -77,9 +79,11 @@ const cfg = require('./config.json');
 
 ここで気をつけたことが2つあります。
 
-1つ目は、CDKのtoken(デプロイ時に決まる値)を書き込まないことです。たとえば`secret.secretArn`をそのまま書くと、`${Token[...]}`のような未解決の文字列が入ります。アセットのハッシュも安定しません。そこでSecretには固定の名前(`omp-cloud-ide/access-password`)を付け、`config.json`にはその名前を書いています。Secrets Managerの`GetSecretValue`は名前でも取得できるので、実行時にはこれで十分です。ARNも同じ理由で、`lib/config.ts`でアカウントIDと固定の名前から組み立てた文字列を使っています。
+1つ目は、CDKのtoken(デプロイ時に決まる値)を書き込まないことです。たとえば`userPool.userPoolId`をそのまま書くと、`${Token[...]}`のような未解決の文字列が入ります。アセットのハッシュも安定しません。そこでUser Pool IDとClient IDは、固定の名前を付けたSSM Parameter(`/omp-cloud-ide/cognito`)に入れ、`config.json`にはその名前だけを書いています。Lambda@Edgeは実行時に`GetParameter`で読み、5分キャッシュします。Cognitoのドメインは`omp-cloud-ide-<アカウントID>`という固定のprefixから組み立てられるので、そのまま書いています。ARNも同じ理由で、`lib/config.ts`でアカウントIDと固定の名前から組み立てた文字列を使っています。
 
-2つ目は、秘密の値を書き込まないことです。`config.json`に入れるのは、名前やARNなど知られても困らない値だけにしました。パスワードは、Lambda@Edgeが実行時にSecrets Managerから取ります。
+2つ目は、秘密の値を書き込まないことです。`config.json`に入れるのは、名前やARNなど知られても困らない値だけにしました。Cognitoのclient secretは、Lambda@Edgeが実行時に`DescribeUserPoolClient`でCognitoから取ります。そもそもCloudFormationの`Fn::GetAtt`では`ClientSecret`を取り出せないので、SSM Parameterに入れることもできません。
+
+なお、以前はSecrets Managerに置いたログインパスワードを同じように固定の名前で引いていました。Cognitoへ移行したので、Secrets Managerは使わなくなっています。
 
 `config.json`はsynthのたびに生成されるので、`.gitignore`に入れています。
 
@@ -228,7 +232,7 @@ defaultBehavior: {
 
 注意点は、Lambda@Edgeの処理から漏れたリクエストが本当に`example.com`へ飛んでしまうことです。どの分岐でもoriginを書き換えるか、Lambda@Edgeが自分でレスポンスを返すようにして、テストでも確認しておく必要があります。
 
-もう1つ、`includeBody: true`にするとLambda@Edgeでリクエストの本文を読めます。CloudFront開発者ガイドによると、本文はbase64でエンコードされて渡され、origin requestイベントでは1MBを超えると切り詰められます。ログインフォームのPOSTを読むときは、切り詰められていたら拒否するようにしています。
+もう1つ、`includeBody: true`にするとLambda@Edgeでリクエストの本文を読めます。CloudFront開発者ガイドによると、本文はbase64でエンコードされて渡され、origin requestイベントでは1MBを超えると切り詰められます。セッション選択画面などのフォームのPOSTを読むときは、切り詰められていたら拒否するようにしています。
 
 ```js:artifact/edge/index.js
 function parseFormBody(body) {

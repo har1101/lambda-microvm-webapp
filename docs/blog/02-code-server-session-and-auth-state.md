@@ -216,15 +216,15 @@ Lambdaは`/run`フックの本文を`{"microvmId": ..., "runHookPayload": "<文�
 
 | Cookie | 値 | 役割 |
 | --- | --- | --- |
-| `omp-cloud-ide-auth` | 有効期限とHMAC署名 | ログインしているかを表す |
+| `omp-cloud-ide-auth` | 32バイトの乱数(DynamoDBにはSHA-256だけを保存) | ログインしているかを表す |
 | `mvm-session` | ランダムなUUID | どのMicroVMへつなぐかを表す |
 
-どちらも`Secure; HttpOnly; SameSite=Strict`で発行しています。
+どちらも`Secure; HttpOnly; SameSite=Strict`で発行しています。ログインまわりの詳しい話は前の記事に書いています(Cognitoでログインし、Lambda@Edgeがtokenを検証したあとで`omp-cloud-ide-auth`を発行しています)。
 
 ポイントは、`mvm-session`にはUUIDしか入れていないことです。このUUIDはDynamoDBのレコードのキーで、MicroVM ID、endpoint、tokenはDynamoDB側にあります。Cookieはただの「指し示す先」なので、Cookieの値を別のUUIDに書き換えれば、そのまま接続先の切り替えになります。
 
 ## セッション選択画面
-ログインすると、Lambda@Edgeはまずセッション選択画面(`/session/select`)を出します。ここで既存のMicroVMへ接続するか、新しく起動するかを選びます。
+Cognitoでログインすると、Lambda@Edgeはまずセッション選択画面(`/session/select`)を出します。ここで既存のMicroVMへ接続するか、新しく起動するかを選びます。
 
 画面の中身は、Lambda@Edgeが次の手順で作っています。
 
@@ -319,13 +319,15 @@ exports.handler = async (event) => {
 状態を壊す判断(今回はCookieの削除)をする前に、正しい情報源(Lambda MicroVMのAPI)で確認し直す。これが今回の一番の学びでした。
 
 ## JavaScriptを使わない画面
-Lambda@Edgeが返すログイン画面、選択画面、制御画面には、次のCSPを付けています。
+Lambda@Edgeが返す選択画面、制御画面には、次のCSPを付けています(`<cognito-domain>`はCognitoのログイン用ドメインです)。
 
 ```text
-default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'
+default-src 'none'; style-src 'unsafe-inline'; form-action 'self' https://<cognito-domain>; base-uri 'none'; frame-ancestors 'none'
 ```
 
 scriptを一切許可していないので、画面の操作は全部HTMLフォームのPOSTで、起動中・再開中の画面から先への移動は`<meta http-equiv="refresh" content="5;url=/">`で行っています。Cookieは`HttpOnly`なのでJavaScriptから触る必要もなく、この画面はサーバー側だけで完結しています。制御画面だけは、code-serverのタブの中で開けるよう`frame-ancestors 'self'`にしています。
+
+`form-action`にCognitoのドメインを足しているのは、「Sign out」ボタンのためです。Sign outのPOSTはLambda@Edgeでセッションを消したあと、Cognitoの`/logout`へリダイレクトします。`form-action`はフォーム送信後のリダイレクト先にもかかるので、許可しておかないとブラウザが止めてしまいます。また、制御画面はcode-serverのタブの中で開いていて、Cognitoの画面は枠の中に表示できません。なのでSign outのフォームには`target="_top"`を付け、ログインが切れていたときは`target="_top"`のログインリンクを出しています。
 
 ## 今の制約
 個人用なので割り切っているところもあります。
