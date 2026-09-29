@@ -1,6 +1,6 @@
 # Lambda MicroVM Web Apps
 
-This fork keeps the original samples and adds a personal, on-demand OMP Cloud IDE implementation under [`code-server/`](code-server/README.md).
+This repository contains a personal, on-demand OMP Cloud IDE implementation under [`code-server/`](code-server/README.md). The original Streamlit sample has been removed.
 
 The Cloud IDE is customized for `har1101` and uses:
 
