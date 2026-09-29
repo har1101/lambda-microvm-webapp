@@ -8,7 +8,7 @@ The Cloud IDE is customized for `har1101` and uses:
 - CloudFront and Lambda@Edge in `us-east-1`
 - code-server, pinned OMP, Bun, Node.js, Python/uv, GitHub CLI, and AWS CLI
 - OMP goal/ask defaults with yolo approvals and explicit destructive-command denies
-- an OMP browser E2E runtime with preinstalled arm64 headless Chromium and screenshot artifacts
+- an OMP browser E2E runtime with a preinstalled arm64 Chrome for Testing headless shell and screenshot artifacts
 - encrypted S3 persistence for OMP and GitHub OAuth state
 - Amazon Cognito Managed Login (email + password + TOTP MFA) enforced at CloudFront, with an opaque `HttpOnly` session cookie, before `RunMicrovm`
 - an explicit suspend/resume control that prevents editor reconnects from waking a paused MicroVM

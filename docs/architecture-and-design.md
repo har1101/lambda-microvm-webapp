@@ -113,7 +113,7 @@ flowchart LR
         subgraph VM["Lambda MicroVM"]
             CS["code-server :8080"]
             HK["lifecycle hook server :9000"]
-            TOOLS["OMP / git / gh / Node / Bun / Python<br/>ヘッドレスChromium"]
+            TOOLS["OMP / git / gh / Node / Bun / Python<br/>Chrome for Testing headless shell"]
         end
         S3[("S3 + KMS<br/>OMP・GitHub認証状態")]
         CWL[("CloudWatch Logs")]
@@ -157,7 +157,7 @@ flowchart LR
 | lifecycle hook server | MicroVM内のport 9000 | code-serverのヘルスチェック、認証状態の復元・保存 |
 | S3 + KMS | ap-northeast-1 | OMPの`agent.db`、`install-id`、GitHub CLIの`hosts.yml`を暗号化して保存する |
 | CloudWatch Logs | ap-northeast-1 | Image buildと検証用MicroVM(`/validate`)のログ。利用者が起動したMicroVMの標準出力は届かない |
-| code-server拡張`har1101.omp-cloud-ide-controls` | MicroVM内 | ステータスバーに`Suspend Cloud IDE`、残り寿命(`残り H:MM`)、認証状態の保存状況(`認証 N分前`など)を出し、制御画面を開く・手動保存を実行する |
+| code-server拡張`har1101.omp-cloud-ide-controls` | MicroVM内 | ステータスバーに`Suspend Cloud IDE`、残り寿命(`残り H:MM`)、認証状態の保存状況(`認証 N分前`など)、Workspace Git状態(`Git同期済み`/`未commit N / 未push M`/`Gitなし`)を出し、制御画面を開く・手動保存を実行する・ソース管理を開く |
 
 ### 3.3 2リージョン・2スタックに分けた理由
 
@@ -731,7 +731,7 @@ Image定義にも`INTERNET_EGRESS`を指定している。Dockerfileの実行中
 | AWS CLI | 2.34.45 | awscli.amazonaws.com | SHA-256(公式はPGP署名のみのため、取得したファイルから算出したtrust-on-first-use) |
 | uv / uvx | 0.12.18 | astral-sh/uv GitHub Releases | SHA-256(releaseの`.sha256`) |
 | ripgrep | 15.2.0 | BurntSushi/ripgrep GitHub Releases | SHA-256 |
-| Chromium(Sparticuz arm64 pack) | 149.0.0 | Sparticuz/chromium GitHub Releases | SHA-256、build時に`--version`を実行 |
+| Chrome for Testing headless shell(linux-arm64) | 154.0.8037.57 | Google Chrome for Testing | SHA-256(Googleがchecksumを公開しないため取得時に算出したTOFU)、build時に`ldd`で不足ライブラリ検査と`--version`を実行 |
 | TypeScript | 7.0.2 | npm | versionのみ |
 | typescript-language-server | 6.0.0 | npm | versionのみ |
 | Pyright | 1.1.414 | npm | versionのみ |
@@ -804,8 +804,11 @@ Image build時に入れる拡張:
 | `Suspend Cloud IDE` | `~/.cache/omp-cloud-ide/session.json`の`controlUrl` | `vscode.open`で制御画面を開く。URLが見つかるまでは15秒ごとにファイルを読み直し、見つかる前のクリックではコマンド`ompCloudIde.openControl`がファイルを読み直して、URLがなければエラーを表示する |
 | `残り H:MM` | `~/.cache/omp-cloud-ide/session.json`の`expiresAt` | ソース管理ビューを開く |
 | `認証 N分前`など | `~/.cache/omp-cloud-ide/auth-sync.json` | コマンド`ompCloudIde.persistAuthState`(「OMP Cloud IDE: Save Auth State to S3」)で`persist-auth-state`を実行し、結果を通知する |
+| `Git同期済み`/`未commit N / 未push M`/`Gitなし` | `~/workspace`配下(深さ2まで)のGit repository | ソース管理ビューを開く |
 
 残り寿命は30分以下で警告色、10分以下でエラー色にする。60/15/5分を切ったときに未commit・未push確認の通知を1回ずつ出し、通知からソース管理を開ける(遅れて開いた場合は最も近い閾値だけ)。終了予定時刻を過ぎると`寿命到達`と表示する。ファイルがないVMでは推測せず`残り時間不明`と表示する。
+
+Workspace Git状態(優先度97、認証表示の右)は、60秒ごと・ファイル保存時・window focus時に`~/workspace`を深さ2まで走査し(dot directoryと`node_modules`は除外)、`.git`を持つdirectoryごとに`git status --porcelain=v1 --branch`と`git rev-list --count HEAD --not --remotes`を実行する。すべてclean・push済みなら`$(check) Git同期済み`(通常)、そうでなければ`$(git-commit) 未commit N / 未push M`(警告色)を出し、tooltipにrepositoryごとの変更件数・未push commit件数・upstream未設定を並べる。repositoryがなければ`$(git-branch) Gitなし`(警告色)とする。未pushには、upstreamより先行するcommit、どのremote-tracking refからも到達できないcommit(detached HEADを含む)、upstreamが`[gone]`のbranch、upstreamのないcommit付きbranchを含める。EdgeはVM内の状態を見られないためTerminateはブロックせず、視覚的な警告にとどめる。判定ロジックは`git-status.js`にある。
 
 MicroVMのゲスト時計はNTPで同期していないため、Suspend/Resumeで時計が遅れる可能性に備えて、S3 regional endpointへの`HEAD`の`Date` headerで毎分とwindow focus時に時計差を補正する。2026-09-25の実測では、3分間Suspendしてから再開した後の補正量は-1秒で、ゲスト時計の遅れは観測されなかった。
 
@@ -829,21 +832,19 @@ control URLはImageに書き込まず、起動のたびにEdgeが`runHookPayload
 
 `bash.patterns`はOMPのbashツールが実行前に照合する承認ルールである。パターンを回避したコマンドや子プロセスを、OSのレベルで止める仕組みは持たない。
 
-### 9.8 ヘッドレスChromium
+### 9.8 ヘッドレスChromium(Chrome for Testing headless shell)
 
-OMPのブラウザ機能はpuppeteer-coreを使い、初回利用時にChrome for Testingをダウンロードしようとする。開発時はLinux arm64向けのChrome for Testingが配布されておらず、ARM64のMicroVMではこのダウンロードに頼れなかった(Dockerfileのコメントに経緯がある)。
+OMPのブラウザ機能はpuppeteer-coreを使い、初回利用時にChrome for Testingをダウンロードしようとする。開発時はLinux arm64向けのChrome for Testingが配布されておらず、以前はSparticuz/chromiumのarm64 packを`@sparticuz/chromium-min`で`/opt/chromium`へ展開していた。しかしこのpackはEdgeのHTML画面などでfont fallbackの際に`SkFontMgr_FontConfigInterface ... Not implemented`で異常終了した。
 
-そこでImage build時に、Sparticuz/chromiumのarm64 packを`@sparticuz/chromium-min`で`/opt/chromium`へ展開している。
+Chrome for Testingの`linux-arm64`は153から配布されているため、現在はImage build時にGoogleのChrome for Testing `chrome-headless-shell` linux-arm64(`ARG CHROME_VERSION=154.0.8037.57`)をダウンロードし、`ARG CHROME_HEADLESS_SHELL_ARM64_ZIP_SHA256`で検証して`/opt/chrome-headless-shell-linux-arm64/`へ展開する。Googleはchecksumを公開していないため、このhashは取得時に算出したもの(trust-on-first-use)である。共有ライブラリとfontは同梱されないので、AL2023の`dnf`で入れる(alsa-lib、at-spi2-atk、at-spi2-core、atk、cairo、cups-libs、dbus-libs、libX11、libXcomposite、libXdamage、libXext、libXfixes、libXrandr、libxcb、libxkbcommon、mesa-libgbm、nspr、nss、pango、fontconfig、liberation-sans-fonts、google-noto-sans-cjk-ttc-fonts)。build時に`ldd`が不足ライブラリを報告すれば失敗させ、最後に`--version`を実行する。
 
-2026-09-25時点のChrome for Testingの配布一覧(`known-good-versions-with-downloads.json`)を見ると、`linux-arm64`の配布物は153.0.8001.0以降にだけ存在する。今回採用したSparticuzのChromium 149と同世代のChrome for Testingには含まれていない。Chromiumを更新するときは、Chrome for Testingへ切り替える案も比較する。その場合はAL2023 minimalに不足する共有ライブラリを`dnf`で入れる必要がある。比較の観点と完了条件は`docs/implementation-status-and-roadmap.md`の5.9.1節にある。
+完全版Chromeではなくheadless shellを選んだのは、OMPがpuppeteer-core 25を`headless: true`と`--no-sandbox`で起動するためheadless shellで足り、GTKが不要だからである。
 
 | 環境変数 | 値 | 役割 |
 | --- | --- | --- |
-| `PUPPETEER_EXECUTABLE_PATH` | `/opt/chromium/chromium` | puppeteerが起動するbinary |
-| `FONTCONFIG_PATH` | `/opt/chromium/fonts` | フォント設定 |
-| `LD_LIBRARY_PATH` | `/opt/chromium/al2023/lib:/opt/chromium` | AL2023向けの共有ライブラリ |
+| `PUPPETEER_EXECUTABLE_PATH` | `/opt/chrome-headless-shell-linux-arm64/chrome-headless-shell` | puppeteerが起動するbinary |
 
-build時は`AWS_EXECUTION_ENV=AWS_Lambda_nodejs24.x`と`TMPDIR=/opt/chromium`を付けて展開する。`@sparticuz/chromium-min`は`AWS_EXECUTION_ENV`を見てAL2023用ライブラリを展開するかを決め、`TMPDIR`(Node.jsの`os.tmpdir()`)を展開先に使うためである。
+2026-09-29にMicroVMと同じAL2023上のユーザー領域再現で、不足ライブラリがないこと、旧packが落ちたEdgeの`/auth/signed-out`ページと日本語glyphを描画できること、OMPのbrowser toolでCloudFrontのページを開きscreenshotを保存できることを確認した。OMPのbrowser toolは`file://`へのnavigationで`No page targets available`になる(http(s)は動く)。deploy後の実Imageでの確認は残っている(実機確認待ち。完了条件は`docs/implementation-status-and-roadmap.md`5.9.1節)。versionを上げるときは`CHROME_VERSION`とzipのSHA-256を同時に更新する。
 
 ## 10. 認証状態の永続化
 
@@ -1166,7 +1167,7 @@ code-server/
 | origin-request | 期限切れtokenの更新失敗時に転送しないこと、Edge専用Cookieを除去してorigin固有Cookieを保持すること |
 | Image | OMPとcode-serverのversionが固定形式であること(自動更新スクリプトの前提)、非rootでの実行、Chromium、Suspend拡張の存在 |
 
-Lambda@Edgeやセッション処理を変えたときは、デプロイ後に「サインイン → 選択画面 → 新規起動 → code-server表示 → Suspend → Resume → 確認付きTerminate → 終了と行削除」を確認する。2026-09-25の検証では起動フォームの二重POSTが409になり、確認画面で誤ったIDを拒否し、テスト用MicroVMだけが`TERMINATED`となってDynamoDB行が削除され、既存MicroVMは残った。EdgeのHTML画面は同梱headless ChromiumのSkia FontConfigで描画が異常終了するためCookie付きHTTPで操作し、code-server UIをブラウザで表示した。一時的なE2Eスクリプトであり、リポジトリには未収録。
+Lambda@Edgeやセッション処理を変えたときは、デプロイ後に「サインイン → 選択画面 → 新規起動 → code-server表示 → Suspend → Resume → 確認付きTerminate → 終了と行削除」を確認する。2026-09-25の検証では起動フォームの二重POSTが409になり、確認画面で誤ったIDを拒否し、テスト用MicroVMだけが`TERMINATED`となってDynamoDB行が削除され、既存MicroVMは残った。EdgeのHTML画面は当時同梱していたSparticuz headless ChromiumのSkia FontConfigで描画が異常終了したためCookie付きHTTPで操作し、code-server UIをブラウザで表示した(Chrome for Testingへ切り替え後の実機確認は9.8節)。一時的なE2Eスクリプトであり、リポジトリには未収録。
 
 ## 16. 既知の制約と改善候補
 
@@ -1221,5 +1222,5 @@ code-serverのタブを開いたままにするとRUNNINGが続く。作業を�
 - code-server FAQ: https://coder.com/docs/code-server/FAQ
 - GitHub CLI manual `gh auth login`: https://cli.github.com/manual/gh_auth_login
 - cdkd: https://github.com/go-to-k/cdkd
-- Sparticuz/chromium: https://github.com/Sparticuz/chromium
+- Chrome for Testing: https://googlechromelabs.github.io/chrome-for-testing/
 - OMP(Oh My Pi): https://github.com/can1357/oh-my-pi

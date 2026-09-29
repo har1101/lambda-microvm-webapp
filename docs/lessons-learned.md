@@ -346,19 +346,19 @@ OMPのmodel roleはImage内へ固定しているが、provider側のモデル名
 
 ## 8. ARM64 ImageとBrowser E2Eのハマりどころ
 
-### 8.1 Google Chrome for TestingはLinux arm64をそのまま配布しない
+### 8.1 Google Chrome for TestingのLinux arm64は153以降にしかない
 
-MicroVM ImageはARM64である。OMPのPuppeteer機能に通常の自動ダウンロードを任せると、対応するLinux arm64 Chromeを取得できず、初回E2Eが失敗する。
+MicroVM ImageはARM64である。開発当初のChrome for TestingにはLinux arm64の配布物がなく、OMPのPuppeteer機能に通常の自動ダウンロードを任せると初回E2Eが失敗した。
 
-現在は`@sparticuz/chromium-min`とSparticuzのarm64 packを使い、Amazon Linux 2023向けChromiumをImage build時に展開している。
+そこで最初は`@sparticuz/chromium-min`とSparticuzのarm64 pack（`/opt/chromium`、`FONTCONFIG_PATH=/opt/chromium/fonts`、`LD_LIBRARY_PATH=/opt/chromium/al2023/lib:/opt/chromium`）を使った。しかしこのpackはfont fallbackで異常終了した（11.6参照）。
+
+Chrome for Testingの`linux-arm64`は153から配布されている。現在はChrome for Testingの`chrome-headless-shell` linux-arm64（154.0.8037.57）を`/opt/chrome-headless-shell-linux-arm64/`へ展開し、共有ライブラリとfont（`fontconfig`、`liberation-sans-fonts`、`google-noto-sans-cjk-ttc-fonts`など）はAL2023の`dnf`で入れている。これでfont fallbackのabortが解消した（2026-09-29、AL2023上のユーザー領域再現で確認。実Imageでは実機確認待ち）。OMPは`headless: true`で起動するので、GTKが要らないheadless shellで足りる。
 
 必要な環境変数:
 
-- `PUPPETEER_EXECUTABLE_PATH=/opt/chromium/chromium`
-- `FONTCONFIG_PATH=/opt/chromium/fonts`
-- `LD_LIBRARY_PATH=/opt/chromium/al2023/lib:/opt/chromium`
+- `PUPPETEER_EXECUTABLE_PATH=/opt/chrome-headless-shell-linux-arm64/chrome-headless-shell`
 
-packはSHA-256を固定し、build時に実際に`chromium --version`を実行して検証する。
+zipのSHA-256を固定し（Googleはchecksumを公開しないため取得時に算出したTOFU）、build時に`ldd`で不足ライブラリがあれば失敗させ、`--version`を実行して検証する。
 
 ### 8.2 Architectureごとの配布形式を確認する
 
@@ -366,7 +366,7 @@ code-server、Node.js、Bun、GitHub CLI、AWS CLI、uv、ripgrepはすべてarm
 
 ### 8.3 version pinだけでなくchecksumも必要
 
-主要なtop-levelツールはversion固定しているが、完全再現可能ではない。code-serverとOMPは`npm run deploy`のたびに最新版へ書き換わる(code-server RPMのSHA-256もrelease assetの`digest`から同時に書き換える)。直接ダウンロードする成果物(code-server RPM、Node、Bun、GitHub CLI、AWS CLI、uv、ripgrep、Chromium pack)はDockerfileのSHA-256 ARGと`sha256sum -c`で検証する。ただしAWS CLIは公式がPGP署名しか公開していないため、取得したファイルから算出したhash(trust-on-first-use)である。`dnf` package、VS Code extension、base imageの実体(digest)、OMPやLSPのtransitive dependencyは完全固定されていない。Edge SDKはlockfileと`npm ci`で現在解決結果を固定しているが、manifestは一部caret rangeである。
+主要なtop-levelツールはversion固定しているが、完全再現可能ではない。code-serverとOMPは`npm run deploy`のたびに最新版へ書き換わる(code-server RPMのSHA-256もrelease assetの`digest`から同時に書き換える)。直接ダウンロードする成果物(code-server RPM、Node、Bun、GitHub CLI、AWS CLI、uv、ripgrep、Chrome for Testing headless shell)はDockerfileのSHA-256 ARGと`sha256sum -c`で検証する。ただしAWS CLIは公式がPGP署名しか公開しておらず、Chrome for Testingはchecksumを公開していないため、取得したファイルから算出したhash(trust-on-first-use)である。`dnf` package、VS Code extension、base imageの実体(digest)、OMPやLSPのtransitive dependencyは完全固定されていない。Edge SDKはlockfileと`npm ci`で現在解決結果を固定しているが、manifestは一部caret rangeである。
 
 version固定は再現性を上げるが、配布物改ざんや同一タグ差し替えへの対策としてはchecksumまたは署名検証が必要である。
 
@@ -565,9 +565,11 @@ Image build時の`chromium --version`と設定ファイルのassertionは、bina
 
 Image/provider更新時は、MicroVM内で小さなtest appを起動し、OMPの`browser.open`→操作→console/network確認→screenshotまでをdeployed E2Eとして通す必要がある。
 
-### 11.6 headless ChromiumではEdgeのHTML画面を描画できない。control planeはHTTPで操作する
+### 11.6 旧headless ChromiumではEdgeのHTML画面を描画できなかった。control planeはHTTPで操作する
 
-Imageに同梱したheadless Chromium（Sparticuz arm64 pack）は、EdgeのログインやSession選択画面を描画する際にfont fallbackで`FATAL: SkFontMgr_FontConfigInterface.cpp:163 Not implemented`を出して落ちた。`about:blank`からCloudFrontへの最初のnavigationが`Navigating frame was detached`で失敗することもあった。code-serverのUIは描画できる（文字glyphはほぼ出ない）。
+以前Imageに同梱したheadless Chromium（Sparticuz arm64 pack）は、EdgeのログインやSession選択画面を描画する際にfont fallbackで`FATAL: SkFontMgr_FontConfigInterface.cpp:163 Not implemented`を出して落ちた。`about:blank`からCloudFrontへの最初のnavigationが`Navigating frame was detached`で失敗することもあった。code-serverのUIは描画できた（文字glyphはほぼ出なかった）。
+
+Chrome for Testingのarm64 headless shellとAL2023のfontへ切り替えた後は、同じEdgeの`/auth/signed-out`ページと日本語glyphを描画でき、OMPのbrowser toolでもCloudFrontのページを開いてscreenshotを保存できた（2026-09-29、AL2023上のユーザー領域再現。実Imageでは実機確認待ち）。なおOMPのbrowser toolは`file://`へのnavigationで`No page targets available`になる（http(s)は動く）。
 
 そこでdeployed E2Eでは、login、session選択、Suspend、ResumeをCookie付きのHTTP（`fetch`）で行い、ブラウザではcode-serverのUIだけを開く。code-serverは準備ができると`/`へ`./?folder=...`への302を返すので、readiness確認に使える。
 
@@ -631,7 +633,7 @@ Lambda@Edgeの公開Versionは関連解除直後に消せないため`RETAIN`、
 - [ ] checksumまたは署名を検証できるか
 - [ ] `USER vscode`後に必要ファイルへ書き込めるか
 - [ ] `ready` hookがcode-serverの`/healthz`を確認できるか
-- [ ] OMP browserが`/opt/chromium/chromium`を起動できるか
+- [ ] OMP browserが`/opt/chrome-headless-shell-linux-arm64/chrome-headless-shell`を起動できるか
 - [ ] `artifact/`へ追加したファイルが`.gitignore`で無視されていないか（`git check-ignore -v`）
 
 ### Edge・セッション変更

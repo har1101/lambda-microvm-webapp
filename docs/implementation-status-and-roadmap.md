@@ -113,7 +113,7 @@ OMPとGitHubの認証状態はKMS暗号化されたS3へ保存される。ワー
 | Ask tool | 実装済み | 有効 |
 | approvalMode | 実装済み | `yolo` |
 | 破壊的コマンドdeny | 実装済み | `rm -rf *`、`git push --force*` |
-| OMP Browser | 実装済み | Chromium起動をImage buildで検証。OMP `browser.open`実操作E2Eは未完 |
+| OMP Browser | 実装済み(実機確認待ち) | Chrome for Testingのarm64 headless shellをImageへ同梱し、build時に不足ライブラリ検査と`--version`を実行(5.9.1節)。VMと同じAL2023でのユーザー領域再現では、OMP browser toolでCloudFrontのEdgeページと日本語を描画できた。deploy後の実Imageでの確認が残る |
 | OMP Computer tool | 未実装 | headless Web E2Eを優先 |
 | プロジェクト共通AGENTSルール | 未実装 | 各clone先リポジトリへ依存 |
 
@@ -133,6 +133,7 @@ OMPとGitHubの認証状態はKMS暗号化されたS3へ保存される。ワー
 | YAML/Python/Docker extension | 実装済み | Image build時に導入 |
 | Suspend control extension | 実装済み(実機確認待ち) | HTTPS制御画面を開く。control URLはImageに固定せず、Edgeが`runHookPayload`で渡した値を`session.json`から読む。deploy前に起動したVMではURLがなくエラー表示 |
 | MicroVM残り寿命表示 | 実装・検証済み | Edgeが`RunMicrovm`直前に計算した期限を`/run` hook経由で渡し、status barへ`残り H:MM`、30分/10分で警告色、60/15/5分で通知。VM内時計はS3 `Date` headerで毎分補正(実機ではSuspend 3分→Resume後も補正-1秒で、ゲスト時計の遅れは観測されなかった)。deploy後の新規VMのみ対象 |
+| Workspace Git状態表示 | 実装済み(実機確認待ち) | status bar(認証表示の右)に`Git同期済み`、`未commit N / 未push M`(警告色)、`Gitなし`(警告色)を表示。60秒ごと・保存時・window focus時に`~/workspace`を深さ2まで走査し、各repositoryで`git status --porcelain=v1 --branch`と`git rev-list --count HEAD --not --remotes`を実行。upstream未設定や`[gone]`、どのremoteにもないcommit(detached HEAD含む)も未pushとする。tooltipにrepository別の内訳、クリックでSource Control。Terminateはブロックしない(視覚的な警告のみ) |
 | リポジトリ自動clone | 未実装 | 起動後に手動clone |
 | project依存の自動install | 未実装 | 各リポジトリで手動 |
 
@@ -211,7 +212,7 @@ npm run diff             # deploy後は両Stack差分ゼロ
 - 30〜180秒のSuspend後にResumeしても、同じ表示が続く。3分のSuspend後の時計補正は-1秒で、ゲスト時計の遅れは観測されなかった
 - テストMicroVMのTerminate、テストDynamoDB行の削除、既存MicroVMの保護
 
-このE2Eでは、login・chooser・Suspend・ResumeをCookie付きHTTPで操作し、ブラウザではcode-server UIだけを開いた。同梱のheadless ChromiumがEdgeのlogin/chooserページを描画するとSkia FontConfigで異常終了するためである(5.9.1節)。
+このE2Eでは、login・chooser・Suspend・ResumeをCookie付きHTTPで操作し、ブラウザではcode-server UIだけを開いた。当時同梱していたSparticuzのheadless ChromiumがEdgeのlogin/chooserページを描画するとSkia FontConfigで異常終了したためである(5.9.1節。Chrome for Testingへ切り替え済み)。
 
 同日、起動・終了の安全策を反映したEdgeをデプロイし、テスト用MicroVMだけでフォームUUIDの二重POSTが409になること、追跡中のセッションを選択・接続できること、確認画面で誤ったIDが拒否されること、正しいIDでTerminateした後に`TERMINATED`を確認して行が消えること、access Cookieを残して選択画面へ戻ることを確認した。既存MicroVMは検証後も残った。新規VMのstatus barは`残り 7:59`を表示したが、1回の実行では`omp/install-id`と`github/hosts.yml`に`認証復元失敗`も表示された。
 
@@ -225,7 +226,7 @@ npm run diff             # deploy後は両Stack差分ゼロ
 
 - curlで、未認証のHTMLナビゲーションは`/auth/login`へ302、非HTMLは401、`/session/control`は`target="_top"`のサインインリンク付き401、Cookieなしの`POST /auth/logout`は何も消さずに`/auth/signed-out`へ303、旧`/login`は`/auth/login`へ302になる。`/auth/login`はS256の`code_challenge`付きでCognitoの`/oauth2/authorize`へ302し、Cognitoはredirect_uriを受け付けてログイン画面へ進む。
 - 一時的な検証ユーザー(管理者作成、確認済み)で、実ブラウザからManaged Login→初回TOTP登録→callback→選択画面まで進み、`omp-cloud-ide-auth`は`SameSite=Strict`のままループしなかった。既存の稼働中MicroVMへ`Connect`し、code-server(`workspace - code-server`)が表示された。制御画面の`Sign out`でCognitoの`/logout`を経て`/auth/signed-out`へ戻り、access Cookieと`sess#`行が消え、再訪時はCognitoのログイン画面(資格情報の再入力)になった。検証ユーザーは削除した。
-- 同梱のSparticuz Chromiumでは描画できないため(5.9.1節)、このE2Eは一時的に展開したPlaywrightのarm64 Chromium(不足ライブラリとフォントをユーザー領域へ展開)で行い、検証後に削除した。
+- 当時同梱していたSparticuz Chromiumでは描画できなかったため(5.9.1節)、このE2Eは一時的に展開したPlaywrightのarm64 Chromium(不足ライブラリとフォントをユーザー領域へ展開)で行い、検証後に削除した。
 
 ### 3.3 手動利用確認
 
@@ -253,7 +254,7 @@ npm run diff             # deploy後は両Stack差分ゼロ
 - `/run`復元失敗の実機エラーコード取得と継続監視。実行中VMのlogはCloudWatchへ届かないため、2026-09-29の全件失敗もコードは直接取得できていない(AWS CLIの初回起動時間から`Timeout`と推定)。S3/KMS固有障害は依然として`restoreFailed`になり、該当keyの自動保存が止まる
 - CloudFront/Lambda@Edgeのregional log横断調査
 - 残り寿命の60/15/5分通知と警告色の実機確認(実機で確認したのは開始直後とSuspend/Resume後の表示まで)
-- status bar項目のクリック(Suspend制御画面、手動保存、Source Control)の実ブラウザ操作。headless Chromiumでは文字glyphがほぼ描画されず、合成`element.click()`も効かないため自動化できていない
+- status bar項目のクリック(Suspend制御画面、手動保存、Source Control)の実ブラウザ操作。旧Sparticuz Chromiumでは文字glyphがほぼ描画されず、合成`element.click()`も効かないため自動化できていない(Chrome for Testingでの再試行は実機確認待ち)
 
 ## 4. 元設計から変更した点
 
@@ -266,7 +267,7 @@ npm run diff             # deploy後は両Stack差分ゼロ
 | root相当`vscode` | UID/GID 1000 | OMP shell実行時の影響を低減 |
 | native HTTP Basic | Cognito Managed Login + 不透明なEdgeセッションCookie | 埋め込みブラウザ互換性、MFA、サーバー側失効(途中でHTMLフォーム+Cookieを経由) |
 | Cookieなしで自動新規起動 | 選択画面 | 既存作業の孤立と不要起動を防止 |
-| Browserは後回し | ARM64 ChromiumをImage同梱 | OMP自身のE2Eを標準化 |
+| Browserは後回し | ARM64 Chrome for Testing headless shellをImage同梱 | OMP自身のE2Eを標準化 |
 
 ## 5. 改善策の優先順位
 
@@ -313,8 +314,8 @@ npm run diff             # deploy後は両Stack差分ゼロ
 
 現状はGit運用に依存する。次の軽量策から検討する。
 
-- status barに「未push変更を確認」の導線を追加
-- Terminate前にdirty repositoryを検知して警告
+- ~~status barに「未push変更を確認」の導線を追加~~(実装済み: `Git同期済み`/`未commit N / 未push M`/`Gitなし`、2.5節)
+- Terminate前にdirty repositoryを検知して警告(EdgeからはVM内の状態が見えないため、現状はstatus barの視覚的警告のみ)
 - startup時に指定repository/branchを自動clone
 - 任意のworkspace snapshotをS3へ保存する明示コマンド
 
@@ -393,7 +394,7 @@ Lambda@Edgeのログは実行リージョンへ分散し得るため、中央集
 
 過去のdeployed E2Eで分かった実装上の注意:
 
-- 同梱のheadless ChromiumはEdgeのlogin/chooserページでabortするため(5.9.1節)、login・chooser・Suspend・ResumeはCookie付きHTTPで操作し、ブラウザはcode-server UIだけに使う
+- 旧Sparticuz headless ChromiumはEdgeのlogin/chooserページでabortしたため(5.9.1節)、login・chooser・Suspend・ResumeはCookie付きHTTPで操作し、ブラウザはcode-server UIだけに使う(現行E2Eもこの方式のまま)
 - code-serverはready後に`/`へ`./?folder=...`への302を返すので、readiness probeに使える
 - status bar項目は合成`element.click()`では反応せず、実mouse clickも文字glyphが描画されない状態では不安定である
 
@@ -441,7 +442,7 @@ MicroVM proxy tokenは現状60分である。短命化（例: 15〜30分）とre
 
 #### 5.9 Supply chain検証を揃える
 
-code-server RPM、Node、Bun、GitHub CLI、AWS CLI、uv、ripgrep、Chromium packの直接ダウンロードはDockerfileのSHA-256 ARGと`sha256sum -c`で検証する(実装済み)。code-serverのhashはdeploy時に`scripts/update-tool-versions.mjs`がrelease assetの`digest`から更新する。AWS CLIは公式がPGP署名しか公開していないため、取得したファイルから算出したhash(trust-on-first-use)であり、PGP署名検証への置き換えが残る。OMPはnpm registryのintegrityに頼る。`dnf` package、VS Code extension、npm global LSP packageのtransitive dependency、base image digestは未固定である。
+code-server RPM、Node、Bun、GitHub CLI、AWS CLI、uv、ripgrep、Chrome for Testing headless shellの直接ダウンロードはDockerfileのSHA-256 ARGと`sha256sum -c`で検証する(実装済み)。code-serverのhashはdeploy時に`scripts/update-tool-versions.mjs`がrelease assetの`digest`から更新する。AWS CLIとChrome for Testingは公式がchecksumを公開していない(AWS CLIはPGP署名のみ)ため、取得したファイルから算出したhash(trust-on-first-use)であり、AWS CLIはPGP署名検証への置き換えが残る。OMPはnpm registryのintegrityに頼る。`dnf` package、VS Code extension、npm global LSP packageのtransitive dependency、base image digestは未固定である。
 
 さらに次を検討する。
 
@@ -455,31 +456,38 @@ code-server RPM、Node、Bun、GitHub CLI、AWS CLI、uv、ripgrep、Chromium pa
 - base image version/digestの更新方針
 - OMP/provider更新時の互換性テスト
 
-#### 5.9.1 Chromiumの調達元を再評価する
+#### 5.9.1 Chromiumの調達元を再評価する(実装済み 2026-09-29: Chrome for Testing headless shell、実機確認待ち)
 
-現在はSparticuz/chromiumのarm64 pack(149.0.0)をImage build時に`/opt/chromium`へ展開している。開発時点ではChrome for TestingにLinux arm64の配布物がなく、OMPのpuppeteerが自動ダウンロードに失敗するためである。
+以前はSparticuz/chromiumのarm64 pack(149.0.0)をImage build時に`/opt/chromium`へ展開していた。開発時点ではChrome for TestingにLinux arm64の配布物がなく、OMPのpuppeteerが自動ダウンロードに失敗したためである。Chrome for Testingの`linux-arm64`は153から配布されている。
 
-2026-09-25時点のChrome for Testingの配布一覧(`known-good-versions-with-downloads.json`)では、`linux-arm64`が153.0.8001.0から追加されている。次にChromiumを更新するときは、次の2案を比較する。
-
-| 観点 | Sparticuz arm64 pack(現行) | Chrome for Testing linux-arm64 |
+| 観点 | Sparticuz arm64 pack(旧) | Chrome for Testing linux-arm64(採用) |
 | --- | --- | --- |
 | 配布元 | 個人メンテナンスのOSS(Lambda向け) | Google公式(自動テスト向け) |
 | 共有ライブラリ | AL2023向けを同梱 | 同梱しない。AL2023 minimalへ不足分を`dnf`で入れる |
 | 導入の仕組み | `AWS_EXECUTION_ENV`と`TMPDIR`を指定して`@sparticuz/chromium-min`で展開 | zipを展開し、`PUPPETEER_EXECUTABLE_PATH`で指定 |
 | versionの選び方 | Sparticuzのrelease単位 | Chromeのversion単位。puppeteerが想定するversionに合わせやすい |
-| 検証 | pack tarのSHA-256を固定 | 配布zipのSHA-256を固定する必要がある |
-| font | 同梱の`FONTCONFIG_PATH=/opt/chromium/fonts`を使う。font fallbackでabortする(下記) | AL2023側でfontconfigとfontを用意する必要がある(未検証) |
+| 検証 | pack tarのSHA-256を固定 | 配布zipのSHA-256を固定(Googleがchecksumを公開しないため取得時に算出したTOFU) |
+| font | 同梱の`FONTCONFIG_PATH=/opt/chromium/fonts`。font fallbackでabortした(下記) | AL2023の`fontconfig`、`liberation-sans-fonts`、`google-noto-sans-cjk-ttc-fonts` |
 
-現行packには実害も出ている。2026-09-25のdeployed E2Eでは、Edgeのlogin/chooserページを描画した時点で`FATAL: SkFontMgr_FontConfigInterface.cpp:163 Not implemented`によりChromiumが異常終了した(font fallback時)。また`about:blank`からCloudFrontへの最初のnavigationが`Navigating frame was detached`で失敗することがあった。code-server UIは描画できるが、文字glyphはほぼ表示されない。OMP Browserで一般のWebページを開く場合も、font fallbackが起きれば同じ異常終了が起こり得る。
+旧packでは実害が出ていた。2026-09-25のdeployed E2Eでは、Edgeのlogin/chooserページを描画した時点で`FATAL: SkFontMgr_FontConfigInterface.cpp:163 Not implemented`によりChromiumが異常終了した(font fallback時)。また`about:blank`からCloudFrontへの最初のnavigationが`Navigating frame was detached`で失敗することがあった。code-server UIは描画できるが、文字glyphはほぼ表示されなかった。
 
-前提として、どちらを選んでもOMPの`browser.open`→`localhost`操作→screenshotまでを通すdeployed E2E(3.4節の未完項目)が必要である。E2Eなしでは切り替え後の動作を判断できない。
+採用した構成:
 
-完了条件:
+- `chrome-headless-shell` linux-arm64(`ARG CHROME_VERSION=154.0.8037.57`、`ARG CHROME_HEADLESS_SHELL_ARM64_ZIP_SHA256`)を`/opt/chrome-headless-shell-linux-arm64/`へ展開し、`PUPPETEER_EXECUTABLE_PATH`で指定する
+- 共有ライブラリとfontはAL2023の`dnf`で入れる(alsa-lib、at-spi2-atk、at-spi2-core、atk、cairo、cups-libs、dbus-libs、libX11、libXcomposite、libXdamage、libXext、libXfixes、libXrandr、libxcb、libxkbcommon、mesa-libgbm、nspr、nss、pango、fontconfig、liberation-sans-fonts、google-noto-sans-cjk-ttc-fonts)
+- build時に`ldd`で不足ライブラリがあれば失敗させ、`--version`を実行する
+- 完全版Chromeではなくheadless shellを選んだ理由: OMPはpuppeteer-core 25を`headless: true`と`--no-sandbox`で起動するのでheadless shellで足り、GTKが不要でImageへ入れる依存が少ない
 
-- 採用した案でImage buildが`chromium --version`まで成功する
-- OMP Browser E2EがMicroVM上で成功する
+2026-09-29にMicroVMと同じAL2023上のユーザー領域再現(RPMを展開し、rootでinstallはしない)で確認した: 不足ライブラリなし、`chrome-headless-shell --screenshot`で旧packがabortしたEdgeの`/auth/signed-out`ページと日本語glyphを描画、puppeteer-coreの`headless: true`で起動、OMP自身のbrowser tool(`omp -p`)でCloudFrontの`/auth/signed-out`を開き、日本語を挿入したscreenshotで文字が読めた。OMPのbrowser toolでの`file://`へのnavigationは`No page targets available`で失敗した(OMP側の制約。http(s)は動く)。
+
+残る完了条件(deploy後の実Imageで確認する):
+
+- Image buildが`ldd`検査と`--version`まで成功する
+- OMP Browser E2E(`browser.open`→`localhost`操作→screenshot)がMicroVM上で成功する
 - EdgeのHTMLページを含む通常のWebページをabortせずに描画でき、文字glyphがscreenshotに表示される
-- 採用理由とversion・checksumの更新手順を`docs/architecture-and-design.md`9.8節へ反映する
+- 成功後、E2EのEdge画面をブラウザ操作へ戻すか判断する
+
+versionを上げるときは`CHROME_VERSION`とzipのSHA-256を同時に更新する。採用理由と更新手順は`docs/architecture-and-design.md`9.8節にも記載した。
 
 ### P2: セッション管理を拡張する
 
@@ -582,6 +590,8 @@ Lambdaは`/run`へ`{"microvmId": ..., "runHookPayload": "<RunMicrovmへ渡した
 5. 明示Terminate UI(実装済み: 5.3節)
 6. E2Eスクリプト正式化(実装済み: 5.6節)
 7. checksum・version pin拡充(直接ダウンロード成果物のSHA-256は実装済み。dnf・VS Code拡張・base image digestが残る)
+8. Chromium調達元をChrome for Testing headless shellへ切り替え(実装済み・実機確認待ち: 5.9.1節)
+9. Workspace Git状態のstatus bar表示(実装済み・実機確認待ち: 5.2節)
 
 ### Phase B: CI/CDと運用監視
 

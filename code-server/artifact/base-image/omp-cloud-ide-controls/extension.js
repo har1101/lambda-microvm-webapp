@@ -4,6 +4,7 @@ const os = require('node:os');
 const path = require('node:path');
 const vscode = require('vscode');
 const timer = require('./session-timer');
+const gitView = require('./git-status');
 
 // Written by /opt/cloud-ide/lifecycle.py when the /run hook delivers the Edge deadline.
 const SESSION_FILE = path.join(os.homedir(), '.cache', 'omp-cloud-ide', 'session.json');
@@ -12,9 +13,18 @@ const AUTH_SYNC_FILE = path.join(os.homedir(), '.cache', 'omp-cloud-ide', 'auth-
 const SYNC_INTERVAL_MS = Math.max(60, Number(process.env.AUTH_SYNC_INTERVAL_SECONDS) || 300) * 1000;
 const TICK_MS = 15_000;
 const CLOCK_SYNC_MS = 60_000;
+const WORKSPACE_DIR = path.join(os.homedir(), 'workspace');
+// Repositories are usually cloned directly under the workspace; allow one grouping level.
+const GIT_SCAN_DEPTH = 2;
+const GIT_REFRESH_MS = 60_000;
 
 function activate(context) {
-  context.subscriptions.push(...createSuspendControl(), createLifetimeCountdown(), ...createAuthSyncStatus());
+  context.subscriptions.push(
+    ...createSuspendControl(),
+    createLifetimeCountdown(),
+    ...createAuthSyncStatus(),
+    ...createWorkspaceGitStatus(),
+  );
 }
 
 function createSuspendControl() {
@@ -199,6 +209,81 @@ function createAuthSyncStatus() {
   void refresh();
   const interval = setInterval(() => void refresh(), TICK_MS);
   return [persist, item, new vscode.Disposable(() => clearInterval(interval))];
+}
+
+// The workspace is lost when the MicroVM ends; Git is the only persistence
+// boundary. Surface repositories with uncommitted or unpushed work.
+function createWorkspaceGitStatus() {
+  const item = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 97);
+  item.name = 'OMP Cloud IDE unsaved Git work';
+  item.command = 'workbench.view.scm';
+  item.show();
+
+  const git = (repo, args) =>
+    new Promise((resolve) => {
+      execFile('git', ['-C', repo, ...args], { timeout: 10_000, maxBuffer: 4 * 1024 * 1024 }, (error, stdout) =>
+        resolve(error ? null : stdout),
+      );
+    });
+
+  let running = false;
+  const refresh = async () => {
+    if (running) return;
+    running = true;
+    try {
+      const repos = [];
+      for (const dir of await findRepositories(WORKSPACE_DIR, GIT_SCAN_DEPTH)) {
+        const porcelain = await git(dir, ['status', '--porcelain=v1', '--branch', '--untracked-files=normal']);
+        if (porcelain === null) continue;
+        // Commits on no remote-tracking ref: catches detached HEAD and deleted upstreams too.
+        // Fails (null) before the first commit, when there is nothing to lose.
+        const localOnly = Number((await git(dir, ['rev-list', '--count', 'HEAD', '--not', '--remotes'])) ?? 0);
+        repos.push({
+          name: path.relative(WORKSPACE_DIR, dir) || '.',
+          ...gitView.summarizeRepository(porcelain, localOnly),
+        });
+      }
+      const view = gitView.describeWorkspace(repos);
+      item.text = view.text;
+      item.tooltip = `${view.detail}\nクリックでソース管理を開きます。`;
+      item.backgroundColor =
+        view.level === 'normal' ? undefined : new vscode.ThemeColor(`statusBarItem.${view.level}Background`);
+    } finally {
+      running = false;
+    }
+  };
+
+  const tick = () => void refresh().catch((error) => console.error('OMP Cloud IDE git status failed', error));
+  tick();
+  const interval = setInterval(tick, GIT_REFRESH_MS);
+  const saved = vscode.workspace.onDidSaveTextDocument(tick);
+  const focus = vscode.window.onDidChangeWindowState((state) => state.focused && tick());
+  return [item, saved, focus, new vscode.Disposable(() => clearInterval(interval))];
+}
+
+/** Directories under root (including root) that contain a `.git` entry, up to `depth` levels down. */
+async function findRepositories(root, depth) {
+  const found = [];
+  const walk = async (dir, level) => {
+    let entries;
+    try {
+      entries = await fs.readdir(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    if (entries.some((entry) => entry.name === '.git')) {
+      found.push(dir);
+      return;
+    }
+    if (level >= depth) return;
+    for (const entry of entries) {
+      if (entry.isDirectory() && !entry.name.startsWith('.') && entry.name !== 'node_modules') {
+        await walk(path.join(dir, entry.name), level + 1);
+      }
+    }
+  };
+  await walk(root, 0);
+  return found;
 }
 
 function validTimeZone(timeZone) {

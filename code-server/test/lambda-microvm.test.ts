@@ -1082,6 +1082,56 @@ describe('OMP Cloud IDE infrastructure', () => {
     expect(timer.describeAuthSync(null, now, interval).level).toBe('warning');
   });
 
+  test('flags repositories whose work would be lost with the MicroVM', () => {
+    const git = require('../artifact/base-image/omp-cloud-ide-controls/git-status.js') as {
+      summarizeRepository: (
+        porcelain: string,
+        localOnly?: number,
+      ) => {
+        changed: number;
+        ahead: number;
+        noUpstream: boolean;
+        unpushed: boolean;
+      };
+      describeWorkspace: (repos: Array<Record<string, unknown>>) => { text: string; level: string; detail: string };
+    };
+
+    expect(git.summarizeRepository('## main...origin/main\n')).toEqual({
+      changed: 0,
+      ahead: 0,
+      noUpstream: false,
+      unpushed: false,
+    });
+    expect(git.summarizeRepository('## main...origin/main [ahead 2, behind 1]\n M a.ts\n?? b.ts\n')).toMatchObject({
+      changed: 2,
+      ahead: 2,
+      unpushed: true,
+    });
+    // A local branch that was never pushed has nowhere to be recovered from.
+    expect(git.summarizeRepository('## feature\n')).toMatchObject({ noUpstream: true, unpushed: true });
+    expect(git.summarizeRepository('## No commits yet on main\n')).toMatchObject({ unpushed: false });
+    expect(git.summarizeRepository('## HEAD (no branch)\n')).toMatchObject({ unpushed: false });
+    // Commits made on a detached HEAD exist on no remote ref and are lost with the VM.
+    expect(git.summarizeRepository('## HEAD (no branch)\n', 1)).toMatchObject({ ahead: 1, unpushed: true });
+    // A deleted upstream leaves the branch's commits only here.
+    expect(git.summarizeRepository('## main...origin/main [gone]\n')).toMatchObject({
+      noUpstream: true,
+      unpushed: true,
+    });
+    // Only "behind" is not local work.
+    expect(git.summarizeRepository('## main...origin/main [behind 3]\n').unpushed).toBe(false);
+
+    const clean = { name: 'app', ...git.summarizeRepository('## main...origin/main\n') };
+    const dirty = { name: 'lib', ...git.summarizeRepository('## main...origin/main [ahead 1]\n M x\n') };
+    expect(git.describeWorkspace([clean]).level).toBe('normal');
+    expect(git.describeWorkspace([clean, dirty])).toMatchObject({
+      text: '$(git-commit) 未commit 1 / 未push 1',
+      level: 'warning',
+    });
+    expect(git.describeWorkspace([clean, dirty]).detail).toContain('lib');
+    expect(git.describeWorkspace([]).level).toBe('warning');
+  });
+
   test('preserves the session cookie when a MicroVM origin temporarily returns 502', async () => {
     const responseHandler = require('../artifact/edge-response/index.js').handler as (
       event: unknown,
@@ -1143,13 +1193,6 @@ describe('OMP Cloud IDE infrastructure', () => {
     expect(dockerfile).toContain('useradd --uid 1000');
     expect(dockerfile).toContain('USER vscode');
     expect(dockerfile).toContain('ripgrep');
-    expect(dockerfile).toContain('ARG CHROMIUM_VERSION=149.0.0');
-    expect(dockerfile).toContain(
-      'CHROMIUM_ARM64_PACK_SHA256=9c42e7850d746cbf0ac0e68eaa48af277af8255a5ee12a813c08573671f231f6',
-    );
-    expect(dockerfile).toContain('AWS_EXECUTION_ENV=AWS_Lambda_nodejs24.x TMPDIR=/opt/chromium');
-    expect(dockerfile).toContain('PUPPETEER_EXECUTABLE_PATH=/opt/chromium/chromium');
-    expect(dockerfile).toContain('/opt/chromium/chromium --version');
     expect(dockerfile).toContain(
       ['COPY omp-cloud-ide-controls $', '{EXTENSIONS_DIR}/har1101.omp-cloud-ide-controls-0.1.0'].join(''),
     );

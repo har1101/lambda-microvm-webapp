@@ -97,7 +97,7 @@ Later MicroVMs restore OMP's `agent.db`, its installation ID, and GitHub CLI's O
 
 The image also installs a global OMP configuration with interactive goal continuation and the ask tool enabled. Tool approvals default to `yolo`, while `rm -rf *` and `git push --force*` are denied by `bash.patterns`. These patterns govern OMP's `bash` tool; they are approval rules rather than operating-system sandboxing.
 
-OMP's Puppeteer browser prelude is enabled in headless mode. A checksum-pinned arm64 Chromium build is expanded into `/opt/chromium` during the image build and selected with `PUPPETEER_EXECUTABLE_PATH`, so the first E2E run does not depend on a browser download. `tab.screenshot()` evidence is saved under `/home/vscode/workspace/.artifacts/screenshots` by default.
+OMP's Puppeteer browser prelude is enabled in headless mode. A checksum-pinned Chrome for Testing `chrome-headless-shell` (linux-arm64) is unpacked into `/opt/chrome-headless-shell-linux-arm64` during the image build and selected with `PUPPETEER_EXECUTABLE_PATH`, so the first E2E run does not depend on a browser download. Its shared libraries and fonts (including Noto Sans CJK) come from AL2023 `dnf` packages, and the build fails if `ldd` reports a missing library. `tab.screenshot()` evidence is saved under `/home/vscode/workspace/.artifacts/screenshots` by default.
 
 Opening `/auth/login` only redirects to Cognito Managed Login; it does not call `RunMicrovm`. After a successful sign-in, `/session/select` lists running and suspended MicroVMs. The user explicitly chooses an existing session to connect or resume, or starts a new MicroVM. The chooser and control pages have a **Sign out** button (`POST /auth/logout`) that deletes the Edge session and ends the Cognito session. Temporary origin `502`/`504` responses preserve the browser's `mvm-session` association and return to the chooser instead of orphaning a live workspace.
 
@@ -109,6 +109,8 @@ The editor status bar contains **Suspend Cloud IDE**. It opens `/session/control
 
 Next to it, the status bar shows the remaining MicroVM lifetime (`残り H:MM`). The Edge passes a deadline in the `/run` hook payload, because a MicroVM cannot look up its own `startedAt`; the lifetime counts both RUNNING and SUSPENDED time. The item turns yellow at 30 minutes and red at 10 minutes, and a notification at 60, 15, and 5 minutes asks you to commit and push. MicroVMs started before this feature was deployed show `残り時間不明`.
 
+The status bar also shows the Git state of repositories under `~/workspace` (up to two levels deep), refreshed every 60 seconds, on save, and on window focus: `Git同期済み` when everything is committed and pushed, `未commit N / 未push M` (warning color, per-repository details in the tooltip) otherwise, and `Gitなし` when no repository exists; clicking opens Source Control. It is only a visual warning and does not block Terminate.
+
 While paused, regular editor requests are blocked at Lambda@Edge. Press **Resume editor** on the control page to resume explicitly. A suspended MicroVM incurs snapshot storage and snapshot operation charges, but no compute charge. The current idle policy also automatically suspends a session after five minutes without endpoint traffic and terminates it after eight suspended hours; an open code-server tab can generate traffic, so use the explicit button when you are finished for now.
 
 ## Terminate a session
@@ -117,7 +119,7 @@ Commit and push all workspace changes first; termination destroys the VM's local
 
 ## Implementation status
 
-The deployable personal-IDE path is implemented: Tokyo MicroVM image, CloudFront/Lambda@Edge access control, code-server, OMP, Bun/Node/Python/uv, GitHub CLI OAuth without PAT, AWS CLI, language servers, `ripgrep`, headless Chromium for OMP browser E2E, encrypted lifecycle persistence, explicit suspend/resume, and `cdkd` deployment.
+The deployable personal-IDE path is implemented: Tokyo MicroVM image, CloudFront/Lambda@Edge access control, code-server, OMP, Bun/Node/Python/uv, GitHub CLI OAuth without PAT, AWS CLI, language servers, `ripgrep`, Chrome for Testing headless shell for OMP browser E2E, encrypted lifecycle persistence, explicit suspend/resume, and `cdkd` deployment.
 
 The original design document is not implemented literally in these intentionally superseded areas:
 
@@ -125,7 +127,7 @@ The original design document is not implemented literally in these intentionally
 - GitHub Enterprise support was replaced by normal `github.com` OAuth using `gh auth login --web`.
 - The workspace remains MicroVM-local and ephemeral. Clone a repository after startup; authentication state persists, repository contents do not.
 
-OMP sign-in for Anthropic and OpenAI Codex and the code-server browser flow have been exercised. OpenCode Go login/model calls and a full private-repository clone/edit/test/push/PR workflow are still manual verification items. code-server and OMP are bumped to their latest releases on every `npm run deploy` (the code-server RPM SHA-256 is updated from the release asset digest); other base-image dependencies are pinned and updated manually. Every directly downloaded artifact (code-server, Node.js, Bun, GitHub CLI, AWS CLI, uv, ripgrep, Chromium) is verified against a pinned SHA-256; dnf packages, VS Code extensions, npm transitive dependencies, and the base image digest are not pinned. No scheduled deploy is configured.
+OMP sign-in for Anthropic and OpenAI Codex and the code-server browser flow have been exercised. OpenCode Go login/model calls and a full private-repository clone/edit/test/push/PR workflow are still manual verification items. code-server and OMP are bumped to their latest releases on every `npm run deploy` (the code-server RPM SHA-256 is updated from the release asset digest); other base-image dependencies are pinned and updated manually. Every directly downloaded artifact (code-server, Node.js, Bun, GitHub CLI, AWS CLI, uv, ripgrep, Chrome for Testing headless shell) is verified against a pinned SHA-256 (AWS CLI and Chrome for Testing publish no checksum, so theirs is trust-on-first-use); dnf packages, VS Code extensions, npm transitive dependencies, and the base image digest are not pinned. No scheduled deploy is configured.
 
 ## Deployed E2E test
 
