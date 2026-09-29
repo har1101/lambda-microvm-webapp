@@ -6,19 +6,23 @@ from __future__ import annotations
 import contextlib
 import fcntl
 import hashlib
+import hmac
+import http.client
 import json
 import os
 import re
 import shutil
+import socket
 import sqlite3
-import subprocess
 import sys
 import tempfile
 import threading
 import time
+import urllib.parse
 import urllib.request
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -39,7 +43,18 @@ LOCK_FILE = STATE_DIR / "auth-sync.lock"
 HOOK_BUDGET_SECONDS = {"run": 25.0, "suspend": 40.0, "terminate": 40.0}
 PERIODIC_BUDGET_SECONDS = 120.0
 MANUAL_BUDGET_SECONDS = 120.0
-AWS_CALL_TIMEOUT_SECONDS = 25.0
+S3_CALL_TIMEOUT_SECONDS = 25.0
+
+# S3 is called from this already-running process, not through the AWS CLI. The
+# root disk of a freshly booted MicroVM is read lazily at ~4 MB/s on first touch,
+# and one `aws` invocation reads >110 MB, so the CLI alone overran the 25 s run
+# hook budget and every restore timed out. Stdlib HTTP reads no new files.
+REGION = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION", "")
+S3_ENDPOINT = f"https://{BUCKET}.s3.{REGION}.amazonaws.com"
+IMDS_ENDPOINT = "http://169.254.169.254"
+CREDENTIAL_REFRESH_MARGIN_SECONDS = 300
+# The AWS CLI retried 5xx and dropped connections; keep that within the deadline.
+S3_ATTEMPTS = 3
 
 STATE_FILES = {
     "omp/agent.db": AGENT_DIR / "agent.db",
@@ -52,6 +67,8 @@ STATE_FILES = {
 hook_waiting = threading.Event()
 active_hooks = 0
 active_hooks_lock = threading.Lock()
+_credentials: dict | None = None
+_credentials_lock = threading.Lock()
 
 
 class SyncError(Exception):
@@ -78,36 +95,174 @@ def now_ms() -> int:
     return int(time.time() * 1000)
 
 
-def run_aws(deadline: Deadline, abort: threading.Event | None, *args: str) -> dict:
-    """Runs an AWS CLI call bounded by the deadline and returns its JSON output."""
-    timeout = min(AWS_CALL_TIMEOUT_SECONDS, deadline.remaining())
+def http_call(
+    url: str, method: str, headers: dict[str, str], body: bytes | None, timeout: float, register
+) -> tuple[int, dict[str, str], bytes]:
+    """One HTTP exchange; `register` receives the connection so a watchdog can cut it."""
+    parts = urllib.parse.urlsplit(url)
+    connection_class = http.client.HTTPSConnection if parts.scheme == "https" else http.client.HTTPConnection
+    connection = connection_class(parts.netloc, timeout=timeout)
+    register(connection)
+    try:
+        connection.request(method, parts.path or "/", body=body, headers=headers)
+        response = connection.getresponse()
+        return response.status, {name.lower(): value for name, value in response.getheaders()}, response.read()
+    finally:
+        connection.close()
+
+
+def bounded(deadline: Deadline, abort: threading.Event | None, action: Callable[[float, Callable], object]):
+    """Runs action(timeout, register) in a worker thread bounded by the deadline.
+
+    On timeout or abort the registered sockets are shut down, which unblocks the
+    worker, and the caller gets SyncError at once instead of waiting for it.
+    """
+    timeout = min(S3_CALL_TIMEOUT_SECONDS, deadline.remaining())
     if timeout < 1:
         raise SyncError("DeadlineExceeded")
-    with subprocess.Popen(
-        ["aws", *args, "--output", "json"],
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    ) as process:
-        end = time.monotonic() + timeout
-        while True:
-            try:
-                stdout, stderr = process.communicate(timeout=0.25)
-                break
-            except subprocess.TimeoutExpired:
-                if abort is not None and abort.is_set():
-                    process.kill()
-                    process.communicate()
-                    raise SyncError("Preempted") from None
-                if time.monotonic() >= end:
-                    process.kill()
-                    process.communicate()
-                    raise SyncError("Timeout") from None
-    if process.returncode != 0:
-        # AWS CLI errors read "An error occurred (Code) when calling ...".
-        match = re.search(r"\(([A-Za-z0-9]+)\)", stderr)
-        raise SyncError(match.group(1) if match else f"Exit{process.returncode}")
-    return json.loads(stdout or "{}")
+    connections: list[http.client.HTTPConnection] = []
+    outcome: dict = {}
+
+    def work() -> None:
+        try:
+            outcome["value"] = action(timeout, connections.append)
+        except BaseException as error:  # noqa: BLE001 - re-raised in the caller's thread
+            outcome["error"] = error
+
+    worker = threading.Thread(target=work, daemon=True)
+    worker.start()
+    end = time.monotonic() + timeout
+    while True:
+        worker.join(0.25)
+        if not worker.is_alive():
+            break
+        if abort is not None and abort.is_set():
+            code = "Preempted"
+        elif time.monotonic() >= end:
+            code = "Timeout"
+        else:
+            continue
+        for connection in connections:
+            if connection.sock is not None:
+                with contextlib.suppress(OSError):
+                    connection.sock.shutdown(socket.SHUT_RDWR)
+        raise SyncError(code)
+    if "error" in outcome:
+        error = outcome["error"]
+        if isinstance(error, socket.timeout):
+            raise SyncError("Timeout")
+        raise error
+    return outcome["value"]
+
+
+def instance_credentials(timeout: float, register) -> dict:
+    """Execution-role credentials from IMDSv2, cached until shortly before expiry."""
+    global _credentials
+    with _credentials_lock:
+        if _credentials and _credentials["expires"] - time.time() > CREDENTIAL_REFRESH_MARGIN_SECONDS:
+            return _credentials
+        status, _, token = http_call(
+            f"{IMDS_ENDPOINT}/latest/api/token",
+            "PUT",
+            {"X-aws-ec2-metadata-token-ttl-seconds": "300"},
+            None,
+            timeout,
+            register,
+        )
+        if status != 200:
+            raise SyncError("CredentialsUnavailable")
+        auth = {"X-aws-ec2-metadata-token": token.decode()}
+        base = f"{IMDS_ENDPOINT}/latest/meta-data/iam/security-credentials/"
+        status, _, roles = http_call(base, "GET", auth, None, timeout, register)
+        role = roles.decode().split("\n", 1)[0].strip()
+        if status != 200 or not role:
+            raise SyncError("CredentialsUnavailable")
+        status, _, document = http_call(base + role, "GET", auth, None, timeout, register)
+        if status != 200:
+            raise SyncError("CredentialsUnavailable")
+        try:
+            raw = json.loads(document)
+            expires = datetime.strptime(raw["Expiration"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+            _credentials = {
+                "access_key": raw["AccessKeyId"],
+                "secret_key": raw["SecretAccessKey"],
+                "token": raw["Token"],
+                "expires": expires.timestamp(),
+            }
+        except (ValueError, KeyError, TypeError):
+            raise SyncError("CredentialsUnavailable") from None
+        return _credentials
+
+
+def sigv4_headers(method: str, path: str, host: str, payload_hash: str, extra: dict[str, str], credentials: dict) -> dict:
+    """AWS Signature Version 4 for S3; every sent header except Content-Length is signed."""
+    amz_date = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    day = amz_date[:8]
+    headers = {name.lower(): value.strip() for name, value in extra.items()}
+    headers.update(
+        {
+            "host": host,
+            "x-amz-date": amz_date,
+            "x-amz-content-sha256": payload_hash,
+            "x-amz-security-token": credentials["token"],
+        }
+    )
+    names = sorted(headers)
+    signed_headers = ";".join(names)
+    canonical_headers = "".join(f"{name}:{headers[name]}\n" for name in names)
+    canonical_request = "\n".join([method, path, "", canonical_headers, signed_headers, payload_hash])
+    scope = f"{day}/{REGION}/s3/aws4_request"
+    string_to_sign = "\n".join(
+        ["AWS4-HMAC-SHA256", amz_date, scope, hashlib.sha256(canonical_request.encode()).hexdigest()]
+    )
+    key = ("AWS4" + credentials["secret_key"]).encode()
+    for part in (day, REGION, "s3", "aws4_request"):
+        key = hmac.new(key, part.encode(), hashlib.sha256).digest()
+    signature = hmac.new(key, string_to_sign.encode(), hashlib.sha256).hexdigest()
+    headers["authorization"] = (
+        f"AWS4-HMAC-SHA256 Credential={credentials['access_key']}/{scope}, "
+        f"SignedHeaders={signed_headers}, Signature={signature}"
+    )
+    return headers
+
+
+def s3_request(
+    deadline: Deadline,
+    abort: threading.Event | None,
+    method: str,
+    key: str,
+    body: bytes = b"",
+    headers: dict[str, str] | None = None,
+) -> tuple[dict, bytes]:
+    """GET/PUT one auth-state object; returns ({ETag, VersionId}, body) or raises SyncError(S3 code)."""
+    endpoint = urllib.parse.urlsplit(S3_ENDPOINT)
+    path = urllib.parse.quote(f"{endpoint.path.rstrip('/')}/{PREFIX}/{key}", safe="/-_.~")
+    payload_hash = hashlib.sha256(body).hexdigest()
+
+    def send(timeout: float, register) -> tuple[int, dict[str, str], bytes]:
+        credentials = instance_credentials(timeout, register)
+        signed = sigv4_headers(method, path, endpoint.netloc, payload_hash, headers or {}, credentials)
+        url = f"{endpoint.scheme}://{endpoint.netloc}{path}"
+        return http_call(url, method, signed, body if method == "PUT" else None, timeout, register)
+
+    for attempt in range(S3_ATTEMPTS):
+        last_attempt = attempt + 1 == S3_ATTEMPTS
+        try:
+            status, response_headers, payload = bounded(deadline, abort, send)
+        except (ConnectionError, http.client.HTTPException) as error:
+            if last_attempt:
+                raise SyncError(type(error).__name__) from None
+            time.sleep(0.2 * 2**attempt)
+            continue
+        except OSError as error:
+            raise SyncError(type(error).__name__) from None
+        if status < 300:
+            return {"ETag": response_headers.get("etag"), "VersionId": response_headers.get("x-amz-version-id")}, payload
+        if status < 500 or last_attempt:
+            match = re.search(rb"<Code>([A-Za-z0-9]+)</Code>", payload)
+            raise SyncError(match.group(1).decode() if match else f"HTTP{status}")
+        time.sleep(0.2 * 2**attempt)
+    raise AssertionError("unreachable")
 
 
 @contextlib.contextmanager
@@ -169,26 +324,18 @@ def restore_state(deadline: Deadline) -> None:
     def restore_file(item: tuple[str, Path]) -> tuple[str, dict | None, str | None]:
         key, target = item
         target.parent.mkdir(parents=True, exist_ok=True)
-        with tempfile.NamedTemporaryFile(dir=target.parent, delete=False) as tmp:
-            temp_path = Path(tmp.name)
+        temp_path: Path | None = None
         try:
-            meta = run_aws(
-                deadline,
-                None,
-                "s3api",
-                "get-object",
-                "--bucket",
-                BUCKET,
-                "--key",
-                f"{PREFIX}/{key}",
-                str(temp_path),
-            )
+            meta, data = s3_request(deadline, None, "GET", key)
+            with tempfile.NamedTemporaryFile(dir=target.parent, delete=False) as tmp:
+                temp_path = Path(tmp.name)
+                tmp.write(data)
             os.chmod(temp_path, 0o600)
             os.replace(temp_path, target)
             return key, {
                 "sha256": file_sha256(target),
-                "etag": meta.get("ETag"),
-                "versionId": meta.get("VersionId"),
+                "etag": meta["ETag"],
+                "versionId": meta["VersionId"],
             }, None
         except SyncError as error:
             if error.code == "NoSuchKey":
@@ -198,13 +345,14 @@ def restore_state(deadline: Deadline) -> None:
         except OSError as error:
             return key, None, type(error).__name__
         finally:
-            temp_path.unlink(missing_ok=True)
+            if temp_path is not None:
+                temp_path.unlink(missing_ok=True)
 
     with sync_lock(deadline):
         files: dict[str, dict] = {}
         failed: list[str] = []
         restored = 0
-        # Each subprocess shares the hook deadline, not its predecessor's
+        # Each request shares the hook deadline, not its predecessor's
         # remaining time. A slow first S3/KMS call cannot starve the other keys.
         with ThreadPoolExecutor(max_workers=len(STATE_FILES)) as pool:
             for key, record, error in pool.map(restore_file, STATE_FILES.items()):
@@ -258,26 +406,14 @@ def upload_file(
         digest = file_sha256(snapshot)
         if mode != "overwrite" and record.get("sha256") == digest:
             return "unchanged"
-        precondition: list[str] = []
+        precondition: dict[str, str] = {}
         if mode != "overwrite":
             if record.get("etag"):
-                precondition = ["--if-match", record["etag"]]
+                precondition = {"If-Match": record["etag"]}
             elif record.get("missing"):
-                precondition = ["--if-none-match", "*"]
+                precondition = {"If-None-Match": "*"}
         try:
-            meta = run_aws(
-                deadline,
-                abort,
-                "s3api",
-                "put-object",
-                "--bucket",
-                BUCKET,
-                "--key",
-                f"{PREFIX}/{key}",
-                "--body",
-                str(snapshot),
-                *precondition,
-            )
+            meta, _ = s3_request(deadline, abort, "PUT", key, snapshot.read_bytes(), precondition)
         except SyncError as error:
             # Only a failed precondition proves another writer won; a 409
             # ConditionalRequestConflict is transient and is retried next sync.

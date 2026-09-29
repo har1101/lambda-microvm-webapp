@@ -842,7 +842,7 @@ hookの期限は、Image定義のtimeout(`/run` 30秒、`/suspend`・`/terminate
 
 - `agent.db`は動作中のOMPが書き込んでいる可能性がある。そのままコピーすると壊れたDBを保存し得るため、Pythonの`sqlite3.Connection.backup()`で一時ファイルへ整合性のある複製を作ってからアップロードする。
 - 復元時は、対象と同じディレクトリの一時ファイルへダウンロードし、権限を`0600`にしてから`os.replace`で置き換える。途中で失敗しても既存ファイルを半端に上書きしない。
-- S3操作はAWS CLIの`aws s3api get-object`と`aws s3api put-object`で行い、応答のETagとVersionIdを記録する。`/run`では3つの`get-object`を並列に開始し、1つ目の遅延が後続ファイルの時間枠を奪わないようにする。各呼び出しは「25秒」と「共通deadlineまでの残り時間」の短い方でtimeoutし、全件が終わってから復元結果を記録する。保存の`put-object`は従来どおり逐次実行する。
+- S3操作は`lifecycle.py`の中からPython標準ライブラリで直接行う(IMDSv2で実行Roleの一時資格情報を取得し、SigV4で署名した`GetObject`/`PutObject`)。AWS CLIは使わない。起動直後のMicroVMのroot diskは未読blockを約4 MB/sで遅延読込し、`aws`は1回の実行で110 MB以上を読むため、CLIの起動だけで`/run`の25秒を使い切るからである。応答のETagとVersionIdを記録する。`/run`では3つの取得を並列に開始し、各呼び出しは「25秒」と「共通deadlineまでの残り時間」の短い方でtimeoutし、全件が終わってから復元結果を記録する。5xxと接続断はdeadline内で最大3回まで試す。保存の`PutObject`は従来どおり逐次実行する。
 - 保存の前に、複製したファイルのSHA-256を前回確認した値(復元時または前回保存時)と比べ、同じならアップロードしない。定期保存、hook、手動保存のどれでも同じである(`--overwrite`だけは比較せずに書く)。
 - fail-openにしている。hookは保存・復元の成否に関係なく必ず200を返し、MicroVMの起動・Suspend・終了を止めない。結果は`~/.cache/omp-cloud-ide/auth-sync.json`へ記録する(10.4節)。
 
@@ -852,7 +852,7 @@ hook serverのスレッド(hookと定期保存)と、別プロセスとして動
 
 - 定期保存はロックを待たない。使用中ならその回を飛ばす。
 - hookと手動保存は期限までロックを待つ。
-- hookがロックを待っている間、定期保存は新しく始まらず、実行中の定期保存はAWS CLIのプロセスをkillして中断する。定期的な処理のせいでSuspendやTerminateの保存が期限切れにならないようにするためである。
+- hookがロックを待っている間、定期保存は新しく始まらず、実行中の定期保存はS3との接続を切って中断する。定期的な処理のせいでSuspendやTerminateの保存が期限切れにならないようにするためである。
 - 複数のhookが同時に走った場合でも、実行中のhookの数を数え、最後のhookが終わるまで定期保存への中断の合図を消さない。
 
 #### 復元に失敗したとき
@@ -895,7 +895,7 @@ MicroVM実行時の`[lifecycle]`ログはCloudWatch Logsに届かない(9.5節)�
 全MicroVMが同じS3キーへ書き込むため、S3の条件付き書き込みによるETag楽観ロックで、古い状態を持つVMが他のVMの新しい状態を上書きしないようにしている。
 
 1. `/run`で、各objectのETagを記録する。objectがなければ「なし」と記録する。
-2. 保存では`put-object --if-match <ETag>`を使う。記録が「なし」なら`--if-none-match '*'`を使い、他のVMが先に作ったobjectを置き換えない。
+2. 保存では`PutObject`に`If-Match: <ETag>`を付ける。記録が「なし」なら`If-None-Match: *`を使い、他のVMが先に作ったobjectを置き換えない。
 3. 成功したら、応答の新しいETagを記録する。
 4. S3が412 `PreconditionFailed`を返したら、別のVMが先に書いたと判断し、そのキーを`conflicts`へ入れる。ステータスバーは`認証競合`になり、以後の自動保存はそのキーを飛ばす。
 5. 409 `ConditionalRequestConflict`は一時的な失敗として`failed`に入れ、次の保存で再試行する。
@@ -905,11 +905,11 @@ sequenceDiagram
     participant A as MicroVM A
     participant S as S3
     participant B as MicroVM B
-    A->>S: /run: get-object(ETag E1を記録)
-    B->>S: /run: get-object(ETag E1を記録)
-    B->>S: put-object --if-match E1
+    A->>S: /run: GetObject(ETag E1を記録)
+    B->>S: /run: GetObject(ETag E1を記録)
+    B->>S: PutObject If-Match: E1
     S-->>B: 200(新しいETag E2)
-    A->>S: put-object --if-match E1
+    A->>S: PutObject If-Match: E1
     S-->>A: 412 PreconditionFailed
     Note over A: conflictsへ追加<br/>ステータスバー「認証競合」<br/>自動保存はこのキーを飛ばす
 ```

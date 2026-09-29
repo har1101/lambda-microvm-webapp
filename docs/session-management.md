@@ -133,12 +133,12 @@ TerminateされたMicroVMのローカルディスクとRAM状態は戻せない�
 
 ### Suspend/Terminate時の認証状態保存
 
-`/suspend`と`/terminate` hookは、`lifecycle.py`が40秒のdeadline(Image側のhook timeoutは45秒)内でOMPとGitHubの認証ファイルをS3へ保存する。各AWS CLI呼び出しは`min(25秒, 残り時間)`で打ち切るため、S3/KMSが応答しなくてもhookがtimeoutを超えて止まることはない。
+`/suspend`と`/terminate` hookは、`lifecycle.py`が40秒のdeadline(Image側のhook timeoutは45秒)内でOMPとGitHubの認証ファイルをS3へ保存する。S3呼び出しは1回ごとに`min(25秒, 残り時間)`で打ち切るため、S3/KMSが応答しなくてもhookがtimeoutを超えて止まることはない。
 
-`/run`では3ファイルの`get-object`を共通25秒deadline内で並列実行する。旧実装の逐次実行では最初の取得が遅れると残り2件が`DeadlineExceeded`になった。ファイルごとの一時ファイル・原子的置換、`NoSuchKey`と実際の失敗の区別は変えていない。
+`/run`では3ファイルの`GetObject`を共通25秒deadline内で並列実行する。S3はAWS CLIではなく`lifecycle.py`のプロセス内から標準ライブラリで呼ぶ(IMDSv2の実行Role資格情報とSigV4)。起動直後のroot diskは未読blockを約4 MB/sで読み込み、CLIは1回で110 MB以上を読むため、CLI経由では3件とも`Timeout`になっていた。ファイルごとの一時ファイル・原子的置換、`NoSuchKey`と実際の失敗の区別は変えていない。
 
 - sha256が前回保存と同じファイルは送らない。
-- 保存は`aws s3api put-object`で、`/run`の復元時に記録したETagと一致するときだけ書くETag楽観ロックである(S3に未作成なら`--if-none-match '*'`)。別MicroVMがより新しい状態を書いていれば上書きせず、`認証競合`として記録する。
+- 保存は`PutObject`で、`/run`の復元時に記録したETagと一致するときだけ書くETag楽観ロックである(S3に未作成なら`If-None-Match: *`)。別MicroVMがより新しい状態を書いていれば上書きせず、`認証競合`として記録する。
 - `/run`で復元に失敗したkeyと競合したkeyは自動保存しない。未ログインのファイルでS3の正常な状態を上書きしないためである。
 - hookはfail-openで常に200を返し、失敗してもSuspend/Terminateを止めない。代わりに結果を`~/.cache/omp-cloud-ide/auth-sync.json`へ記録する。
 - 定期保存が実行中でも、hookが待っていれば定期保存のAWS呼び出しを中断してlockを譲らせる。

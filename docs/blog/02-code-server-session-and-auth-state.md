@@ -414,40 +414,46 @@ def sqlite_snapshot(source: Path, destination: Path) -> None:
 
 ```python:lifecycle.py
 # restore_file((key, target)) の抜粋。キーごとに別の一時ファイルを使う
-with tempfile.NamedTemporaryFile(dir=target.parent, delete=False) as tmp:
-    temp_path = Path(tmp.name)
 try:
-    meta = run_aws(deadline, None, "s3api", "get-object",
-                   "--bucket", BUCKET, "--key", f"{PREFIX}/{key}", str(temp_path))
+    meta, data = s3_request(deadline, None, "GET", key)
+    with tempfile.NamedTemporaryFile(dir=target.parent, delete=False) as tmp:
+        temp_path = Path(tmp.name)
+        tmp.write(data)
     os.chmod(temp_path, 0o600)
     os.replace(temp_path, target)
     return key, {"sha256": file_sha256(target),
-                 "etag": meta.get("ETag"), "versionId": meta.get("VersionId")}, None
+                 "etag": meta["ETag"], "versionId": meta["VersionId"]}, None
 except SyncError as error:
     if error.code == "NoSuchKey":
         return key, {"missing": True}, None
     return key, None, error.code
 finally:
-    temp_path.unlink(missing_ok=True)
+    if temp_path is not None:
+        temp_path.unlink(missing_ok=True)
 ```
 
-`aws s3 cp`ではなく`aws s3api get-object`を使っているのは、戻したオブジェクトのETagとVersionIdを記録するためです。ETagは後で書く楽観ロックに使います。
+`s3_request`は、戻したオブジェクトのETagとVersionIdも返します。ETagは後で書く楽観ロックに使います。
 
 `NoSuchKey`は初回起動なので正常です。それ以外の理由で復元できなかったファイルは`restoreFailed`に入れ、自動保存では送らないようにしています。復元に失敗したMicroVMのローカルファイルは未ログインの状態なので、それでS3の正しい認証情報を上書きしてしまわないためです。ログインし直して`persist-auth-state`を実行すると、この制限は外れます。このときはETagがわからないので、手動保存に限って無条件で書き込みます。
 
-旧実装ではこれを3ファイルに対して逐次呼び出し、先頭のS3取得が遅れると同じ25秒の期限を使い切って後続2ファイルが`DeadlineExceeded`になりました。先頭を遅延させた回帰テストで実機と同じ失敗の並びを再現したため、今は`ThreadPoolExecutor(max_workers=len(STATE_FILES))`で3件を同時に開始し、すべての結果が揃ってから`restoreFailed`を記録します。デプロイ後に起動した2台では3ファイルとも復元されましたが、元の実機失敗コードは記録されていなかったので、他のS3/KMSエラーまで防げるという意味ではありません。
+### AWS CLIをやめてS3を直接呼ぶ
+最初はAWS CLIの`aws s3api get-object`を3ファイル分逐次呼び出していて、先頭の取得が遅れると同じ25秒の期限を使い切り、後続2ファイルが`DeadlineExceeded`になりました。そこで3件を並列に始めるようにしましたが、code-server/OMPを更新した新Imageをデプロイした翌日、今度は3ファイルとも復元に失敗しました。
+
+遅かったのはS3ではなくAWS CLIの起動でした。起動直後のMicroVMのroot diskは、まだ読んでいないblockを約4 MB/sでしか読めません(同じVMで、未読の24 MBのファイルに5.9秒、2回目は0.05秒)。一方`aws s3api`は1回の実行で110 MB以上のファイルを読みます。CLIを起動するだけで25秒を超え、並列にした3プロセスは同じ未読ファイルを待つので一緒にtimeoutしていました。デプロイ直後の検証VMで成功したのは、Imageのblockがまだ温かったためだと考えています。
+
+今は`lifecycle.py`のプロセスの中から、Python標準ライブラリでS3を呼んでいます。資格情報はIMDSv2から実行Roleのものを取り、SigV4で署名した`GetObject`/`PutObject`を`http.client`で送ります。起動時に新しいファイルを読まないので、Imageの温まり具合に左右されません。実VMでは3ファイルの復元が0.27秒、読み込みは約1.3 MBでした。
 
 ## 保存の結果をステータスバーに出す
 最初の実装では、保存に失敗してもhook serverのログに出るだけでした。ところが調べてみると、実行中のMicroVMの標準出力(`[lifecycle]`の行)はCloudWatch Logsに届いていませんでした。Imageに設定したロググループに残るのは、Imageのbuildと検証のときの出力だけです。つまり、失敗しても誰も気づけない状態でした。
 
 そこで`lifecycle.py`は、復元と保存のたびに結果を`~/.cache/omp-cloud-ide/auth-sync.json`へ書き、自作拡張がそれをステータスバーに出すようにしました。普段は最後に保存できた時刻を`認証 N分前`と表示し、同期間隔の3倍(15分)より古いか記録がなければ警告色にします。失敗したときは`認証保存失敗`、`認証復元失敗`、`認証競合`をエラー色で出します。クリックすると`persist-auth-state`が動き、結果が通知で返ってきます。
 
-フック自体はfail-openのままです。`/run`は25秒、`/suspend`と`/terminate`は40秒の中で処理を終わらせ、AWS CLIの呼び出しも1回ごとに残り時間で打ち切ります。S3に届かなくてもフックは200を返すので、MicroVMの起動やSuspendが止まることはありません。定期保存、フック、手動保存は`flock`のロックで1つずつ動かし、フックが待っているときは定期保存の通信を打ち切ってフックを優先させます。
+フック自体はfail-openのままです。`/run`は25秒、`/suspend`と`/terminate`は40秒の中で処理を終わらせ、S3の呼び出しも1回ごとに残り時間で打ち切ります。S3に届かなくてもフックは200を返すので、MicroVMの起動やSuspendが止まることはありません。定期保存、フック、手動保存は`flock`のロックで1つずつ動かし、フックが待っているときは定期保存の通信を打ち切ってフックを優先させます。
 
 ## 複数のMicroVMからの書き込みはETagで守る
 すべてのMicroVMは同じS3のキーへ書き込みます。何もしないと、古い認証情報を持ったMicroVMが、別のMicroVMで更新されたばかりのOAuth tokenを上書きしてしまいます。
 
-そこでS3の条件付き書き込みで、ETag楽観ロックをかけました。`/run`で記録したETag(オブジェクトがなかった場合は「なし」)を使い、保存するときは`put-object --if-match <ETag>`、オブジェクトがなかったキーは`--if-none-match '*'`を付けます。成功したら新しいETagを覚えておきます。
+そこでS3の条件付き書き込みで、ETag楽観ロックをかけました。`/run`で記録したETag(オブジェクトがなかった場合は「なし」)を使い、保存するときは`PutObject`に`If-Match: <ETag>`、オブジェクトがなかったキーには`If-None-Match: *`を付けます。成功したら新しいETagを覚えておきます。
 
 S3が412(PreconditionFailed)を返したら、別のMicroVMが先に書いたということです。そのキーを`conflicts`に入れてステータスバーに`認証競合`を出し、以後の自動保存では送りません。409(ConditionalRequestConflict)は一時的な衝突なので、次の同期で再試行します。
 

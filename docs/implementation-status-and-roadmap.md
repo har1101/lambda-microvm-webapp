@@ -138,10 +138,10 @@ OMPとGitHubの認証状態はKMS暗号化されたS3へ保存される。ワー
 
 | 項目 | 状態 | 現状 |
 | --- | --- | --- |
-| OMP `agent.db`永続化 | 実装済み | SQLite backup API→`s3api put-object`。結果・VersionIdを`~/.cache/omp-cloud-ide/auth-sync.json`へ記録しstatus barに表示 |
+| OMP `agent.db`永続化 | 実装済み | SQLite backup API→S3 `PutObject`(lifecycle.pyから標準ライブラリで直接呼ぶ)。結果・VersionIdを`~/.cache/omp-cloud-ide/auth-sync.json`へ記録しstatus barに表示 |
 | OMP `install-id`永続化 | 実装済み | 他ファイルと同じdeadline・失敗記録の対象 |
 | GitHub CLI認証永続化 | 実装済み | `hosts.yml`→S3。保存結果をstatus barに表示 |
-| `/run`復元 | 実装・検証済み | 25秒の共通deadline内で3ファイルを並列取得し、atomic replace。1つの遅延が後続を期限切れにしない。NoSuchKeyは正常、その他の失敗は`restoreFailed`に記録してそのkeyの自動保存を止める。fail-openで200 |
+| `/run`復元 | 実装済み(新Imageの実機確認待ち) | 25秒の共通deadline内で3ファイルを並列取得し、atomic replace。AWS CLIを使わず、IMDSv2資格情報とSigV4でプロセス内から取得する。NoSuchKeyは正常、その他の失敗は`restoreFailed`に記録してそのkeyの自動保存を止める。fail-openで200 |
 | 5分定期保存 | 実装済み | ETag条件付き。sha256が前回保存と同じならskip。競合・復元失敗のkeyは自動保存しない。lockが使用中なら待たずにskipし、hookが待っていれば実行中のAWS呼び出しを中断して譲る |
 | `/suspend`保存 | 実装済み | 40秒deadline(hook timeout 45秒)でETag条件付き保存。失敗・競合は`auth-sync.json`へ記録し、Suspendを止めないfail-openで200。手動保存がlockを握っている間(最大約2分)は保存をskipし得る |
 | `/terminate`保存 | 実装済み | 同上 |
@@ -217,6 +217,8 @@ npm run diff             # deploy後は両Stack差分ゼロ
 
 その後、旧`/run`の先頭`get-object`を遅延させた回帰テストで、後続2ファイルが`DeadlineExceeded`になり、実機と同じ復元失敗の並びになることを再現した。3ファイルを共通deadline内で並列取得するImageをデプロイし、新規テストVMを2台連続で起動。両方で`auth-sync.json`の`restoreFailed=[]`、3ファイルのSHA-256記録、status barの`認証 0分前`、VM内からのS3取得成功を確認した。Suspend/Resume後も正常表示され、テストVMだけをTerminate・行削除し、既存VMは維持された。元の実機失敗のエラーコードは取得できていないため、同じ遅延が唯一の原因だったとは断定しない。
 
+2026-09-29、2026-09-28のdeploy(code-server 4.139.1/OMP 18.4.0の新Image v16)の翌日に起動したVMで、3ファイルすべてが`restoreFailed`になった。同じVMでは後からの`GetObject`は0.9秒で成功した。原因は起動直後のAWS CLIである。root diskの未読blockは約4 MB/sでしか読めず(24 MBの未読ファイルに5.9秒)、`aws s3api`は1回で110 MB以上を読むため、CLIの初回起動だけで25秒を超える。並列化した3プロセスは同じファイルを待つので同時に`Timeout`になる。`lifecycle.py`をAWS CLIから標準ライブラリのS3呼び出し(IMDSv2資格情報、SigV4)へ切り替え、同じVMの実execution roleと実bucketで、3ファイル復元0.27秒・読み込み約1.3 MB、ETag/VersionIdがCLIと一致、`If-None-Match`/`If-Match`の412、`NoSuchKey`を確認した。新Imageでの新規VM起動は未確認である。
+
 ### 3.3 手動利用確認
 
 - OMP起動
@@ -240,7 +242,7 @@ npm run diff             # deploy後は両Stack差分ゼロ
 - 強制的な異常終了後の最大損失時間確認
 - 2台の実MicroVMが同時にOAuth refreshする競合試験(条件付き書き込み自体は実行Roleと実bucketで確認済み)
 - 8時間上限到達後の新規VMへの認証復元
-- `/run`復元失敗の実機エラーコード取得と継続監視。後続が期限切れになる逐次取得は再現・修正済みだが、過去の実機失敗コードは残っていない。S3/KMS固有障害は依然として`restoreFailed`になり、該当keyの自動保存が止まる
+- `/run`復元失敗の実機エラーコード取得と継続監視。実行中VMのlogはCloudWatchへ届かないため、2026-09-29の全件失敗もコードは直接取得できていない(AWS CLIの初回起動時間から`Timeout`と推定)。S3/KMS固有障害は依然として`restoreFailed`になり、該当keyの自動保存が止まる
 - CloudFront/Lambda@Edgeのregional log横断調査
 - 残り寿命の60/15/5分通知と警告色の実機確認(実機で確認したのは開始直後とSuspend/Resume後の表示まで)
 - status bar項目のクリック(Suspend制御画面、手動保存、Source Control)の実ブラウザ操作。headless Chromiumでは文字glyphがほぼ描画されず、合成`element.click()`も効かないため自動化できていない
@@ -266,8 +268,9 @@ npm run diff             # deploy後は両Stack差分ゼロ
 
 次を実装した。
 
-- hookごとのdeadline(`/run` 25秒、`/suspend`・`/terminate` 40秒)。各AWS CLI呼び出しは`min(25秒, 残り時間)`で打ち切る
+- hookごとのdeadline(`/run` 25秒、`/suspend`・`/terminate` 40秒)。各S3呼び出しは`min(25秒, 残り時間)`で打ち切る
 - `/run`の3つのS3取得を並列化。遅い先頭取得に後続ファイルの時間を奪われないようにし、各ファイルの失敗隔離と共通25秒deadlineは維持する
+- S3はAWS CLIではなくlifecycle.pyのプロセス内から標準ライブラリで呼ぶ。起動直後の未読diskは約4 MB/sで、CLIの初回起動だけで`/run`の25秒を超えるため
 - fail-open policy: hookは常に200を返してRun/Suspend/Terminateを止めない。代わりに結果を`auth-sync.json`へ記録する
 - 手動command(`persist-auth-state`)は失敗ファイルがあれば非zeroで終了し、ファイルごとの結果を表示する
 - last-success、failed-files、restoreFailed、VersionId/ETagを`auth-sync.json`へ記録し、code-serverのstatus barに`認証 N分前`/`認証保存失敗`/`認証復元失敗`として表示する。クリックで手動保存

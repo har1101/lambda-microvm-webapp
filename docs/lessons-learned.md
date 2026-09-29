@@ -263,12 +263,14 @@ OMPが書き込み中の`agent.db`を単純に`cp`すると、不整合なスナ
 
 現在は次のように変えた。
 
-- hook全体にdeadlineを設ける。`/run`は25秒、`/suspend`と`/terminate`は40秒（Imageのhook timeoutは30/45秒）で、各AWS CLI呼び出しは`min(25秒, 残り時間)`で打ち切る。
+- hook全体にdeadlineを設ける。`/run`は25秒、`/suspend`と`/terminate`は40秒（Imageのhook timeoutは30/45秒）で、各S3呼び出しは`min(25秒, 残り時間)`で打ち切る。
 - hookはfail-openで常に200を返し、結果を`~/.cache/omp-cloud-ide/auth-sync.json`へ記録する。ステータスバーは通常`認証 N分前`を表示し、保存記録がないかsync間隔の3倍（15分）より古ければ警告、失敗時は`認証保存失敗`、`認証復元失敗`、`認証競合`を表示する。クリックすると`persist-auth-state`を実行し、結果を通知する。
 - `persist-auth-state`はファイルごとの結果を表示し、失敗があれば非0で終了する。
 - 定期sync、hook、手動保存は同じ`fcntl.flock`のlockを使う。定期syncはlockを待たずにその周期を飛ばし、hookがlockを待っているときは定期syncの実行中のAWS呼び出しを打ち切ってhookを優先する。
 - 復元でNoSuchKey（初回起動では正常）以外の失敗が起きたkeyは`restoreFailed`に入れ、自動保存の対象から外す。未認証のローカルファイルでS3上の正しい状態を上書きしないためである。再ログイン後の手動保存で解除する。
 - 起動時の復元は3ファイルを同じ25秒deadlineで逐次取得すると、先頭のS3/KMS呼び出しが遅れただけで後続が`DeadlineExceeded`になる。先頭を1.8秒遅延させ、全体を2.5秒とした回帰テストで後続2件だけが失敗することを再現した。`/run`の取得だけを並列化し、各ファイルの原子的な置換と失敗時の自動保存停止は維持する。
+- ただし並列化では直らなかった。2026-09-28のdeploy(code-server/OMP更新で新Image)の翌日に起動したVMでは、3ファイルすべてが`認証復元失敗`になった。遅かったのはS3ではなくAWS CLIの起動である。起動直後のMicroVMのroot diskは一度も読んでいないblockを約4 MB/sで読み込み(同じVMで24 MBの未読ファイルに5.9秒、2回目は0.05秒)、`aws s3api`は1回で110 MB以上(`rchar`、mmapした共有ライブラリを除く)を読む。CLIの初回起動だけで25秒を超え、3つの並列プロセスは同じ未読ファイルを待つため一緒に`Timeout`になる。逐次取得時代の「先頭だけ遅い」もこのCLI初回起動だったと考えられる。deploy直後の検証VMで成功したのは、Imageのblockがまだ温かったためと推定する（実行中VMのlogはCloudWatchへ届かないため、失敗コードは直接は確認できていない）。
+- 対策として、`lifecycle.py`はS3を自プロセス内から標準ライブラリで呼ぶ（IMDSv2の実行Role資格情報、SigV4署名、`http.client`）。起動時に新しいファイルを読まないので、Imageの温まり具合に左右されない。実VMでは3ファイルの復元が0.27秒、読み込みは約1.3 MBだった。教訓は、起動hookの処理時間を見積もるときは、ネットワークだけでなく「起動直後に初めて読むファイルの量」を数えることである。
 
 教訓は、「hookを失敗させない（fail-open）」ことと「結果を利用者が確認できる」ことを別々に設計することである。既知の制約として、手動保存がlockを保持している間（最大約2分）に来たSuspend hookは、待ちきれずに保存を飛ばすことがある。
 
@@ -520,9 +522,9 @@ Image buildやCloudFront更新を含むdeployは数分以上かかる。短いti
 - 残り時間の計算、閾値通知、`Date` headerによる時計補正
 - Edgeが`RunMicrovm`へ渡す終了時刻が実際の終了より遅くないこと
 - noncurrent version lifecycle rule
-- 認証状態保存（Pythonの`lifecycle_test.py`）: 初回のNoSuchKey、`restoreFailed`、ETagによる競合検出、sha256 skip、失敗記録、hook deadline、hookによる定期syncの打ち切り、`/run` hook本文のenvelope解析
+- 認証状態保存（Pythonの`lifecycle_test.py`）: 初回のNoSuchKey、`restoreFailed`、ETagによる競合検出、sha256 skip、失敗記録、hook deadline、hookによる定期syncの打ち切り、S3 5xxの再試行、IMDS資格情報の期限前更新、`/run` hook本文のenvelope解析。S3とIMDSv2はテスト内のHTTP serverで模擬し、実socketのtimeoutと切断を通す
 
-現在はJest 22件で、そのうち1件がPython unittestの`lifecycle_test.py`（11件）を実行する。新規起動の二重送信・補償、終了の二段階確認と曖昧な失敗、originへのCookie転送、先頭S3取得が遅い場合と1件だけtimeoutした場合の復元も確認する。
+現在はJest 22件で、そのうち1件がPython unittestの`lifecycle_test.py`（13件）を実行する。新規起動の二重送信・補償、終了の二段階確認と曖昧な失敗、originへのCookie転送、先頭S3取得が遅い場合と1件だけtimeoutした場合の復元も確認する。
 
 ### 11.2 CDK assertionの配列順に注意する
 
