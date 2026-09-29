@@ -424,6 +424,16 @@ Edge専用の`omp-cloud-ide-auth`と`mvm-session`は、認証後にcode-server�
 
 同一originのまま単純CSRF tokenだけを追加しても、同一originアプリがtokenを読めるため完全な境界にならない。
 
+実装設計(2026-09-29時点、未着手):
+
+- CloudFront Distributionを2つにする。control用(`/auth/*`、`/session/*`、Cognito callback/logout URL、access Cookie)とIDE用(MicroVMへのproxyと`/_handoff`だけ)。`*.cloudfront.net`はPublic Suffix Listに載っているため、2つの標準ドメインは別siteとして扱われ、Cookieは互いに届かない(custom domain不要)
+- 同じEdge関数を両方に関連付け、`distributionDomainName`でどちらの役割かを判定する。Lambda@Edgeは環境変数もStack出力も読めず、Distributionと関数Versionが循環参照になるため、2つのoriginは既存のCognito用SSM Parameter(`/omp-cloud-ide/cognito`)へ追加して実行時に読む
+- control側で新規起動・既存接続が成功したら、1回限りのhandoff code(32バイト乱数、60秒)を作り、auth tableへ`handoff#<SHA-256>`として`{sessionId, authKey}`を保存し、IDE側の`/_handoff?code=...`へ送る。IDE側は条件付き`DeleteItem`(`ReturnValues: ALL_OLD`)で消費し、IDE専用Cookie(不透明値、auth tableには`ide#<SHA-256>`で`{sessionId, authKey, expiresAt}`)を発行してから、200+meta refreshで`/`へ進める(`SameSite=Strict`のcross-site redirect問題を避ける既存callbackと同じ手法)
+- IDE側の各requestは`ide#`行を読み、参照先のaccess session行とsession行を並列に読む。access sessionが消えていれば(Sign out)拒否する。paused/terminationPendingならcontrol側`/session/control`へ302する
+- control側はproxyしない。`/`は`/session/select`へ送る。IDE側には状態変更routeを置かないため、`/proxy/<port>/`アプリからはcontrol Cookieを送れない(別site・`SameSite=Strict`)
+- run hookの`controlUrl`はcontrol側originにする(実行時注入は実装済み)。E2E(`scripts/e2e.mjs`)は2つのoriginとhandoffを扱うように更新する
+- 移行時は旧URLのbookmarkが制御画面へ届くよう、control側を既存Distributionに残し、IDE用を新設する
+
 #### 5.7.2 未信頼repository用の実行境界を作る
 
 Workspace Trustを再評価し、未知repoや依存install scriptを`yolo`で実行しない。必要に応じて次を導入する。
