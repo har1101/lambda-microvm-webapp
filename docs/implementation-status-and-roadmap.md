@@ -15,7 +15,7 @@
 ```text
 CloudFront URLを開く
   ↓
-Lambda@Edgeのログインフォーム
+Cognito Managed Loginでサインイン(パスワード + TOTP)
   ↓
 既存MicroVMを選ぶ / 新規MicroVMを開始
   ↓
@@ -49,31 +49,33 @@ OMPとGitHubの認証状態はKMS暗号化されたS3へ保存される。ワー
 | Lambda@Edge origin-request | 実装・検証済み | 認証、セッション管理、origin差し替え、token付与 |
 | Lambda@Edge origin-response | 実装・検証済み | 一時的`502`/`504`から選択画面へ復帰 |
 | DynamoDBセッションテーブル | 実装・検証済み | PAY_PER_REQUEST、TTL。選択画面は25件ずつ全ページScan |
-| Secrets Managerアクセスパスワード | 実装・検証済み | 32文字自動生成、Edgeが実行時取得 |
+| Cognito User Pool / Managed Login | 実装・検証済み | us-east-1、Essentials、管理者作成のみ、TOTP MFA必須、RETAIN・削除保護。Pool/Client IDはSSM Parameter、client secretは`DescribeUserPoolClient`でEdgeが実行時取得 |
+| DynamoDB認証セッションテーブル | 実装・検証済み | `omp-cloud-ide-auth-sessions`。PAY_PER_REQUEST、TTL、DESTROY。Cookieのハッシュだけを保存 |
 | S3認証状態Bucket | 実装・検証済み | KMS、Versioning、Block Public Access、RETAIN。非現行Version lifecycleあり。実行Roleと実bucketでETag条件付き書き込みを確認済み |
 | KMS Key rotation | 実装済み | rotation有効、RETAIN |
 | MicroVM CloudWatch Logs | 部分実装 | 専用Log Group、1週間保持、削除保護、RETAIN。ただし届くのはImage build/検証用VMの出力だけで、実行中MicroVMのstdout(`[lifecycle]`行など)は届かない |
 | Edge CloudWatch Logs | 部分実装 | 元Functionは731日保持・RETAIN、複製先regional logの保持/集約は未管理 |
 | カスタムドメイン/ACM | 未実装 | CloudFront標準ドメインを使用 |
-| WAF/レート制限 | 未実装 | ログイン試行制限なし |
+| WAF/レート制限 | 未実装 | WAFなし。パスワード試行はCognitoのロックアウトで制限 |
 | メトリクス/Alarm/Dashboard | 未実装 | 手動調査中心 |
 
 ### 2.2 認証とセキュリティ
 
 | 項目 | 状態 | 現状 |
 | --- | --- | --- |
-| MicroVM起動前のログイン | 実装・検証済み | Lambda@Edge HTMLフォーム |
-| ブラウザ互換性 | 実装・検証済み | ネイティブBasic認証依存を解消 |
-| 署名付きアクセスCookie | 実装・検証済み | HMAC-SHA256、8時間、改ざん/未来期限検証 |
+| MicroVM起動前のログイン | 実装・検証済み | Cognito Managed Login(authorization code + PKCE、state、nonce)。旧パスワードフォームとHTTP Basicは削除 |
+| ブラウザ互換性 | 実装・検証済み | ネイティブBasic認証ダイアログに依存しない。callbackは200+meta refreshで`SameSite=Strict` Cookieのループを回避 |
+| アクセスCookie | 実装・検証済み | 32バイト乱数の不透明値、8時間。DynamoDBにはSHA-256ハッシュと期限だけを保存し、期限切れ行はTTL削除前でも拒否 |
 | セッションCookie | 実装・検証済み | UUID参照、Secure/HttpOnly/SameSite=Strict |
-| SecretsのImage/Git混入防止 | 実装済み | パスワード・OAuth tokenはImageに入れない |
+| SecretsのImage/Git混入防止 | 実装済み | Cognito client secret・OAuth tokenはImageに入れない |
 | 非root実行 | 実装・検証済み | UID/GID 1000の`vscode` |
 | MicroVM実行Role最小化 | 実装・検証済み | 認証状態S3/bucket、KMS、ログに限定 |
-| Edge Role最小化 | 実装・検証済み | 対象Image、Role、Table、Secret等に限定 |
+| Edge Role最小化 | 実装・検証済み | 対象Image、Role、Table、SSM Parameter、User Pool等に限定 |
 | セキュリティヘッダー | 実装・検証済み | CSP、HSTS、nosniff、no-referrer等 |
-| MFA/ユーザー別認証 | 未実装 | 個人用固定username/password |
-| ログイン試行ロック | 未実装 | brute-force防止なし |
-| ログアウト/全Cookie失効UI | 未実装 | 手動Cookie削除またはパスワードrotation |
+| MFA | 実装・検証済み | CognitoのTOTP必須(SMSなし) |
+| ユーザー別認証・分離 | 部分実装 | Cognitoで利用者を識別するが単一利用者前提。sessionの`ownerSub`による所有者限定、利用者別S3 prefix・実行Roleはない |
+| ログイン試行ロック | 実装済み | Cognito組み込みのロックアウト(5回失敗後に指数的に待機、最大約15分) |
+| ログアウトUI | 実装・検証済み | 選択画面・制御画面の「Sign out」。Edgeセッション行を削除し、Cognitoセッションも終了 |
 | 状態変更request分離 | 未実装 | proxyアプリとcontrolが同一origin。SameSiteだけでは同一originコードを防げない |
 | Edge専用Cookieのorigin転送防止 | 実装・検証済み | access/session Cookieは認証後にorigin-requestから除去し、code-server固有Cookieを保持。実VMの`/proxy/3000/headers`でEdge Cookieが届かないことを確認 |
 | 未信頼repository隔離 | 未実装 | Workspace Trust無効、同一UIDからOAuth/AWS資格情報とInternet egressを利用可能 |
@@ -186,7 +188,7 @@ npm test -- --runInBand  # Jest 22 tests(Python lifecycle_test.py 11 testsを含
 npm run diff             # deploy後は両Stack差分ゼロ
 ```
 
-テスト内容は、IaC、IAM、Cookie署名、HTML escape、CSP、Suspend/Resume、502復旧、Image設定、Chromium、extensionなどを含む。Python側(`lifecycle_test.py`)は、初回復元の未作成object、復元失敗時の自動保存停止、別VMの新しい状態を上書きしないETag条件付き書き込み、sha256による未変更skip、保存失敗の記録、hook deadline、hookによる定期保存の中断、`/run` hook envelopeからの期限記録を確認する。Jest側は残り寿命のcountdown・通知閾値・時計補正と、Edgeが実際の期限より遅い`expiresAt`を渡さないことも確認する。
+テスト内容は、IaC、IAM、Cognitoサインイン・サインアウトとセッション検証、HTML escape、CSP、Suspend/Resume、502復旧、Image設定、Chromium、extensionなどを含む。Python側(`lifecycle_test.py`)は、初回復元の未作成object、復元失敗時の自動保存停止、別VMの新しい状態を上書きしないETag条件付き書き込み、sha256による未変更skip、保存失敗の記録、hook deadline、hookによる定期保存の中断、`/run` hook envelopeからの期限記録を確認する。Jest側は残り寿命のcountdown・通知閾値・時計補正と、Edgeが実際の期限より遅い`expiresAt`を渡さないことも確認する。
 
 ### 3.2 実ブラウザE2E
 
@@ -218,6 +220,12 @@ npm run diff             # deploy後は両Stack差分ゼロ
 その後、旧`/run`の先頭`get-object`を遅延させた回帰テストで、後続2ファイルが`DeadlineExceeded`になり、実機と同じ復元失敗の並びになることを再現した。3ファイルを共通deadline内で並列取得するImageをデプロイし、新規テストVMを2台連続で起動。両方で`auth-sync.json`の`restoreFailed=[]`、3ファイルのSHA-256記録、status barの`認証 0分前`、VM内からのS3取得成功を確認した。Suspend/Resume後も正常表示され、テストVMだけをTerminate・行削除し、既存VMは維持された。元の実機失敗のエラーコードは取得できていないため、同じ遅延が唯一の原因だったとは断定しない。
 
 2026-09-29、2026-09-28のdeploy(code-server 4.139.1/OMP 18.4.0の新Image v16)の翌日に起動したVMで、3ファイルすべてが`restoreFailed`になった。同じVMでは後からの`GetObject`は0.9秒で成功した。原因は起動直後のAWS CLIである。root diskの未読blockは約4 MB/sでしか読めず(24 MBの未読ファイルに5.9秒)、`aws s3api`は1回で110 MB以上を読むため、CLIの初回起動だけで25秒を超える。並列化した3プロセスは同じファイルを待つので同時に`Timeout`になる。`lifecycle.py`をAWS CLIから標準ライブラリのS3呼び出し(IMDSv2資格情報、SigV4)へ切り替え、同じVMの実execution roleと実bucketで、3ファイル復元0.27秒・読み込み約1.3 MB、ETag/VersionIdがCLIと一致、`If-None-Match`/`If-Match`の412、`NoSuchKey`を確認した。新Imageでの新規VM起動は未確認である。
+
+2026-09-29、Cognitoへの移行後のEdge Stackをデプロイし(`cdkd deploy OmpCloudIdeEdgeStack --exclusively`)、次を確認した。
+
+- curlで、未認証のHTMLナビゲーションは`/auth/login`へ302、非HTMLは401、`/session/control`は`target="_top"`のサインインリンク付き401、Cookieなしの`POST /auth/logout`は何も消さずに`/auth/signed-out`へ303、旧`/login`は`/auth/login`へ302になる。`/auth/login`はS256の`code_challenge`付きでCognitoの`/oauth2/authorize`へ302し、Cognitoはredirect_uriを受け付けてログイン画面へ進む。
+- 一時的な検証ユーザー(管理者作成、確認済み)で、実ブラウザからManaged Login→初回TOTP登録→callback→選択画面まで進み、`omp-cloud-ide-auth`は`SameSite=Strict`のままループしなかった。既存の稼働中MicroVMへ`Connect`し、code-server(`workspace - code-server`)が表示された。制御画面の`Sign out`でCognitoの`/logout`を経て`/auth/signed-out`へ戻り、access Cookieと`sess#`行が消え、再訪時はCognitoのログイン画面(資格情報の再入力)になった。検証ユーザーは削除した。
+- 同梱のSparticuz Chromiumでは描画できないため(5.9.1節)、このE2Eは一時的に展開したPlaywrightのarm64 Chromium(不足ライブラリとフォントをユーザー領域へ展開)で行い、検証後に削除した。
 
 ### 3.3 手動利用確認
 
@@ -360,7 +368,7 @@ main merge: prod Environment承認後にdeploy + E2E
 - MicroVM Image build failure Alarm
 - CloudFront 4xx/5xx率
 - セッション起動、Resume、Suspendのカスタムメトリクス
-- 認証失敗回数（パスワード値は記録しない）
+- 認証失敗回数（資格情報やCookie値は記録しない）
 - lifecycle sync失敗回数・last-success・failed-files・conflictsのmetric化(現在はVM内`auth-sync.json`とstatus barだけ)
 - 実行中MicroVMのログ取得経路(現状、runtime MicroVMのstdoutはCloudWatch Logsへ届かない)
 - regional Lambda@Edge logの保持/中央集約
@@ -392,17 +400,14 @@ Lambda@Edgeのログは実行リージョンへ分散し得るため、中央集
 
 ### P1: セキュリティを強化する
 
-#### 5.7 個人用パスワードをOIDCへ置き換える
+#### 5.7 個人用パスワードをOIDCへ置き換える(実装済み: Cognito Managed Login)
 
-候補はCognito Managed Loginまたは信頼できるOIDC IdPである。次が得られる。
+Cognito Managed LoginとEdge側セッションへ移行し、MFA(TOTP)、利用者識別(`sub`)、サーバー側のセッション失効(ログアウト)、ログイン試行のロックアウトを得た。
 
-- MFA
-- ユーザー識別
-- token失効
-- 監査
-- login rate limit
+2人目の利用者を追加する前に、次が残っている。現在のImageは共有の`personal/`認証状態(GitHub・LLMの資格情報)をすべてのMicroVMへ復元するため、これらなしに利用者を増やしてはいけない。
 
-単一利用者の簡潔さとのトレードオフがあるため、外部公開範囲と利用頻度で判断する。
+- session tableへ`ownerSub`を持たせ、一覧・接続・制御を所有者に限定する
+- 利用者別のS3 prefixと実行Role
 
 #### 5.7.1 control/auth originとIDE/proxy originを分離する
 
@@ -594,7 +599,7 @@ Lambdaは`/run`へ`{"microvmId": ..., "runHookPayload": "<RunMicrovmへ渡した
 
 ### Phase C: 複数利用・長期運用
 
-1. Cognito/OIDC
+1. 利用者別S3 prefix・実行Role
 2. user ownership付きsession table
 3. Query/GSI/pagination
 4. Auth Brokerまたは中央credential service

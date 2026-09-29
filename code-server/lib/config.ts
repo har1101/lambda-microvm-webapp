@@ -28,10 +28,15 @@ export const config = {
   },
   edge: {
     tableName: 'omp-cloud-ide-sessions',
-    accessSecretName: 'omp-cloud-ide/access-password',
-    basicAuthUsername: 'har1101',
+    authTableName: 'omp-cloud-ide-auth-sessions',
+    // Lambda@Edge cannot read stack outputs or environment variables, so the
+    // generated User Pool/Client IDs are published under this stable name.
+    cognitoParameterName: '/omp-cloud-ide/cognito',
+    cognitoDomainPrefix: `omp-cloud-ide-${ACCOUNT}`,
     accessCookieName: 'omp-cloud-ide-auth',
     accessCookieMaxAgeSec: 28800,
+    oauthCookieName: 'omp-cloud-ide-oauth',
+    loginTtlSec: 600,
     tokenDurationMin: 60,
     tokenRefreshThresholdMin: 15,
     maxDurationSec: 28800,

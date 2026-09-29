@@ -40,8 +40,8 @@
 
 ### 1.2 利用者から見た流れ
 
-1. CloudFrontのURLを開くと、Lambda@Edgeがログインフォームを返す。
-2. ユーザー名とパスワードでログインすると、セッション選択画面(`/session/select`)へ移動する。
+1. CloudFrontのURLを開くと、Lambda@EdgeがAmazon CognitoのManaged Loginへリダイレクトする。
+2. メールアドレス・パスワード・TOTP(認証アプリのワンタイムコード)でサインインすると、`/auth/callback`を経てセッション選択画面(`/session/select`)へ移動する。
 3. 選択画面で、既存のMicroVMへ接続するか、新しいMicroVMを起動するかを選ぶ。
 4. code-serverが開く。ターミナルで`omp`や`git`を使って開発する。
 5. 作業を中断するときは、code-serverのステータスバーにある`Suspend Cloud IDE`から制御画面を開き、Suspendする。
@@ -79,7 +79,9 @@
 | lifecycle hook | MicroVMの起動・再開・停止・終了時に、AWSがMicroVM内のHTTP serverへPOSTする仕組み。このシステムではport 9000で受ける |
 | Lambda@Edge | CloudFrontのリクエスト・レスポンスに割り込んで動くLambda。このシステムではorigin-requestとorigin-responseの2つを使う |
 | セッション | ブラウザと1台のMicroVMの対応関係。DynamoDBの1レコードで表す |
-| access Cookie | `omp-cloud-ide-auth`。ログイン済みであることを示す署名付きCookie |
+| access Cookie | `omp-cloud-ide-auth`。ログイン済みであることを示す不透明なランダム値のCookie。DynamoDBにはそのSHA-256ハッシュだけを保存する |
+| Cognito User Pool | `omp-cloud-ide`。利用者(1人)のID・パスワード・TOTPを管理するAmazon Cognitoのディレクトリ。サインイン画面はCognitoのManaged Loginを使う |
+| oauth Cookie | `omp-cloud-ide-oauth`。サインイン開始から`/auth/callback`までの間だけstate値を持つ短命Cookie |
 | session Cookie | `mvm-session`。どのセッション(MicroVM)へ接続するかを示すCookie。中身はDynamoDBのキーになるUUID |
 | paused | DynamoDBのフラグ。利用者が明示的にSuspendした状態を表し、trueの間はLambda@Edgeがエディタの通信を止める |
 | OMP | Oh My Pi。npmパッケージ`@oh-my-pi/pi-coding-agent`として配布されるコーディングエージェントCLI |
@@ -101,7 +103,9 @@ flowchart LR
         ORQ["Lambda@Edge<br/>origin-request"]
         ORS["Lambda@Edge<br/>origin-response"]
         DDB[("DynamoDB<br/>セッション表")]
-        SM[("Secrets Manager<br/>ログインパスワード")]
+        ADB[("DynamoDB<br/>認証セッション表")]
+        COG["Cognito User Pool<br/>Managed Login"]
+        SSM[("SSM Parameter<br/>/omp-cloud-ide/cognito")]
     end
 
     subgraph APNE1["ap-northeast-1 (MicroVM Stack)"]
@@ -121,8 +125,11 @@ flowchart LR
 
     B -- "HTTPS / WebSocket" --> CF
     CF --> ORQ
-    ORQ -- "Cookie検証・セッション取得" --> DDB
-    ORQ -- "パスワード取得" --> SM
+    B -- "サインイン(リダイレクト)" --> COG
+    ORQ -- "access Cookie検証" --> ADB
+    ORQ -- "セッション取得" --> DDB
+    ORQ -- "Pool/Client ID取得" --> SSM
+    ORQ -- "client secret取得<br/>code→token交換" --> COG
     ORQ -- "Run / Get / List / Suspend / Resume / Terminate<br/>CreateMicrovmAuthToken" --> API
     ORQ -- "origin差し替え<br/>Edge専用Cookie除去<br/>X-aws-proxy-auth付与" --> EP
     EP --> CS
@@ -139,10 +146,12 @@ flowchart LR
 | コンポーネント | 置き場所 | 責務 |
 | --- | --- | --- |
 | CloudFront | グローバル(Edge Stack) | ブラウザの唯一の入口。HTTPS化、セキュリティヘッダー付与、Lambda@Edgeの起動 |
-| Lambda@Edge origin-request | us-east-1で定義し各地で実行 | ログイン、Cookie検証、セッション選択、MicroVMの起動・一時停止・再開・終了、proxy tokenの発行と更新、origin差し替え |
+| Lambda@Edge origin-request | us-east-1で定義し各地で実行 | Cognitoとのサインイン処理(`/auth/*`)、access Cookie検証、セッション選択、MicroVMの起動・一時停止・再開・終了、proxy tokenの発行と更新、origin差し替え |
 | Lambda@Edge origin-response | 同上 | MicroVMが一時的に502/504を返したとき、HTML画面だけを選択画面へ戻す |
 | DynamoDB `omp-cloud-ide-sessions` | us-east-1 | セッションID、MicroVM ID、endpoint、proxy token、paused状態を保存する |
-| Secrets Manager `omp-cloud-ide/access-password` | us-east-1 | ログインパスワード。access Cookieの署名鍵も兼ねる |
+| DynamoDB `omp-cloud-ide-auth-sessions` | us-east-1 | サインイン途中のstate・nonce・PKCE verifier(`login#<state>`、10分)と、access Cookieのハッシュ(`sess#<hash>`、8時間)を保存する |
+| Cognito User Pool `omp-cloud-ide` / App client `omp-cloud-ide-edge` | us-east-1 | 利用者のパスワード・TOTP MFA・ロックアウトを管理し、Managed Loginでサインイン画面を出す。Edgeはauthorization code grantでID tokenを受け取る |
+| SSM Parameter `/omp-cloud-ide/cognito` | us-east-1 | 生成されたUser Pool IDとClient IDを公開する。Lambda@Edgeは環境変数を使えないため実行時に読む |
 | MicroVM Image `omp-cloud-ide` | ap-northeast-1 | code-server、OMP、開発ツール、hook serverを含む実行イメージ |
 | Lambda MicroVM | ap-northeast-1 | code-serverとOMPを動かす実行環境。1セッションにつき1台 |
 | lifecycle hook server | MicroVM内のport 9000 | code-serverのヘルスチェック、認証状態の復元・保存 |
@@ -157,13 +166,13 @@ CloudFrontに関連付けるLambda@Edgeは、`us-east-1`に置く必要がある
 | スタック | リージョン | 含むもの |
 | --- | --- | --- |
 | `OmpCloudIdeMicrovmStack` | `ap-northeast-1` | MicroVM Image、KMS Key、S3 Bucket、Log Group、Build Role、Execution Role |
-| `OmpCloudIdeEdgeStack` | `us-east-1` | CloudFront、Lambda@Edge 2つ、DynamoDB、Secrets Manager、Edge用IAM Role |
+| `OmpCloudIdeEdgeStack` | `us-east-1` | CloudFront、Lambda@Edge 2つ、DynamoDB 2表、Cognito User Pool・Managed Login、SSM Parameter、Edge用IAM Role |
 
 Edge StackはMicroVM Stackに依存する(`edgeStack.addStackDependency(microvmStack)`)。デプロイ時はMicroVM Stackが先に作られる。
 
 2スタック間でCDKのcross-region参照は使わない。`lib/config.ts`がアカウントIDと固定の名前からImage ARN、Execution Role ARN、Bucket名を組み立て、両スタックが同じ値を参照する。
 
-DynamoDBとSecrets ManagerをEdge側(`us-east-1`)に置いた理由は、Lambda@Edgeの処理のたびに呼ぶためである。
+DynamoDBとCognito(User Pool・SSM Parameter)をEdge側(`us-east-1`)に置いた理由は、Lambda@Edgeの処理のたびに呼ぶためである。
 
 ### 3.4 状態の置き場所
 
@@ -171,7 +180,7 @@ DynamoDBとSecrets ManagerをEdge側(`us-east-1`)に置いた理由は、Lambda@
 
 | 状態 | 内容 | 置き場所 | 寿命 |
 | --- | --- | --- | --- |
-| 利用者認証 | Cloud IDEを使ってよいブラウザか | access Cookie、Secrets Manager | 8時間 |
+| 利用者認証 | Cloud IDEを使ってよいブラウザか | access Cookie、DynamoDB認証セッション表(ハッシュのみ)、Cognito User Pool | 8時間 |
 | 接続先 | どのMicroVMへ接続するか | session Cookie、DynamoDB | 8時間(TTLは+1時間) |
 | MicroVM endpoint認証 | endpointへ通すためのtoken | DynamoDB(ブラウザには渡さない) | 60分、期限15分前から更新 |
 | OMP・GitHubの認証 | LLM providerとGitHubのOAuth情報 | MicroVMのローカルとS3 | MicroVMを越えて存続 |
@@ -184,7 +193,7 @@ DynamoDBとSecrets ManagerをEdge側(`us-east-1`)に置いた理由は、Lambda@
 
 ### 4.1 常駐サーバーを置かない
 
-- 決めたこと: CloudFront、Lambda@Edge、DynamoDB、S3、Secrets Managerというマネージドサービスだけで制御系を作る。computeはMicroVMだけにする。
+- 決めたこと: CloudFront、Lambda@Edge、DynamoDB、S3、Cognito、SSM Parameter Storeというマネージドサービスだけで制御系を作る。computeはMicroVMだけにする。
 - 理由: 個人用のIDEで常駐EC2やAuth Brokerを持つと、使わない時間の費用と運用(パッチ適用など)が大きい。
 - 受け入れたこと: 認証情報を一元管理するサーバーがないため、複数MicroVMが同じ認証情報を更新すると競合し得る。S3の条件付き書き込みで他のVMの新しい状態を上書きしないようにしているが、自動では統合しない(10.5節)。
 
@@ -192,7 +201,7 @@ DynamoDBとSecrets ManagerをEdge側(`us-east-1`)に置いた理由は、Lambda@
 
 - 決めたこと: ブラウザはCloudFrontのドメインだけを見る。MicroVM endpointとproxy tokenはDynamoDBに置き、Lambda@Edgeがリクエストごとに付ける。
 - 理由: proxy tokenはMicroVMへの鍵そのものであり、ブラウザに置くとJavaScriptやログから漏れる経路が増える。CloudFrontを唯一の入口にすると、ログイン判定も1か所に集まる。
-- 受け入れたこと: 通常のリクエストのたびにLambda@EdgeがDynamoDBを1回読む。
+- 受け入れたこと: 通常のリクエストのたびにLambda@EdgeがDynamoDBを読む。access Cookieの認証行とsession行の2件は`Promise.all`で並列に読むため、往復は1回分で済む。
 
 ### 4.3 code-serverの認証を無効にし、前段の2層で守る
 
@@ -224,11 +233,11 @@ DynamoDBとSecrets ManagerをEdge側(`us-east-1`)に置いた理由は、Lambda@
 - 理由: MicroVMは最大8時間の使い捨てなので、起動のたびにダウンロードすると時間がかかり、結果も毎回変わり得る。Imageはスナップショットから起動するため、事前に入れたツールは起動直後から使える。code-serverとOMPは更新が速く、変更内容を個別に確認する運用もしないため、deployごとに追従させる。
 - 受け入れたこと: ツールを更新するたびにImageの再buildが必要になる。code-serverとOMPは、互換性のない版が出てもdeploy時にそのまま入る。deployしない限り更新されない。
 
-### 4.8 Cognitoを使わず、パスワードフォームとHMAC Cookieにする
+### 4.8 Cognito Managed LoginとEdge側セッションで利用者認証する
 
-- 決めたこと: Secrets Managerの自動生成パスワードでログインし、HMAC署名付きCookieを発行する。
-- 理由: 利用者は1人であり、ユーザー管理やMFAより構成の小ささを優先した。
-- 受け入れたこと: MFA、ユーザー識別、ログイン試行回数の制限、個別のログアウトがない。複数人で使う段階でCognitoなどのOIDCへ移行する。
+- 決めたこと: 利用者認証はAmazon Cognito User PoolのManaged Login(メールアドレス、パスワード、TOTP MFA必須)に任せる。Lambda@EdgeはOIDCのauthorization code grant(PKCE、state、nonce)でID tokenを受け取り、`aws-jwt-verify`で検証したらtokenを捨て、自前の不透明なaccess Cookieを発行する。Cookieのハッシュだけを8時間の期限付きでDynamoDBに置く。
+- 理由: 以前はSecrets Managerの自動生成パスワードとHMAC署名付きCookieを使っていたが、MFA、ログイン試行回数の制限、サーバー側で取り消せるログアウトがなかった。Cognitoはパスワード保管、TOTP、ロックアウトを提供し、利用者1人ならEssentialsの無料枠(10,000 MAU)に収まる。tokenをブラウザへ渡さずEdge側セッションにすると、Cookieを失効させる手段(行の削除)がサーバー側に残り、token更新の処理も要らない。
+- 受け入れたこと: 通常のリクエストごとに認証行のDynamoDB読み取りが増える(session行と並列に読むので往復は増えない)。Lambda@Edgeは環境変数を使えないため、生成されたPool/Client IDはSSM Parameterから、client secretは`DescribeUserPoolClient`から実行時に取得する(5分キャッシュ)。セッションはCognitoの`sub`に紐づけておらず、全MicroVMが共有の`personal/`認証状態を復元するため、2人目の利用者を追加する前に利用者ごとのセッション所有とS3 prefix・実行Roleの分離が必要になる。
 
 ### 4.9 通常のGitHubにGitHub CLIのOAuthで接続する
 
@@ -255,7 +264,11 @@ MicroVM ImageにはCDKのL2 Constructがまだないため、`cdk.CfnResource`�
 
 | リソース | 名前 | 主な設定 | 削除時 |
 | --- | --- | --- | --- |
-| Secrets Manager Secret | `omp-cloud-ide/access-password` | 32文字、記号なし | 削除 |
+| Cognito User Pool | `omp-cloud-ide` | Essentials、自己サインアップ無効、メールでサインイン、TOTP MFA必須(SMSなし)、パスワード14文字以上(大文字・小文字・数字)、復旧はメールのみ、削除保護 | 残す(RETAIN) |
+| Cognito Domain・Managed Login Branding | `omp-cloud-ide-<account>.auth.us-east-1.amazoncognito.com` | Managed Login v2、Cognito既定のスタイル | 削除 |
+| Cognito App client | `omp-cloud-ide-edge` | client secretあり、authorization code grantのみ、scope `openid`・`email`、callback `/auth/callback`、logout `/auth/signed-out`、ID/access token 5分、refresh token 60分(いずれも最小値) | 削除 |
+| SSM Parameter | `/omp-cloud-ide/cognito` | String。`{userPoolId, clientId}` | 削除 |
+| DynamoDB Table | `omp-cloud-ide-auth-sessions` | パーティションキー`id`、オンデマンド、TTL属性`ttl` | 削除 |
 | DynamoDB Table | `omp-cloud-ide-sessions` | パーティションキー`sessionId`、オンデマンド、TTL属性`ttl` | 削除 |
 | IAM Role(Edge) | 自動命名 | 11.1節 | 削除 |
 | Lambda(origin-request) | 自動命名 | Node.js 24、256MiB、30秒 | 関数は削除、公開Versionは残す |
@@ -271,17 +284,17 @@ Lambda@Edgeの公開VersionをRETAINにしている理由は、CloudFrontが各�
 | --- | --- | --- |
 | origin | `example.com`(ダミー) | CDKがoriginの指定を必須とするため。実際の通信先はLambda@Edgeが差し替える |
 | Viewer protocol | HTTPをHTTPSへリダイレクト | 平文を許さない |
-| 許可メソッド | ALLOW_ALL | ログインフォームやSuspendのPOST、code-serverのAPIを通す |
+| 許可メソッド | ALLOW_ALL | サインアウトやSuspendのPOST、code-serverのAPIを通す |
 | Cache policy | CachingDisabled | すべてが利用者ごとの動的な応答であるため |
 | Origin request policy | AllViewerExceptHostHeader | Cookie、WebSocket関連ヘッダーをoriginへ渡す。HostはLambda@Edgeが設定する |
 | HTTP version | HTTP/2とHTTP/3 | ブラウザとの通信を効率化する |
 | Price class | PriceClass_200 | 日本を含むエッジを使う |
-| origin-request | `includeBody: true` | ログインフォームと選択画面のPOST本文を読む |
+| origin-request | `includeBody: true` | 選択画面・制御画面のPOST本文を読む |
 | origin-response | `includeBody: false` | ステータスコードとヘッダーだけを見る |
 
 ### 5.4 削除時の挙動が非対称であること
 
-`npm run destroy`を実行すると、S3、KMS、MicroVMのLog Group、Lambda@EdgeのVersionは残る一方、DynamoDBとSecretは消える。生きているMicroVMがある状態でdestroyすると、DynamoDBの対応関係を失い、そのMicroVMへ再接続できなくなる。Secretを作り直すとパスワードが変わり、既存のaccess Cookieもすべて無効になる。destroyの前に、稼働中のMicroVMを終了させておく。
+`npm run destroy`を実行すると、S3、KMS、MicroVMのLog Group、Lambda@EdgeのVersion、Cognito User Pool(削除保護あり)は残る一方、DynamoDBの2表は消える。生きているMicroVMがある状態でdestroyすると、DynamoDBの対応関係を失い、そのMicroVMへ再接続できなくなる。認証セッション表が消えると、すべてのブラウザのサインインも失われる。User Poolと利用者は残るので、再デプロイ後は同じアカウントでサインインし直せる。destroyの前に、稼働中のMicroVMを終了させておく。
 
 ## 6. Lambda@Edgeのリクエスト処理
 
@@ -291,16 +304,16 @@ Lambda@Edgeの公開VersionをRETAINにしている理由は、CloudFrontが各�
 
 ```mermaid
 flowchart TD
-    A["リクエスト受信"] --> B{"URIは/login?"}
-    B -- Yes --> L["ログイン処理<br/>GET: フォーム表示<br/>POST: 認証してaccess Cookie発行"]
-    B -- No --> C{"access Cookieまたは<br/>Basic認証が有効?"}
-    C -- No --> R1["302 /login"]
+    A["リクエスト受信"] --> B{"URIは/auth/*?"}
+    B -- Yes --> L["サインイン処理(7.2節)<br/>login / callback / logout / signed-out"]
+    B -- No --> F["DynamoDB GetItemを並列実行(強い整合性)<br/>認証行 sess#&lt;hash&gt; と session行"]
+    F --> C{"access Cookieの認証行があり<br/>期限内?"}
+    C -- No --> R1["HTML遷移: 302 /auth/login<br/>制御系URI: 401画面(target=_top)<br/>それ以外: 401"]
     C -- Yes --> D{"URIは/session/select?"}
     D -- Yes --> SEL["選択画面の表示・処理"]
     D -- No --> E{"session Cookieあり?"}
     E -- No --> R2["制御系URIなら<br/>セッションなしの制御画面<br/>それ以外は302 /session/select"]
-    E -- Yes --> F["DynamoDB GetItem<br/>(強い整合性)"]
-    F --> G{"レコードあり?"}
+    E -- Yes --> G{"session行あり?"}
     G -- No --> R3["session Cookieを消して<br/>302 /session/select"]
     G -- Yes --> H{"制御系URI?<br/>control / suspend / resume"}
     H -- Yes --> CTRL["制御画面・Suspend・Resume"]
@@ -317,8 +330,10 @@ flowchart TD
 
 | URI | メソッド | ログイン要否 | 処理 |
 | --- | --- | --- | --- |
-| `/login` | GET, HEAD | 不要 | ログインフォームを返す。MicroVMは起動しない |
-| `/login` | POST | 不要 | ユーザー名とパスワードを照合し、成功ならaccess Cookieを付けて`/session/select`へ303 |
+| `/auth/login` | GET, HEAD | 不要 | state・nonce・PKCE verifierを作って`login#<state>`行に保存し、oauth Cookieを付けてCognitoの`/oauth2/authorize`へ302。MicroVMは起動しない |
+| `/auth/callback` | GET | 不要 | stateとoauth Cookieを照合し、codeをtokenへ交換してID tokenを検証する。成功ならaccess Cookieを付けて`/session/select`へ遷移する200画面を返す(7.2節) |
+| `/auth/logout` | POST | 不要 | `sess#`行を削除してaccess Cookieを失効させ、Cognitoの`/logout`へ303。Cognitoの設定を取得できなければ、Cognito側のセッションが残る旨を示す502画面を返す。access Cookieがなければ何も変えずに`/auth/signed-out`へ303 |
+| `/auth/signed-out` | GET | 不要 | access Cookieがなければサインアウト完了画面(サインインへのリンク付き)を返す。access Cookieが残っていれば`/session/select`へ302し、通常の認証判定に任せる |
 | `/session/select` | GET, HEAD | 必要 | 既存セッションの一覧と新規作成ボタンを表示する |
 | `/session/select` | POST `action=new` | 必要 | MicroVMを新規起動する(8.3節) |
 | `/session/select` | POST `action=attach` | 必要 | 指定セッションへ接続し、必要ならResumeする(8.4節) |
@@ -329,7 +344,7 @@ flowchart TD
 | `/session/resume` | POST | 必要 | Resumeして`paused=false`に戻す(8.5節) |
 | 上記以外 | すべて | 必要 | session CookieをもとにMicroVMのcode-serverへ中継する |
 
-Lambda@Edgeが自分で返す画面(ログイン、選択、制御、起動中、再開中)には、すべて`Cache-Control: no-store`を付ける。起動中画面を除く画面には、厳しいCSPも付ける(7.5節)。
+Lambda@Edgeが自分で返す画面(サインイン関連、選択、制御、起動中、再開中)には、すべて`Cache-Control: no-store`を付ける。起動中画面を除く画面には、厳しいCSPも付ける(7.5節)。
 
 ### 6.3 originの差し替え
 
@@ -350,7 +365,7 @@ request.origin = {
 request.headers.host = [{ key: 'Host', value: host }];
 request.headers['x-aws-proxy-auth'] = [{ key: 'X-aws-proxy-auth', value: token }];
 request.headers.origin = [{ key: 'Origin', value: `https://${host}` }];
-// access/session Cookieは認証判定後に取り除き、code-server固有Cookieは保持する。
+// access/oauth/session Cookieは認証判定後に取り除き、code-server固有Cookieは保持する。
 stripEdgeCookies(request.headers);
 ```
 
@@ -376,7 +391,7 @@ code-serverのWebSocketも同じ経路を通る。WebSocketは最初にHTTPのup
 
 Lambda@Edgeは環境変数を使えない。そこで、CDKのsynth時に`OmpCloudIdeEdgeStack`が`artifact/edge/config.json`を書き出し、関数のコードと一緒にバンドルする。
 
-`config.json`に入れるのは、リージョン、テーブル名、Image ARN、Role ARN、Secretの名前、Cookie名、各種の秒数など、秘密でない値だけである。パスワードは実行時にSecrets Managerから取得する。CDKのtoken(未解決の値)を書き込むとアセットのハッシュが安定しないため、固定の名前を使う。
+`config.json`に入れるのは、リージョン、テーブル名(認証セッション表を含む)、Image ARN、Role ARN、CognitoのリージョンとドメインとSSM Parameter名、Cookie名、各種の秒数など、秘密でない固定値だけである。CDKのtoken(未解決の値)を書き込むとアセットのハッシュが安定しないため、固定の名前を使う。CloudFormationが生成するUser Pool IDとClient IDは、SSM Parameter `/omp-cloud-ide/cognito`(`{userPoolId, clientId}`)に書き、Lambda@Edgeが実行時に読む。CloudFormationはClient secretを返せないため、secretは`cognito-idp:DescribeUserPoolClient`で取得する。どちらも実行環境ごとに5分キャッシュする。
 
 `config.json`は生成物であり、Gitで管理しない。
 
@@ -393,51 +408,70 @@ flowchart LR
 
 | 層 | 誰が検証するか | 何を検証するか | ブラウザが持つか |
 | --- | --- | --- | --- |
-| ① 利用者認証 | Lambda@Edge | access Cookieの署名と期限 | 持つ |
+| ① 利用者認証 | Lambda@Edge(サインインはCognito) | access Cookieのハッシュに対応するDynamoDB行の存在と期限 | 持つ(ランダム値だけ) |
 | ② MicroVM endpoint認証 | AWS(MicroVM endpoint) | proxy tokenの対象MicroVM、port、期限 | 持たない |
 
 ### 7.2 第1層: 利用者認証
 
-#### ログインの流れ
+#### サインインの流れ
 
 ```mermaid
 sequenceDiagram
     participant B as ブラウザ
     participant E as Lambda@Edge
-    participant S as Secrets Manager
-    B->>E: GET /login
-    E-->>B: ログインフォーム(HTML)
-    B->>E: POST /login (username, password)
-    E->>S: GetSecretValue(5分キャッシュ)
-    S-->>E: パスワード
-    E->>E: timingSafeEqualで照合
-    E-->>B: 303 /session/select + access Cookie
+    participant D as DynamoDB(認証セッション表)
+    participant C as Cognito
+    B->>E: GET /auth/login
+    E->>D: PutItem login#<state> (nonce, PKCE verifier, 10分)
+    E-->>B: 302 /oauth2/authorize (S256) + oauth Cookie(state)
+    B->>C: Managed Login(メール、パスワード、TOTP)
+    C-->>B: 302 /auth/callback?code&state
+    B->>E: GET /auth/callback + oauth Cookie
+    E->>D: DeleteItem login#<state>(条件付き、1回限り)
+    E->>C: POST /oauth2/token (Basic client認証 + code_verifier)
+    C-->>E: ID token
+    E->>E: aws-jwt-verifyで検証、nonce照合、tokenは破棄
+    E->>D: PutItem sess#<hash> (sub, 8時間)
+    E-->>B: 200 (meta refresh → /session/select) + access Cookie
 ```
 
-ログインが成功しても、Lambda@Edgeは`RunMicrovm`を呼ばない。
+サインインが成功しても、Lambda@Edgeは`RunMicrovm`を呼ばない。
 
-#### access Cookieの仕様
+callbackで302ではなく200のHTMLを返す理由: 302で返すとCognitoからのクロスサイトなリダイレクトの連鎖が続き、ブラウザはその次のリクエストに`SameSite=Strict`のaccess Cookieを付けない。その結果`/session/select`が未ログイン扱いになり、サインインがループする。同一サイトの画面から`<meta http-equiv="refresh">`で遷移すればCookieが送られる。
 
-| 項目 | 内容 |
-| --- | --- |
-| 名前 | `omp-cloud-ide-auth` |
-| 値 | `<有効期限のUNIX秒>.<署名>` |
-| 署名 | HMAC-SHA256。鍵はログインパスワード、入力は`omp-cloud-ide:<有効期限>`、出力はbase64url |
-| 寿命 | 8時間(`Max-Age=28800`) |
-| 属性 | `Path=/; Secure; HttpOnly; SameSite=Strict` |
+#### Cookieの仕様
 
-Lambda@Edgeは次の順で検証する。
+| 項目 | access Cookie | oauth Cookie |
+| --- | --- | --- |
+| 名前 | `omp-cloud-ide-auth` | `omp-cloud-ide-oauth` |
+| 値 | 32バイトの乱数(base64url) | state |
+| 寿命 | 8時間(`Max-Age=28800`) | 10分(`Max-Age=600`) |
+| 属性 | `Path=/; Secure; HttpOnly; SameSite=Strict` | `Path=/auth/callback; Secure; HttpOnly; SameSite=Lax` |
+| サーバー側 | `sess#<base64url(SHA-256(値))>`行(sub、createdAt、expiresAt) | `login#<state>`行(nonce、PKCE verifier、expiresAt) |
 
-1. 値を最初の`.`で分け、有効期限を整数として読む。
-2. 有効期限が現在時刻より前なら拒否する。
-3. 有効期限が「現在時刻 + 8時間 + 60秒」より先なら拒否する。署名が正しくても、設定より長い寿命のCookieは受け付けない。
-4. 署名を再計算し、`timingSafeEqual`で比較する。
+oauth Cookieは、Cognitoからのトップレベルのリダイレクトでcallbackへ届く必要があるため`SameSite=Lax`にしている。
 
-パスワードそのものはCookieに入らない。パスワードを変更すると署名鍵も変わるため、発行済みのaccess Cookieはすべて無効になる。Lambda@Edgeはパスワードを実行環境ごとに5分間キャッシュするので、変更直後は最大5分の移行時間がある。
+callbackでは次を確認する。
 
-#### Basic認証を残している理由
+1. クエリの`state`がoauth Cookieの値と一致する。
+2. `login#<state>`行を条件付きで削除でき(1回限り)、期限内である。
+3. codeをCognitoの`/oauth2/token`でtokenへ交換する(client IDとclient secretを`Authorization: Basic`ヘッダーで送るclient認証と、PKCEの`code_verifier`)。
+4. ID tokenを`aws-jwt-verify`で検証する(署名、`iss`、`aud`、`token_use=id`、`exp`)。
+5. ID tokenの`nonce`が保存したnonceと一致する。
 
-ブラウザ向けにはHTMLフォームを使う。以前はHTTP Basic認証のダイアログを使っていたが、一部の埋め込みブラウザでダイアログが一瞬で閉じる問題があり、フォームへ移行した。`Authorization: Basic`ヘッダーは、ブラウザ以外からの疎通確認用に今も受け付ける。Lambda@Edgeは検証後にこのヘッダーを削除してから転送する。
+通常のリクエストでは、access Cookieのハッシュで`sess#`行を強い整合性で読み、行があり`expiresAt`が未来のときだけ通す。TTLによる削除は遅れることがあるため、期限切れの行はTTL削除前でも拒否する。DynamoDBにはCookieのハッシュしか置かないため、表を読めてもCookieは再現できない。Cognitoのtokenはブラウザにも表にも保存しない。
+
+未認証のとき、HTML遷移は`/auth/login`へ302、XHRやWebSocketなど非HTMLは401を返す。code-serverのタブ内のframeで開く`/session/control`・`/session/suspend`・`/session/resume`は、Cognitoがframe内表示を拒否するため、`target="_top"`で`/auth/login`へ移るリンク付きの401画面を返す。
+
+パスワード試行の制限はCognito組み込みのロックアウト(5回失敗後に指数的に待ち時間が伸び、最大約15分)が担う。
+
+#### サインアウト
+
+選択画面と制御画面の「Sign out」フォーム(`target="_top"`)は`POST /auth/logout`を送る。Lambda@Edgeは`sess#`行を削除してaccess Cookieを失効させ、Cognitoの`/logout`へ303で送ってManaged Loginのセッションも終わらせる。戻り先は`/auth/signed-out`である。SSMやCognitoの障害でlogout先を組み立てられない場合は、Cloud IDEのセッションは消えたがCognitoのセッションが残る(次回は資格情報なしでサインインし得る)ことを502画面で示し、完了とは表示しない。access CookieのないPOST(クロスサイトからの偽造を含む)は何も変更せず`/auth/signed-out`へ送るだけにする。`/auth/signed-out`はaccess Cookieを持つブラウザには完了画面を出さず、`/session/select`へ送る。
+
+User Poolの利用者は全員が全MicroVMと共有の認証状態へアクセスできる(Poolへの所属が認可の境界)。Cognitoで利用者を無効化・パスワード変更しても発行済みのEdgeセッション(最長8時間)は残るため、即時に失効させるときは`admin-user-global-sign-out`と`sess#`行の削除を行う(手順は`code-server/README.md`のOperations)。
+
+以前のHTTP Basic認証とパスワードフォーム(`/login`)は削除した。
 
 ### 7.3 第2層: MicroVM endpoint認証
 
@@ -473,10 +507,10 @@ CloudFrontのResponse Headers Policyが、すべての応答に次を付ける�
 - `X-XSS-Protection: 1; mode=block`
 - code-serverが動く範囲のCSP(`override: false`なので、code-serverが自分のCSPを返した場合はそちらを優先する)
 
-Lambda@Edgeが自分で返すログイン画面、選択画面、制御画面には、さらに厳しいCSPを付ける。再開中画面は`form-action`を除いた同等のCSPを付ける。新規起動時の起動中画面(`startSession`の応答)には、Lambda@Edge側ではCSPを付けていない。
+Lambda@Edgeが自分で返す選択画面、制御画面には、さらに厳しいCSPを付ける。サインアウトのフォームがCognitoの`/logout`へ遷移するため、`form-action`にCognitoのドメインを加えている。サインイン関連の画面(callback後の遷移画面、サインアウト完了画面など)と再開中画面は、`form-action`を除いた同等のCSPを付ける。制御系URIへの未認証時の401画面は制御画面と同じCSPを使う。新規起動時の起動中画面(`startSession`の応答)には、Lambda@Edge側ではCSPを付けていない。
 
 ```text
-default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'
+default-src 'none'; style-src 'unsafe-inline'; form-action 'self' https://<Cognitoドメイン>; base-uri 'none'; frame-ancestors 'none'
 ```
 
 制御画面(`/session/control`)だけは、code-serverのタブ内で開くために`frame-ancestors 'self'`にしている。
@@ -951,7 +985,9 @@ lifecycle ruleにはprefixを付けず、Bucket全体を対象にしている。
 | `lambda:PassNetworkConnector` | `ALL_INGRESS`と`INTERNET_EGRESS`のconnector ARN | |
 | `iam:PassRole` | Execution Role ARN | `iam:PassedToService`条件は実際の呼び出しと合わず失敗したため付けていない |
 | DynamoDB `GetItem`、`PutItem`、`Scan`、`UpdateItem`、`DeleteItem` | セッション表 | 削除は対象MicroVM ID一致が条件 |
-| Secrets Managerの読み取り | パスワードのSecret | |
+| DynamoDB `GetItem`、`PutItem`、`DeleteItem` | 認証セッション表 | |
+| `ssm:GetParameter` | `/omp-cloud-ide/cognito` | Pool/Client IDの取得 |
+| `cognito-idp:DescribeUserPoolClient` | 対象User Pool | client secretの取得 |
 | CloudWatch Logsへの書き込み | `/aws/lambda/*` | Lambda@Edgeは実行したリージョンにログを書く |
 
 origin-response用のRoleは、CloudWatch Logsへの書き込みだけを持つ。
@@ -982,14 +1018,16 @@ Build RoleとExecution Roleは、`lambda.amazonaws.com`に対して`sts:AssumeRo
 - ブラウザへのproxy tokenとMicroVM endpointの露出
 - rootでの実行(UID 1000で動かす)
 - 広いAWS権限(Execution Roleは認証状態の保存に必要な分だけ)
-- ImageとGitへのsecretの混入(パスワード、OAuth tokenはどちらにも入れない)
+- ImageとGitへのsecretの混入(Cognitoのclient secret、OAuth tokenはどちらにも入れない)
+- パスワードの推測(CognitoのTOTP MFA必須と組み込みロックアウト)
 
 ### 12.2 守れていないもの
 
 - 同じMicroVM内で動く信頼できないコードからのsecretの保護。cloneしたコード、依存パッケージのinstall script、VS Code拡張、OMPはすべて同じUID 1000で動き、`agent.db`、`hosts.yml`、Execution Roleの資格情報を読める。`INTERNET_EGRESS`で外部へ送ることもできる。
 - 同一originの開発アプリからの状態変更。IDE、`/proxy/<port>/`の開発アプリ、ログイン、選択画面、制御画面は同じCloudFrontのoriginにある。`SameSite=Strict`は外部サイトからのCSRFを防ぐが、同じoriginで動くアプリからのPOSTは防がない。
 - Edge専用Cookieのorigin転送は防いでいるが、同じCloudFront originの開発アプリは制御routeへリクエストできる。MicroVM内の同一UIDのコードから認証ファイルも読める。
-- ログイン試行回数の制限(WAFなし)
+- 複数利用者の分離。セッションはCognitoの`sub`に紐づかず、全MicroVMが共有の`personal/`認証状態を復元する(単一利用者前提)
+- WAFによるレート制限(Cognitoのロックアウト以外にはない)
 
 ### 12.3 前提
 
@@ -1020,8 +1058,10 @@ cdkdは、CDKアプリをCloudFormationを経由せずAWS SDKで直接デプロ�
 | モジュール | version | 用途 |
 | --- | --- | --- |
 | `@aws-sdk/client-lambda-microvms` | ^3.1075.0 | Run、Get、Suspend、Resume、CreateMicrovmAuthToken |
-| `@aws-sdk/client-dynamodb` | ^3.1075.0 | セッション表 |
-| `@aws-sdk/client-secrets-manager` | 3.1075.0 | パスワード取得 |
+| `@aws-sdk/client-dynamodb` | ^3.1075.0 | セッション表、認証セッション表 |
+| `@aws-sdk/client-ssm` | ^3.1142.0 | Pool/Client IDのParameter取得 |
+| `@aws-sdk/client-cognito-identity-provider` | ^3.1142.0 | `DescribeUserPoolClient`によるclient secret取得 |
+| `aws-jwt-verify` | ^5.2.1 | ID tokenの署名・claim検証 |
 
 CDKのbundlingで`npm ci --omit=dev`を実行してから関数に含める。ローカルでのbundlingに失敗した場合はNode.js 24のbundling用コンテナで実行する。
 
@@ -1118,8 +1158,8 @@ code-server/
 | 対象 | 確認している内容 |
 | --- | --- |
 | MicroVM Stack | S3のKMS暗号化・Versioning・公開遮断、hookの設定、東京リージョン |
-| Edge Stack | ログインフォームの前提、Lambda@Edgeの関連付け、セキュリティヘッダー、IAMのResource範囲 |
-| Cookie | ログインフォームの解析、改ざん・期限切れ・期限が長すぎるCookieの拒否 |
+| Edge Stack | Cognito User Pool(管理者作成のみ、MFA必須)、Lambda@Edgeの関連付け、セキュリティヘッダー、IAMのResource範囲 |
+| 利用者認証 | Cognito経由のサインイン(PKCE、state、1回限りのnonce)、全routeでのサインイン済みセッション要求、サインアウト時のセッション削除とCognitoセッション終了 |
 | 画面 | HTMLエスケープ、CSP、選択画面、制御画面、起動画面がscriptを使わないこと |
 | Suspend / Resume | paused中の302と409、POST以外の拒否 |
 | 残り寿命 | Edgeが`/run` hookへ渡す期限が実際の終了時刻より遅くならないこと、`lifecycle.py`がLambdaの本文から期限を読むこと、カウントダウンと通知の閾値 |
@@ -1128,7 +1168,7 @@ code-server/
 | origin-request | 期限切れtokenの更新失敗時に転送しないこと、Edge専用Cookieを除去してorigin固有Cookieを保持すること |
 | Image | OMPとcode-serverのversionが固定形式であること(自動更新スクリプトの前提)、非rootでの実行、Chromium、Suspend拡張の存在 |
 
-Lambda@Edgeやセッション処理を変えたときは、デプロイ後に「ログイン → 選択画面 → 新規起動 → code-server表示 → Suspend → Resume → 確認付きTerminate → 終了と行削除」を確認する。2026-09-25の検証では起動フォームの二重POSTが409になり、確認画面で誤ったIDを拒否し、テスト用MicroVMだけが`TERMINATED`となってDynamoDB行が削除され、既存MicroVMは残った。EdgeのHTML画面は同梱headless ChromiumのSkia FontConfigで描画が異常終了するためCookie付きHTTPで操作し、code-server UIをブラウザで表示した。一時的なE2Eスクリプトであり、リポジトリには未収録。
+Lambda@Edgeやセッション処理を変えたときは、デプロイ後に「サインイン → 選択画面 → 新規起動 → code-server表示 → Suspend → Resume → 確認付きTerminate → 終了と行削除」を確認する。2026-09-25の検証では起動フォームの二重POSTが409になり、確認画面で誤ったIDを拒否し、テスト用MicroVMだけが`TERMINATED`となってDynamoDB行が削除され、既存MicroVMは残った。EdgeのHTML画面は同梱headless ChromiumのSkia FontConfigで描画が異常終了するためCookie付きHTTPで操作し、code-server UIをブラウザで表示した。一時的なE2Eスクリプトであり、リポジトリには未収録。
 
 ## 16. 既知の制約と改善候補
 
@@ -1144,7 +1184,7 @@ Lambda@Edgeやセッション処理を変えたときは、デプロイ後に「
 | 永続化 | 複数MicroVMのETag競合は検出するが自動で統合しない |
 | 永続化 | `/resume` hookが何も確認しない |
 | セキュリティ | 同一originの開発アプリから制御画面を操作できる |
-| セキュリティ | MFA、ログイン試行制限、WAFがない |
+| セキュリティ | WAFがない(試行制限はCognitoのロックアウトのみ)。利用者ごとのセッション所有・S3 prefix・実行Roleの分離がない |
 | セキュリティ | 一部の外部成果物はchecksumを検証していない |
 | 運用 | origin-responseが開発アプリ自身の502/504も選択画面へ戻す |
 | 運用 | control URLがImageに固定されている |
@@ -1159,7 +1199,7 @@ MicroVMのcompute以外にも費用は発生する。
 | 層 | 主な課金要素 |
 | --- | --- |
 | Lambda MicroVM | RUNNING中のcompute(ベースラインと超過分)、Suspend中のスナップショット保存 |
-| Edge | CloudFrontのリクエストと転送量、Lambda@Edgeの実行、DynamoDB、Secrets Manager |
+| Edge | CloudFrontのリクエストと転送量、Lambda@Edgeの実行、DynamoDB、Cognito(EssentialsのMAU課金。10,000 MAUまでは無料枠)、SSM Parameter(標準は無料) |
 | 永続化 | S3の保存量(旧versionを含む)とリクエスト、KMS、CloudWatch Logs |
 
 code-serverのタブを開いたままにするとRUNNINGが続く。作業を終えたら明示的にSuspendする。

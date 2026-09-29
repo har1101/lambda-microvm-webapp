@@ -1,4 +1,5 @@
 import { spawnSync } from 'node:child_process';
+import { createHash, generateKeyPairSync, randomBytes, sign } from 'node:crypto';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { Match, Template } from 'aws-cdk-lib/assertions';
@@ -6,21 +7,11 @@ import * as cdk from 'aws-cdk-lib/core';
 import { OmpCloudIdeEdgeStack, OmpCloudIdeMicrovmStack } from '../lib/lambda-microvm-stack';
 
 type EdgeTestHelpers = {
-  createAccessCookie: (password: string, now?: number) => string;
+  authSessionKey: (accessCookie: string) => string;
   createMicrovmSessionCookie: (sessionId: string) => string;
-  isAccessCookieValidForPassword: (value: string, password: string, now?: number) => boolean;
-  loginPageResponse: (
-    errorMessage?: string,
-    status?: string,
-  ) => {
-    status: string;
-    headers: Record<string, Array<{ key: string; value: string }>>;
-    body: string;
+  getIdTokenVerifier: (client: { userPoolId: string; clientId: string }) => {
+    cacheJwks: (jwks: { keys: unknown[] }) => void;
   };
-  parseLoginForm: (body: { data: string; encoding: string; inputTruncated?: boolean }) => {
-    username: string;
-    password: string;
-  } | null;
   pausedSessionResponse: (headers: Record<string, Array<{ key: string; value: string }>>) => {
     status: string;
     headers: Record<string, Array<{ key: string; value: string }>>;
@@ -66,7 +57,6 @@ type EdgeTestHelpers = {
     headers: Record<string, Array<{ key: string; value: string }>>;
     body: string;
   };
-  signAccessCookie: (payload: string, password: string) => string;
   startSession: (requestId?: string) => Promise<{ status: string; headers: Record<string, unknown>; body: string }>;
 };
 
@@ -101,15 +91,45 @@ function getEdgeModule(): EdgeModule {
 type AwsInput = Record<string, unknown>;
 type AwsCall = { name: string; input: AwsInput };
 
+const AUTH_TABLE = 'omp-cloud-ide-auth-sessions';
+const TEST_USER_POOL_ID = 'us-east-1_TestPool1';
+const TEST_CLIENT_ID = 'test-client-id';
+// A signed-in browser: the default auth-table mock accepts exactly this cookie.
+const ACCESS_COOKIE_VALUE = randomBytes(32).toString('base64url');
+const ACCESS_COOKIE = `omp-cloud-ide-auth=${ACCESS_COOKIE_VALUE}`;
+
+function edgeConfig(): { COGNITO_DOMAIN: string } {
+  getEdgeTemplate();
+  return JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'artifact', 'edge', 'config.json'), 'utf8'));
+}
+
+/**
+ * Auth-table operations are reported as Auth<Command> so tests can tell them
+ * apart from MicroVM session-table operations of the same command type.
+ */
 async function withAwsMocks<T>(
   overrides: Record<string, (input: AwsInput) => unknown>,
   run: () => Promise<T>,
 ): Promise<{ calls: AwsCall[]; result: T }> {
   const { LambdaMicrovmsClient } = require('../artifact/edge/node_modules/@aws-sdk/client-lambda-microvms');
   const { DynamoDBClient } = require('../artifact/edge/node_modules/@aws-sdk/client-dynamodb');
-  const { SecretsManagerClient } = require('../artifact/edge/node_modules/@aws-sdk/client-secrets-manager');
+  const { SSMClient } = require('../artifact/edge/node_modules/@aws-sdk/client-ssm');
+  const {
+    CognitoIdentityProviderClient,
+  } = require('../artifact/edge/node_modules/@aws-sdk/client-cognito-identity-provider');
+  const signedInKey = getEdgeModule().__test.authSessionKey(ACCESS_COOKIE_VALUE);
   const calls: AwsCall[] = [];
   const defaults: Record<string, (input: AwsInput) => unknown> = {
+    AuthGetItemCommand: (input) =>
+      JSON.stringify(input.Key) === JSON.stringify({ id: { S: signedInKey } })
+        ? { Item: { id: { S: signedInKey }, sub: { S: 'user-sub' }, expiresAt: { N: String(Date.now() + 60_000) } } }
+        : {},
+    AuthPutItemCommand: () => ({}),
+    AuthDeleteItemCommand: () => ({}),
+    GetParameterCommand: () => ({
+      Parameter: { Value: JSON.stringify({ userPoolId: TEST_USER_POOL_ID, clientId: TEST_CLIENT_ID }) },
+    }),
+    DescribeUserPoolClientCommand: () => ({ UserPoolClient: { ClientSecret: 'test-client-secret' } }),
     PutItemCommand: () => ({}),
     UpdateItemCommand: () => ({}),
     DeleteItemCommand: () => ({}),
@@ -131,19 +151,92 @@ async function withAwsMocks<T>(
       throw new Error('Invalid AWS command');
     }
     const input = command.input as AwsInput;
-    const name = command.constructor.name;
+    const name = `${input.TableName === AUTH_TABLE ? 'Auth' : ''}${command.constructor.name}`;
     calls.push({ name, input });
     const respond = overrides[name] ?? defaults[name];
     if (!respond) throw new Error(`Unexpected AWS command: ${name}`);
     return respond(input);
   };
-  const clients = [LambdaMicrovmsClient, DynamoDBClient, SecretsManagerClient];
+  const clients = [LambdaMicrovmsClient, DynamoDBClient, SSMClient, CognitoIdentityProviderClient];
   const spies = clients.map((client) => jest.spyOn(client.prototype, 'send').mockImplementation(mockSend));
   try {
     return { calls, result: await run() };
   } finally {
     for (const spy of spies) spy.mockRestore();
   }
+}
+
+type EdgeRequest = {
+  method: string;
+  uri: string;
+  querystring?: string;
+  headers: Record<string, Array<{ key: string; value: string }>>;
+  body?: { encoding: string; data: string };
+};
+
+function edgeEvent(request: EdgeRequest) {
+  return { Records: [{ cf: { config: { distributionDomainName: 'd111.cloudfront.net' }, request } }] };
+}
+
+function cookieHeader(value: string) {
+  return { cookie: [{ key: 'Cookie', value }] };
+}
+
+function headerValues(response: { headers: Record<string, unknown> }, name: string): string[] {
+  const headers = response.headers[name];
+  return Array.isArray(headers) ? headers.map((header) => String(header.value)) : [];
+}
+
+type AttributeMap = Record<string, { S?: string; N?: string }>;
+
+/** In-memory auth table with the conditional semantics the edge relies on. */
+function authTableMock(rows = new Map<string, AttributeMap>()) {
+  const idOf = (key: unknown) => JSON.parse(JSON.stringify(key)).id.S as string;
+  return {
+    rows,
+    overrides: {
+      AuthPutItemCommand: (input: AwsInput) => {
+        // Items are the edge's own DynamoDB attribute maps.
+        const item: AttributeMap = JSON.parse(JSON.stringify(input.Item));
+        rows.set(String(item.id.S), item);
+        return {};
+      },
+      AuthGetItemCommand: (input: AwsInput) => ({ Item: rows.get(idOf(input.Key)) }),
+      AuthDeleteItemCommand: (input: AwsInput) => {
+        const id = idOf(input.Key);
+        const existing = rows.get(id);
+        if (input.ConditionExpression && !existing) {
+          throw Object.assign(new Error('missing'), { name: 'ConditionalCheckFailedException' });
+        }
+        rows.delete(id);
+        return { Attributes: existing };
+      },
+    },
+  };
+}
+
+/** Signs a Cognito-shaped ID token and teaches the edge verifier the matching JWKS. */
+function createIdTokenSigner() {
+  const { privateKey, publicKey } = generateKeyPairSync('rsa', { modulusLength: 2048 });
+  const jwk = { ...publicKey.export({ format: 'jwk' }), kid: 'test-key', alg: 'RS256', use: 'sig' };
+  getEdgeModule()
+    .__test.getIdTokenVerifier({ userPoolId: TEST_USER_POOL_ID, clientId: TEST_CLIENT_ID })
+    .cacheJwks({ keys: [jwk] });
+  return (claims: Record<string, unknown>) => {
+    const now = Math.floor(Date.now() / 1000);
+    const encode = (value: unknown) => Buffer.from(JSON.stringify(value)).toString('base64url');
+    const signingInput = `${encode({ alg: 'RS256', kid: 'test-key', typ: 'JWT' })}.${encode({
+      sub: 'user-sub',
+      aud: TEST_CLIENT_ID,
+      iss: `https://cognito-idp.us-east-1.amazonaws.com/${TEST_USER_POOL_ID}`,
+      token_use: 'id',
+      auth_time: now,
+      iat: now,
+      exp: now + 300,
+      ...claims,
+    })}`;
+    return `${signingInput}.${sign('sha256', Buffer.from(signingInput), privateKey).toString('base64url')}`;
+  };
 }
 
 describe('OMP Cloud IDE infrastructure', () => {
@@ -199,10 +292,25 @@ describe('OMP Cloud IDE infrastructure', () => {
     });
   });
 
-  test('uses an edge login form before exposing the IDE', async () => {
+  test('fronts the IDE with an admin-only, MFA-required Cognito user pool', async () => {
     const template = getEdgeTemplate();
 
-    template.resourceCountIs('AWS::SecretsManager::Secret', 1);
+    template.resourceCountIs('AWS::SecretsManager::Secret', 0);
+    template.hasResourceProperties('AWS::Cognito::UserPool', {
+      AdminCreateUserConfig: { AllowAdminCreateUserOnly: true },
+      MfaConfiguration: 'ON',
+      EnabledMfas: ['SOFTWARE_TOKEN_MFA'],
+      DeletionProtection: 'ACTIVE',
+    });
+    template.hasResourceProperties('AWS::Cognito::UserPoolClient', {
+      GenerateSecret: true,
+      AllowedOAuthFlows: ['code'],
+      AllowedOAuthFlowsUserPoolClient: true,
+      AllowedOAuthScopes: ['openid', 'email'],
+      SupportedIdentityProviders: ['COGNITO'],
+    });
+    template.hasResourceProperties('AWS::Cognito::UserPoolDomain', { ManagedLoginVersion: 2 });
+    template.resourceCountIs('AWS::Cognito::ManagedLoginBranding', 1);
     template.hasResourceProperties('AWS::CloudFront::Distribution', {
       DistributionConfig: Match.objectLike({
         DefaultCacheBehavior: Match.objectLike({
@@ -255,64 +363,204 @@ describe('OMP Cloud IDE infrastructure', () => {
             Action: Match.arrayWith(['dynamodb:Scan']),
             Effect: 'Allow',
           }),
-          Match.objectLike({
-            Action: Match.arrayWith(['secretsmanager:GetSecretValue']),
-            Effect: 'Allow',
-          }),
+          Match.objectLike({ Action: 'ssm:GetParameter', Effect: 'Allow' }),
+          Match.objectLike({ Action: 'cognito-idp:DescribeUserPoolClient', Effect: 'Allow' }),
         ]),
       }),
     });
   });
 
-  test('renders an in-page login instead of a browser Basic auth challenge', async () => {
+  test('requires a live Cognito sign-in session before any IDE route', async () => {
     const edge = getEdgeModule();
-    const response = await edge.handler({
-      Records: [{ cf: { request: { method: 'GET', uri: '/login', headers: {} } } }],
-    });
+    const html = { accept: [{ key: 'Accept', value: 'text/html' }] };
+    const { calls } = await withAwsMocks(
+      {
+        AuthGetItemCommand: () => ({
+          Item: { sub: { S: 'user-sub' }, expiresAt: { N: String(Date.now() - 1_000) } },
+        }),
+      },
+      async () => {
+        const anonymous = await edge.handler(edgeEvent({ method: 'GET', uri: '/', headers: html }));
+        expect(anonymous.status).toBe('302');
+        expect(anonymous.headers.location).toEqual([{ key: 'Location', value: '/auth/login' }]);
 
-    expect(response.status).toBe('200');
-    expect(response.headers['www-authenticate']).toBeUndefined();
-    expect(String(response.body)).toContain('<form method="post" action="/login"');
+        // Editor XHR/WebSocket traffic cannot follow a cross-site sign-in redirect.
+        const websocket = await edge.handler(edgeEvent({ method: 'GET', uri: '/stable/ws', headers: {} }));
+        expect(websocket.status).toBe('401');
 
-    const redirect = await edge.handler({
-      Records: [{ cf: { request: { method: 'GET', uri: '/', headers: {} } } }],
-    });
-    expect(redirect.status).toBe('302');
-    expect(redirect.headers.location).toEqual([{ key: 'Location', value: '/login' }]);
+        // The framed control page must break out of the editor to reach Cognito.
+        const control = await edge.handler(edgeEvent({ method: 'GET', uri: '/session/control', headers: html }));
+        expect(control.status).toBe('401');
+        expect(control.body).toContain('href="/auth/login" target="_top"');
+
+        // DynamoDB TTL deletes lazily; an expired row must not authenticate.
+        const expired = await edge.handler(
+          edgeEvent({ method: 'GET', uri: '/', headers: { ...html, ...cookieHeader(ACCESS_COOKIE) } }),
+        );
+        expect(expired.status).toBe('302');
+      },
+    );
+    expect(calls.map((call) => call.name)).toEqual(['AuthGetItemCommand']);
   });
 
-  test('parses login bodies and rejects tampered or out-of-window access cookies', () => {
-    const helpers = getEdgeModule().__test;
-    const encoded = Buffer.from('username=har1101&password=a%26b%3Dc').toString('base64');
-    expect(helpers.parseLoginForm({ data: encoded, encoding: 'base64' })).toEqual({
-      username: 'har1101',
-      password: 'a&b=c',
+  test('signs in through Cognito with PKCE, a browser-bound state, and a one-time nonce', async () => {
+    const edge = getEdgeModule();
+    const signIdToken = createIdTokenSigner();
+    const table = authTableMock();
+    let idTokenNonce = '';
+    const tokenRequests: Array<{ authorization: string | null; body: URLSearchParams }> = [];
+    const fetchSpy = jest.spyOn(globalThis, 'fetch').mockImplementation(async (_url, init) => {
+      tokenRequests.push({
+        authorization: new Headers(init?.headers).get('authorization'),
+        body: new URLSearchParams(String(init?.body)),
+      });
+      return new Response(JSON.stringify({ id_token: signIdToken({ nonce: idTokenNonce }) }), { status: 200 });
     });
-    expect(helpers.parseLoginForm({ data: encoded, encoding: 'base64', inputTruncated: true })).toBeNull();
+    const callback = (query: URLSearchParams, stateCookie: string) =>
+      edge.handler(
+        edgeEvent({
+          method: 'GET',
+          uri: '/auth/callback',
+          querystring: query.toString(),
+          headers: cookieHeader(`omp-cloud-ide-oauth=${stateCookie}`),
+        }),
+      );
+    try {
+      await withAwsMocks(table.overrides, async () => {
+        const login = await edge.handler(edgeEvent({ method: 'GET', uri: '/auth/login', headers: {} }));
+        expect(login.status).toBe('302');
+        const authorize = new URL(headerValues(login, 'location')[0]);
+        expect(`${authorize.origin}${authorize.pathname}`).toBe(
+          `https://${edgeConfig().COGNITO_DOMAIN}/oauth2/authorize`,
+        );
+        expect(Object.fromEntries(authorize.searchParams)).toMatchObject({
+          response_type: 'code',
+          client_id: TEST_CLIENT_ID,
+          redirect_uri: 'https://d111.cloudfront.net/auth/callback',
+          code_challenge_method: 'S256',
+        });
+        const state = authorize.searchParams.get('state') ?? '';
+        idTokenNonce = authorize.searchParams.get('nonce') ?? '';
+        const [stateCookie] = headerValues(login, 'set-cookie');
+        expect(stateCookie).toMatch(new RegExp(`^omp-cloud-ide-oauth=${state};`));
+        expect(stateCookie).toContain('Path=/auth/callback');
+        expect(stateCookie).toContain('SameSite=Lax');
 
-    const now = 1_800_000_000_000;
-    const password = 'test-only-password';
-    const setCookie = helpers.createAccessCookie(password, now);
-    const value = setCookie.split(';', 1)[0]?.split('=', 2)[1];
-    expect(value).toBeDefined();
-    if (!value) throw new Error('access cookie value was not generated');
-    expect(helpers.isAccessCookieValidForPassword(value, password, now + 1_000)).toBe(true);
-    expect(helpers.isAccessCookieValidForPassword(`${value}tampered`, password, now + 1_000)).toBe(false);
-    expect(helpers.isAccessCookieValidForPassword(value, 'wrong-password', now + 1_000)).toBe(false);
-    expect(helpers.isAccessCookieValidForPassword(value, password, now + 28_801_000)).toBe(false);
+        const query = new URLSearchParams({ code: 'auth-code', state });
+        // A code delivered to a browser that did not start this sign-in is refused before any exchange.
+        expect((await callback(query, randomBytes(32).toString('base64url'))).status).toBe('400');
+        expect(tokenRequests).toHaveLength(0);
 
-    const beyondWindow = String(Math.floor(now / 1000) + 28_861);
-    const futureCookie = `${beyondWindow}.${helpers.signAccessCookie(beyondWindow, password)}`;
-    expect(helpers.isAccessCookieValidForPassword(futureCookie, password, now)).toBe(false);
+        const signedIn = await callback(query, state);
+        expect(signedIn.status).toBe('200');
+        expect(signedIn.body).toContain('<meta http-equiv="refresh" content="0;url=/session/select">');
+        expect(tokenRequests).toHaveLength(1);
+        const [tokenRequest] = tokenRequests;
+        expect(tokenRequest.authorization).toBe(
+          `Basic ${Buffer.from(`${TEST_CLIENT_ID}:test-client-secret`).toString('base64')}`,
+        );
+        expect(tokenRequest.body.get('code')).toBe('auth-code');
+        expect(
+          createHash('sha256')
+            .update(String(tokenRequest.body.get('code_verifier')))
+            .digest('base64url'),
+        ).toBe(authorize.searchParams.get('code_challenge'));
+
+        const [accessCookie, clearedState] = headerValues(signedIn, 'set-cookie');
+        expect(accessCookie).toMatch(
+          /^omp-cloud-ide-auth=[A-Za-z0-9_-]{43}; Path=\/; Secure; HttpOnly; SameSite=Strict;/,
+        );
+        expect(clearedState).toMatch(/^omp-cloud-ide-oauth=;.*Max-Age=0/);
+        const cookieValue = accessCookie.split(';', 1)[0];
+        // Only the hash of the cookie is stored.
+        expect([...table.rows.keys()]).toEqual([edge.__test.authSessionKey(cookieValue.split('=')[1])]);
+        expect(JSON.stringify([...table.rows.values()])).not.toContain(cookieValue.split('=')[1]);
+
+        // The state was consumed; replaying the callback cannot mint a second session.
+        expect((await callback(query, state)).status).toBe('400');
+        expect(tokenRequests).toHaveLength(1);
+
+        const chooser = await edge.handler(
+          edgeEvent({ method: 'GET', uri: '/session/select', headers: cookieHeader(cookieValue) }),
+        );
+        expect(chooser.status).toBe('200');
+        expect(chooser.body).toContain('action="/auth/logout"');
+      });
+
+      // An ID token minted for a different sign-in attempt is rejected.
+      await withAwsMocks(table.overrides, async () => {
+        const login = await edge.handler(edgeEvent({ method: 'GET', uri: '/auth/login', headers: {} }));
+        const state = new URL(headerValues(login, 'location')[0]).searchParams.get('state') ?? '';
+        idTokenNonce = randomBytes(32).toString('base64url');
+        const sessionKeys = () => [...table.rows.keys()].filter((key) => key.startsWith('sess#'));
+        const sessionsBefore = sessionKeys();
+        expect((await callback(new URLSearchParams({ code: 'auth-code', state }), state)).status).toBe('401');
+        expect(sessionKeys()).toEqual(sessionsBefore);
+      });
+    } finally {
+      fetchSpy.mockRestore();
+    }
   });
 
-  test('escapes login errors and sends restrictive login-page security headers', () => {
-    const response = getEdgeModule().__test.loginPageResponse('<invalid>', '401');
-    expect(response.status).toBe('401');
-    expect(response.body).toContain('&lt;invalid&gt;');
-    expect(response.body).not.toContain('<invalid>');
-    expect(response.headers['content-security-policy'][0].value).toContain("form-action 'self'");
-    expect(response.headers['www-authenticate']).toBeUndefined();
+  test('signs out by deleting the session and ending the Cognito session', async () => {
+    const edge = getEdgeModule();
+    const { calls } = await withAwsMocks({}, async () => {
+      const signedOut = await edge.handler(
+        edgeEvent({ method: 'POST', uri: '/auth/logout', headers: cookieHeader(ACCESS_COOKIE) }),
+      );
+      expect(signedOut.status).toBe('303');
+      const logout = new URL(headerValues(signedOut, 'location')[0]);
+      expect(`${logout.origin}${logout.pathname}`).toBe(`https://${edgeConfig().COGNITO_DOMAIN}/logout`);
+      expect(logout.searchParams.get('client_id')).toBe(TEST_CLIENT_ID);
+      expect(logout.searchParams.get('logout_uri')).toBe('https://d111.cloudfront.net/auth/signed-out');
+      expect(headerValues(signedOut, 'set-cookie')).toEqual([
+        expect.stringMatching(/^omp-cloud-ide-auth=;.*Max-Age=0/),
+      ]);
+
+      // A cross-site POST carries no SameSite=Strict cookie and must not sign anyone out.
+      const forged = await edge.handler(edgeEvent({ method: 'POST', uri: '/auth/logout', headers: {} }));
+      expect(forged.headers.location).toEqual([{ key: 'Location', value: '/auth/signed-out' }]);
+      expect(forged.headers['set-cookie']).toBeUndefined();
+
+      expect((await edge.handler(edgeEvent({ method: 'GET', uri: '/auth/logout', headers: {} }))).status).toBe('405');
+
+      // The signed-out page never claims success to a browser that still holds a sign-in cookie.
+      const stale = await edge.handler(
+        edgeEvent({ method: 'GET', uri: '/auth/signed-out', headers: cookieHeader(ACCESS_COOKIE) }),
+      );
+      expect(stale.headers.location).toEqual([{ key: 'Location', value: '/session/select' }]);
+      expect((await edge.handler(edgeEvent({ method: 'GET', uri: '/auth/signed-out', headers: {} }))).body).toContain(
+        'Signed out',
+      );
+    });
+    expect(calls.filter((call) => call.name === 'AuthDeleteItemCommand').map((call) => call.input.Key)).toEqual([
+      { id: { S: edge.__test.authSessionKey(ACCESS_COOKIE_VALUE) } },
+    ]);
+  });
+
+  test('reports an incomplete sign-out when the Cognito session cannot be ended', async () => {
+    const edge = getEdgeModule();
+    // Outlive the edge's 5-minute Cognito client cache so the lookup really runs.
+    const later = Date.now() + 10 * 60_000;
+    const clock = jest.spyOn(Date, 'now').mockReturnValue(later);
+    try {
+      const { calls, result } = await withAwsMocks(
+        {
+          GetParameterCommand: () => {
+            throw Object.assign(new Error('throttled'), { name: 'ThrottlingException' });
+          },
+        },
+        () => edge.handler(edgeEvent({ method: 'POST', uri: '/auth/logout', headers: cookieHeader(ACCESS_COOKIE) })),
+      );
+      expect(result.status).toBe('502');
+      expect(result.body).toContain('Sign-out incomplete');
+      expect(result.body).not.toContain('>Signed out<');
+      // The Cloud IDE session itself is still revoked.
+      expect(calls.map((call) => call.name)).toContain('AuthDeleteItemCommand');
+      expect(headerValues(result, 'set-cookie')).toEqual([expect.stringMatching(/^omp-cloud-ide-auth=;.*Max-Age=0/)]);
+    } finally {
+      clock.mockRestore();
+    }
   });
 
   test('renders explicit suspend and resume controls without starting a session', () => {
@@ -451,12 +699,10 @@ describe('OMP Cloud IDE infrastructure', () => {
 
   test('reconciles all session and MicroVM pages before reporting untracked machines', async () => {
     const edge = getEdgeModule();
-    const password = 'test-only-password';
-    const accessCookie = edge.__test.createAccessCookie(password).split(';', 1)[0];
+    const accessCookie = ACCESS_COOKIE;
     const imageArn = 'arn:aws:lambda:ap-northeast-1:123456789012:microvm-image:omp-cloud-ide';
     const { result } = await withAwsMocks(
       {
-        GetSecretValueCommand: () => ({ SecretString: password }),
         ScanCommand: (input) =>
           input.ExclusiveStartKey
             ? { Items: [{ sessionId: { S: 'tracked' }, microvmId: { S: 'mvm-tracked' } }] }
@@ -517,15 +763,13 @@ describe('OMP Cloud IDE infrastructure', () => {
 
   test('does not forward an expired proxy token when renewal fails', async () => {
     const edge = getEdgeModule();
-    const password = 'test-only-password';
-    const accessCookie = edge.__test.createAccessCookie(password).split(';', 1)[0];
+    const accessCookie = ACCESS_COOKIE;
     const sessionId = '7d041485-dff5-4033-bdbc-a921757e217b';
     type Forwarded = { status?: string; headers: Record<string, Array<{ value: string }>> };
     const requestWithTokenExpiry = async (tokenExpiry: number) =>
       (
         await withAwsMocks(
           {
-            GetSecretValueCommand: () => ({ SecretString: password }),
             GetItemCommand: () => ({
               Item: {
                 sessionId: { S: sessionId },
@@ -568,8 +812,7 @@ describe('OMP Cloud IDE infrastructure', () => {
 
   test('requires an exact second confirmation, then cleans up only the terminated session', async () => {
     const edge = getEdgeModule();
-    const password = 'test-only-password';
-    const accessCookie = edge.__test.createAccessCookie(password).split(';', 1)[0];
+    const accessCookie = ACCESS_COOKIE;
     const sessionId = '7d041485-dff5-4033-bdbc-a921757e217b';
     const microvmId = 'microvm-40287cea-cb68-32ac-a059-02188a827bff';
     const imageArn = 'arn:aws:lambda:ap-northeast-1:123456789012:microvm-image:omp-cloud-ide';
@@ -596,7 +839,6 @@ describe('OMP Cloud IDE infrastructure', () => {
       });
     const { calls } = await withAwsMocks(
       {
-        GetSecretValueCommand: () => ({ SecretString: password }),
         GetItemCommand: () => ({ Item: rowExists ? row : undefined }),
         GetMicrovmCommand: () => ({ microvmId, imageArn, state }),
         ScanCommand: () => ({ Items: rowExists ? [row] : [] }),
@@ -644,8 +886,7 @@ describe('OMP Cloud IDE infrastructure', () => {
 
   test('keeps an uncertain termination blocked and rejects untracked termination requests', async () => {
     const edge = getEdgeModule();
-    const password = 'test-only-password';
-    const accessCookie = edge.__test.createAccessCookie(password).split(';', 1)[0];
+    const accessCookie = ACCESS_COOKIE;
     const sessionId = '7d041485-dff5-4033-bdbc-a921757e217b';
     const microvmId = 'microvm-11111111-2222-4333-8444-555555555555';
     const row = {
@@ -671,7 +912,6 @@ describe('OMP Cloud IDE infrastructure', () => {
       });
     const { calls } = await withAwsMocks(
       {
-        GetSecretValueCommand: () => ({ SecretString: password }),
         GetItemCommand: () => ({ Item: row }),
         ScanCommand: () => ({ Items: [row] }),
         GetMicrovmCommand: () => ({
@@ -716,8 +956,7 @@ describe('OMP Cloud IDE infrastructure', () => {
 
   test('forwards editor cookies but never forwards Edge access or session cookies', async () => {
     const edge = getEdgeModule();
-    const password = 'test-only-password';
-    const accessCookie = edge.__test.createAccessCookie(password).split(';', 1)[0];
+    const accessCookie = ACCESS_COOKIE;
     const sessionId = '7d041485-dff5-4033-bdbc-a921757e217b';
     const forward = (other = '') =>
       edge.handler({
@@ -740,7 +979,6 @@ describe('OMP Cloud IDE infrastructure', () => {
       });
     await withAwsMocks(
       {
-        GetSecretValueCommand: () => ({ SecretString: password }),
         GetItemCommand: () => ({
           Item: {
             microvmId: { S: 'mvm-test' },

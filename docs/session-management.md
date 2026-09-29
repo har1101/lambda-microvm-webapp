@@ -30,14 +30,15 @@ CloudFrontのCDK定義にはダミーoriginとして`example.com`が必要だが
 
 ## 2種類のCookie
 
-このシステムでは目的が異なる2種類のCookieを使う。
+このシステムでは目的が異なる2種類のCookieを使う。サインイン途中だけ、別に短命の`omp-cloud-ide-oauth`も使う。
 
 | Cookie | 目的 | 内容 |
 | --- | --- | --- |
-| `omp-cloud-ide-auth` | Cloud IDE利用者の認証 | 有効期限とHMAC署名。Secrets Managerのパスワードから署名する |
+| `omp-cloud-ide-auth` | Cloud IDE利用者の認証 | 32バイトの不透明な乱数。`omp-cloud-ide-auth-sessions`テーブルにはそのSHA-256ハッシュと期限(8時間)だけを保存する |
 | `mvm-session` | ブラウザとMicroVMセッションの関連付け | DynamoDBの`sessionId`を指すランダムUUID |
+| `omp-cloud-ide-oauth` | サインイン途中のstate | `/auth/login`から`/auth/callback`までの10分だけ。`Path=/auth/callback`、`SameSite=Lax` |
 
-どちらも`Secure`、`HttpOnly`、`SameSite=Strict`で発行する。`mvm-session`だけでは接続できず、有効な`omp-cloud-ide-auth`も必要になる。
+`omp-cloud-ide-auth`と`mvm-session`は`Secure`、`HttpOnly`、`SameSite=Strict`で発行する。`mvm-session`だけでは接続できず、有効な`omp-cloud-ide-auth`も必要になる。Lambda@Edgeは両方の行を`Promise.all`で並列に読むため、認証の確認でDynamoDBの往復は増えない。
 
 ## DynamoDBのセッションレコード
 
@@ -58,9 +59,9 @@ ttl             DynamoDBレコードの自動削除時刻
 
 ## ログインから接続まで
 
-### 1. ログイン
+### 1. サインイン
 
-`GET /login`はログインフォームだけを返し、MicroVMを起動しない。`POST /login`が成功すると`omp-cloud-ide-auth`を発行し、`/session/select`へ移動する。
+`GET /auth/login`はCognitoのManaged Loginへリダイレクトするだけで、MicroVMを起動しない。メールアドレス・パスワード・TOTPでサインインすると、`/auth/callback`がID tokenを検証して`omp-cloud-ide-auth`を発行し、`/session/select`へ移動する。選択画面と制御画面の「Sign out」(`POST /auth/logout`)は、認証行を削除してCognitoのセッションも終了する。
 
 ### 2. セッション選択
 

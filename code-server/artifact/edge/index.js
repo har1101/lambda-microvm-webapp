@@ -18,37 +18,64 @@ const {
   ScanCommand,
   UpdateItemCommand,
 } = require('@aws-sdk/client-dynamodb');
-const { GetSecretValueCommand, SecretsManagerClient } = require('@aws-sdk/client-secrets-manager');
-const { createHmac, randomUUID, timingSafeEqual } = require('node:crypto');
+const { GetParameterCommand, SSMClient } = require('@aws-sdk/client-ssm');
+const {
+  CognitoIdentityProviderClient,
+  DescribeUserPoolClientCommand,
+} = require('@aws-sdk/client-cognito-identity-provider');
+const { CognitoJwtVerifier } = require('aws-jwt-verify');
+const { createHash, randomBytes, randomUUID, timingSafeEqual } = require('node:crypto');
 
 const mvm = new LambdaMicrovmsClient({ region: cfg.MVM_REGION });
 const ddb = new DynamoDBClient({ region: cfg.TABLE_REGION });
-const secrets = new SecretsManagerClient({ region: cfg.AUTH_SECRET_REGION });
+const ssm = new SSMClient({ region: cfg.COGNITO_REGION });
+const cognitoIdp = new CognitoIdentityProviderClient({ region: cfg.COGNITO_REGION });
 
-let cachedPassword;
-let passwordCachedAt = 0;
-const PASSWORD_CACHE_MS = 5 * 60 * 1000;
+let cachedCognitoClient;
+let cognitoClientCachedAt = 0;
+let cachedIdTokenVerifier;
+const COGNITO_CLIENT_CACHE_MS = 5 * 60 * 1000;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+// 32 random bytes as base64url: access cookie values, OAuth state, nonce, PKCE verifier.
+const RANDOM_TOKEN_PATTERN = /^[A-Za-z0-9_-]{43}$/;
 // A start claim that never received a MicroVM (RunMicrovm failed) expires on its own.
 const START_CLAIM_TTL_SEC = 15 * 60;
+// Edge pages submit forms to themselves; only the sign-out redirect leaves for Cognito.
+const FORM_ACTION = `form-action 'self' https://${cfg.COGNITO_DOMAIN}`;
 
 exports.handler = async (event) => {
-  const request = event.Records[0].cf.request;
+  const { request, config: distribution } = event.Records[0].cf;
+  const siteOrigin = `https://${distribution?.distributionDomainName}`;
 
-  if (request.uri === '/login') {
-    return handleLogin(request);
+  switch (request.uri) {
+    case '/auth/login':
+      return handleAuthLogin(request, siteOrigin);
+    case '/auth/callback':
+      return handleAuthCallback(request, siteOrigin);
+    case '/auth/logout':
+      return handleAuthLogout(request, siteOrigin);
+    case '/auth/signed-out':
+      // Only a browser without a sign-in cookie is shown as signed out; anyone
+      // else is sent through the normal session check.
+      return RANDOM_TOKEN_PATTERN.test(parseCookies(request.headers.cookie)[cfg.ACCESS_COOKIE_NAME] ?? '')
+        ? redirectTo('/session/select')
+        : signedOutResponse();
   }
-
-  if (!(await isAuthorized(request.headers))) {
-    return redirectToLogin();
-  }
-  delete request.headers.authorization;
 
   const cookies = parseCookies(request.headers.cookie);
   const sessionId = cookies['mvm-session'];
   const isControlRoute = request.uri === '/session/control';
   const isSuspendRoute = request.uri === '/session/suspend';
   const isResumeRoute = request.uri === '/session/resume';
+  const needsSessionRow = Boolean(sessionId) && request.uri !== '/session/select' && request.uri !== '/session/start';
+
+  const { authSession, sessionItem } = await loadRequestState(
+    cookies[cfg.ACCESS_COOKIE_NAME],
+    needsSessionRow ? sessionId : undefined,
+  );
+  if (!authSession) {
+    return unauthenticatedResponse(request.headers, isControlRoute || isSuspendRoute || isResumeRoute);
+  }
 
   if (request.uri === '/session/select') {
     return handleSessionSelection(request, sessionId);
@@ -64,44 +91,37 @@ exports.handler = async (event) => {
     return redirectToSessionSelect();
   }
 
-  const result = await ddb.send(
-    new GetItemCommand({
-      TableName: cfg.TABLE,
-      Key: { sessionId: { S: sessionId } },
-      ConsistentRead: true,
-    }),
-  );
-  if (!result.Item?.microvmId?.S) {
+  if (!sessionItem?.microvmId?.S) {
     if (isControlRoute || isSuspendRoute || isResumeRoute) {
       return sessionControlResponse({ hasSession: false, clearSessionCookie: true });
     }
     return redirectToSessionSelect(true);
   }
 
-  if (result.Item.terminationPending?.BOOL === true) {
-    return terminationResultResponse(result.Item.microvmId.S, true);
+  if (sessionItem.terminationPending?.BOOL === true) {
+    return terminationResultResponse(sessionItem.microvmId.S, true);
   }
-  const paused = result.Item.paused?.BOOL === true;
+  const paused = sessionItem.paused?.BOOL === true;
   if (isControlRoute) {
     return sessionControlResponse({ hasSession: true, paused, sessionId });
   }
   if (isSuspendRoute) {
-    return suspendSession(request, sessionId, result.Item);
+    return suspendSession(request, sessionId, sessionItem);
   }
   if (isResumeRoute) {
-    return resumeSession(request, sessionId, result.Item);
+    return resumeSession(request, sessionId, sessionItem);
   }
   if (paused) {
     return pausedSessionResponse(request.headers);
   }
 
-  let token = result.Item.token.S;
-  const expiry = Number(result.Item.tokenExpiry.N);
+  let token = sessionItem.token.S;
+  const expiry = Number(sessionItem.tokenExpiry.N);
   if (Date.now() > expiry - cfg.TOKEN_REFRESH_THRESHOLD * 60000) {
     try {
       const refreshed = await mvm.send(
         new CreateMicrovmAuthTokenCommand({
-          microvmIdentifier: result.Item.microvmId.S,
+          microvmIdentifier: sessionItem.microvmId.S,
           expirationInMinutes: cfg.TOKEN_DURATION_MIN,
           allowedPorts: [{ port: 8080 }],
         }),
@@ -123,13 +143,13 @@ exports.handler = async (event) => {
       console.error('MicroVM auth token refresh failed', error?.name);
       // Within the refresh window the old token still works; once it has
       // expired, forwarding it would only produce an opaque origin 403.
-      if (token === result.Item.token.S && Date.now() >= expiry) {
+      if (token === sessionItem.token.S && Date.now() >= expiry) {
         return tokenUnavailableResponse(request.headers);
       }
     }
   }
 
-  const host = result.Item.endpoint.S;
+  const host = sessionItem.endpoint.S;
   request.origin = {
     custom: {
       domainName: host,
@@ -696,61 +716,293 @@ async function setSessionPaused(sessionId, paused, microvmId) {
   );
 }
 
-async function isAuthorized(headers) {
-  const cookies = parseCookies(headers.cookie);
-  if (await isAccessCookieValid(cookies[cfg.ACCESS_COOKIE_NAME])) {
-    return true;
+/**
+ * Reads the browser's auth session and, when the route needs it, its MicroVM
+ * session row. Both GetItems run concurrently so authentication adds no extra
+ * round trip to the per-request DynamoDB read the proxy path already made.
+ */
+async function loadRequestState(accessCookie, sessionId) {
+  if (!RANDOM_TOKEN_PATTERN.test(accessCookie ?? '')) {
+    return { authSession: null, sessionItem: undefined };
   }
-
-  const authorization = headers.authorization?.[0]?.value;
-  if (!authorization?.startsWith('Basic ')) {
-    return false;
-  }
-
-  let decoded;
-  try {
-    decoded = Buffer.from(authorization.slice(6), 'base64').toString('utf8');
-  } catch {
-    return false;
-  }
-  const separator = decoded.indexOf(':');
-  if (separator < 0) {
-    return false;
-  }
-
-  const username = decoded.slice(0, separator);
-  const password = decoded.slice(separator + 1);
-  const expectedPassword = await getAccessPassword();
-  return secureEqual(username, cfg.BASIC_AUTH_USERNAME) && secureEqual(password, expectedPassword);
+  const [auth, session] = await Promise.all([
+    ddb.send(
+      new GetItemCommand({
+        TableName: cfg.AUTH_TABLE,
+        Key: { id: { S: authSessionKey(accessCookie) } },
+        // The row is written just before the post-login redirect.
+        ConsistentRead: true,
+      }),
+    ),
+    sessionId
+      ? ddb.send(
+          new GetItemCommand({
+            TableName: cfg.TABLE,
+            Key: { sessionId: { S: sessionId } },
+            ConsistentRead: true,
+          }),
+        )
+      : undefined,
+  ]);
+  // DynamoDB TTL deletes lazily, so an expired row must be rejected here.
+  const expiresAt = Number(auth.Item?.expiresAt?.N ?? 0);
+  const authSession = expiresAt > Date.now() ? { sub: auth.Item.sub?.S ?? '' } : null;
+  return { authSession, sessionItem: session?.Item };
 }
 
-async function handleLogin(request) {
-  if (request.method === 'GET' || request.method === 'HEAD') {
-    return loginPageResponse();
-  }
-  if (request.method !== 'POST') {
-    return methodNotAllowedResponse();
-  }
+function authSessionKey(accessCookie) {
+  return `sess#${createHash('sha256').update(accessCookie).digest('base64url')}`;
+}
 
-  const form = parseLoginForm(request.body);
-  if (!form) {
-    return loginPageResponse('The login request was invalid or too large.', '400');
-  }
+function randomToken() {
+  return randomBytes(32).toString('base64url');
+}
 
-  const expectedPassword = await getAccessPassword();
-  if (!secureEqual(form.username, cfg.BASIC_AUTH_USERNAME) || !secureEqual(form.password, expectedPassword)) {
-    return loginPageResponse('The username or password was incorrect.', '401');
+async function handleAuthLogin(request, siteOrigin) {
+  if (request.method !== 'GET' && request.method !== 'HEAD') {
+    return methodNotAllowedResponse('GET, HEAD');
   }
-
-  const cookie = createAccessCookie(expectedPassword);
+  const state = randomToken();
+  const nonce = randomToken();
+  const verifier = randomToken();
+  let client;
+  try {
+    client = await getCognitoClient();
+    const now = Date.now();
+    await ddb.send(
+      new PutItemCommand({
+        TableName: cfg.AUTH_TABLE,
+        Item: {
+          id: { S: `login#${state}` },
+          nonce: { S: nonce },
+          verifier: { S: verifier },
+          expiresAt: { N: String(now + cfg.LOGIN_TTL_SEC * 1000) },
+          ttl: { N: String(Math.ceil(now / 1000) + cfg.LOGIN_TTL_SEC) },
+        },
+      }),
+    );
+  } catch (error) {
+    console.error('Could not start Cognito sign-in', error?.name);
+    return authPageResponse({ status: '502', title: 'Sign-in unavailable', message: 'Please retry in a moment.' });
+  }
+  const authorize = new URL(`https://${cfg.COGNITO_DOMAIN}/oauth2/authorize`);
+  authorize.search = new URLSearchParams({
+    response_type: 'code',
+    client_id: client.clientId,
+    redirect_uri: `${siteOrigin}/auth/callback`,
+    scope: 'openid email',
+    state,
+    nonce,
+    code_challenge: createHash('sha256').update(verifier).digest('base64url'),
+    code_challenge_method: 'S256',
+  }).toString();
   return {
-    status: '303',
-    statusDescription: 'See Other',
+    status: '302',
+    statusDescription: 'Found',
     headers: {
-      location: [{ key: 'Location', value: '/session/select' }],
-      'set-cookie': [{ key: 'Set-Cookie', value: cookie }],
+      location: [{ key: 'Location', value: authorize.toString() }],
+      // Lax, not Strict: the callback is a top-level navigation from Cognito's site.
+      'set-cookie': [
+        {
+          key: 'Set-Cookie',
+          value: `${cfg.OAUTH_COOKIE_NAME}=${state}; Path=/auth/callback; Secure; HttpOnly; SameSite=Lax; Max-Age=${cfg.LOGIN_TTL_SEC}`,
+        },
+      ],
       'cache-control': [{ key: 'Cache-Control', value: 'no-store' }],
     },
+  };
+}
+
+async function handleAuthCallback(request, siteOrigin) {
+  if (request.method !== 'GET') {
+    return methodNotAllowedResponse('GET');
+  }
+  const params = new URLSearchParams(request.querystring ?? '');
+  const state = params.get('state') ?? '';
+  const code = params.get('code') ?? '';
+  const cookieState = parseCookies(request.headers.cookie)[cfg.OAUTH_COOKIE_NAME] ?? '';
+  if (params.has('error')) {
+    return authFailureResponse('400', 'Sign-in was cancelled or rejected by Cognito.');
+  }
+  // The state must match the cookie set by /auth/login in this same browser.
+  if (!RANDOM_TOKEN_PATTERN.test(state) || !code || !secureEqual(state, cookieState)) {
+    return authFailureResponse('400', 'This sign-in did not start in this browser or has expired.');
+  }
+
+  let pending;
+  try {
+    // Deleting with ALL_OLD makes each state usable exactly once.
+    const deleted = await ddb.send(
+      new DeleteItemCommand({
+        TableName: cfg.AUTH_TABLE,
+        Key: { id: { S: `login#${state}` } },
+        ConditionExpression: 'attribute_exists(id)',
+        ReturnValues: 'ALL_OLD',
+      }),
+    );
+    pending = deleted.Attributes;
+  } catch (error) {
+    if (error?.name !== 'ConditionalCheckFailedException') throw error;
+  }
+  if (!pending?.verifier?.S || !pending.nonce?.S || Number(pending.expiresAt?.N ?? 0) <= Date.now()) {
+    return authFailureResponse('400', 'This sign-in did not start in this browser or has expired.');
+  }
+
+  let claims;
+  try {
+    const client = await getCognitoClient();
+    const tokens = await exchangeAuthorizationCode(client, code, pending.verifier.S, `${siteOrigin}/auth/callback`);
+    claims = await getIdTokenVerifier(client).verify(tokens.id_token);
+  } catch (error) {
+    console.error('Cognito sign-in could not be completed', error?.name, error?.message);
+    return authFailureResponse('502', 'Sign-in could not be completed.');
+  }
+  if (typeof claims.nonce !== 'string' || !secureEqual(claims.nonce, pending.nonce.S)) {
+    return authFailureResponse('401', 'The identity token did not belong to this sign-in.');
+  }
+
+  const accessCookie = randomToken();
+  const now = Date.now();
+  const expiresAt = now + cfg.ACCESS_COOKIE_MAX_AGE_SEC * 1000;
+  await ddb.send(
+    new PutItemCommand({
+      TableName: cfg.AUTH_TABLE,
+      Item: {
+        id: { S: authSessionKey(accessCookie) },
+        sub: { S: claims.sub },
+        createdAt: { N: String(now) },
+        expiresAt: { N: String(expiresAt) },
+        ttl: { N: String(Math.ceil(expiresAt / 1000)) },
+      },
+      ConditionExpression: 'attribute_not_exists(id)',
+    }),
+  );
+  return signedInResponse(accessCookie);
+}
+
+async function exchangeAuthorizationCode(client, code, verifier, redirectUri) {
+  const response = await fetch(`https://${cfg.COGNITO_DOMAIN}/oauth2/token`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/x-www-form-urlencoded',
+      authorization: `Basic ${Buffer.from(`${client.clientId}:${client.clientSecret}`).toString('base64')}`,
+    },
+    body: new URLSearchParams({
+      grant_type: 'authorization_code',
+      client_id: client.clientId,
+      code,
+      redirect_uri: redirectUri,
+      code_verifier: verifier,
+    }).toString(),
+    signal: AbortSignal.timeout(10_000),
+  });
+  if (!response.ok) {
+    throw Object.assign(new Error(`Token endpoint returned ${response.status}`), { name: 'TokenExchangeError' });
+  }
+  const tokens = await response.json();
+  if (typeof tokens?.id_token !== 'string') {
+    throw Object.assign(new Error('Token response had no id_token'), { name: 'TokenExchangeError' });
+  }
+  return tokens;
+}
+
+async function handleAuthLogout(request, siteOrigin) {
+  if (request.method !== 'POST') {
+    return postOnlyResponse();
+  }
+  const accessCookie = parseCookies(request.headers.cookie)[cfg.ACCESS_COOKIE_NAME] ?? '';
+  // SameSite=Strict keeps the cookie off cross-site POSTs, so a forged logout
+  // arrives without it and changes nothing.
+  if (!RANDOM_TOKEN_PATTERN.test(accessCookie)) {
+    return redirectTo('/auth/signed-out', '303');
+  }
+  await ddb.send(
+    new DeleteItemCommand({ TableName: cfg.AUTH_TABLE, Key: { id: { S: authSessionKey(accessCookie) } } }),
+  );
+  let response;
+  try {
+    const client = await getCognitoClient();
+    // Also end the Managed Login session so the next sign-in asks for credentials.
+    const logout = new URL(`https://${cfg.COGNITO_DOMAIN}/logout`);
+    logout.search = new URLSearchParams({
+      client_id: client.clientId,
+      logout_uri: `${siteOrigin}/auth/signed-out`,
+    }).toString();
+    response = redirectTo(logout.toString(), '303');
+  } catch (error) {
+    console.error('Could not resolve the Cognito logout endpoint', error?.name);
+    // The Cloud IDE session is gone, but Managed Login may still sign the
+    // browser back in without credentials; say so instead of claiming success.
+    response = authPageResponse({
+      status: '502',
+      title: 'Sign-out incomplete',
+      message:
+        'You are signed out of the Cloud IDE, but the Cognito sign-in session could not be ended. Sign in and sign out again to end it.',
+    });
+  }
+  response.headers['set-cookie'] = [{ key: 'Set-Cookie', value: expiredAccessCookie() }];
+  return response;
+}
+
+async function getCognitoClient() {
+  if (cachedCognitoClient && Date.now() - cognitoClientCachedAt < COGNITO_CLIENT_CACHE_MS) {
+    return cachedCognitoClient;
+  }
+  const parameter = await ssm.send(new GetParameterCommand({ Name: cfg.COGNITO_PARAMETER_NAME }));
+  const { userPoolId, clientId } = JSON.parse(parameter.Parameter?.Value ?? '{}');
+  if (!userPoolId || !clientId) {
+    throw new Error('Cognito parameter is missing userPoolId or clientId');
+  }
+  const described = await cognitoIdp.send(
+    new DescribeUserPoolClientCommand({ UserPoolId: userPoolId, ClientId: clientId }),
+  );
+  const clientSecret = described.UserPoolClient?.ClientSecret;
+  if (!clientSecret) {
+    throw new Error('Cognito app client has no secret');
+  }
+  cachedCognitoClient = { userPoolId, clientId, clientSecret };
+  cognitoClientCachedAt = Date.now();
+  return cachedCognitoClient;
+}
+
+/** One verifier per pool/client, so its JWKS cache survives across requests. */
+function getIdTokenVerifier({ userPoolId, clientId }) {
+  if (cachedIdTokenVerifier?.userPoolId !== userPoolId || cachedIdTokenVerifier.clientId !== clientId) {
+    cachedIdTokenVerifier = {
+      userPoolId,
+      clientId,
+      verifier: CognitoJwtVerifier.create({ userPoolId, clientId, tokenUse: 'id' }),
+    };
+  }
+  return cachedIdTokenVerifier.verifier;
+}
+
+function unauthenticatedResponse(headers, framedRoute) {
+  if (framedRoute) {
+    // The control page runs inside the editor; Cognito refuses to be framed,
+    // so sign-in must replace the whole tab.
+    const response = sessionControlResponse({
+      hasSession: false,
+      customControls: [
+        '<p class="status error">Your Cloud IDE sign-in has expired.</p>',
+        '<a class="button primary" href="/auth/login" target="_top">Sign in again</a>',
+      ].join(''),
+    });
+    response.status = '401';
+    response.statusDescription = 'Unauthorized';
+    return response;
+  }
+  if (isHtmlNavigation(headers)) {
+    return redirectTo('/auth/login');
+  }
+  return {
+    status: '401',
+    statusDescription: 'Unauthorized',
+    headers: {
+      'cache-control': [{ key: 'Cache-Control', value: 'no-store' }],
+      'content-type': [{ key: 'Content-Type', value: 'text/plain; charset=utf-8' }],
+    },
+    body: 'Sign in to the Cloud IDE at /auth/login.',
   };
 }
 
@@ -767,73 +1019,20 @@ function parseFormBody(body) {
   }
 }
 
-function parseLoginForm(body) {
-  const params = parseFormBody(body);
-  if (!params) return null;
-  return {
-    username: params.get('username') ?? '',
-    password: params.get('password') ?? '',
-  };
-}
-
 function createMicrovmSessionCookie(sessionId) {
   return `mvm-session=${sessionId}; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=${cfg.MAX_DURATION_SEC}`;
 }
 
-function createAccessCookie(password, now = Date.now()) {
-  const expiresAt = Math.floor(now / 1000) + cfg.ACCESS_COOKIE_MAX_AGE_SEC;
-  const payload = String(expiresAt);
-  const signature = signAccessCookie(payload, password);
-  return `${cfg.ACCESS_COOKIE_NAME}=${payload}.${signature}; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=${cfg.ACCESS_COOKIE_MAX_AGE_SEC}`;
+function createAccessCookie(value) {
+  return `${cfg.ACCESS_COOKIE_NAME}=${value}; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=${cfg.ACCESS_COOKIE_MAX_AGE_SEC}`;
 }
 
-async function isAccessCookieValid(value, now = Date.now()) {
-  if (!value) {
-    return false;
-  }
-  const expectedPassword = await getAccessPassword();
-  return isAccessCookieValidForPassword(value, expectedPassword, now);
+function expiredAccessCookie() {
+  return `${cfg.ACCESS_COOKIE_NAME}=; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=0`;
 }
 
-function isAccessCookieValidForPassword(value, password, now = Date.now()) {
-  if (!value) {
-    return false;
-  }
-  const separator = value.indexOf('.');
-  if (separator <= 0) {
-    return false;
-  }
-  const payload = value.slice(0, separator);
-  const signature = value.slice(separator + 1);
-  const expiresAt = Number(payload);
-  const nowSeconds = Math.floor(now / 1000);
-  if (!Number.isSafeInteger(expiresAt) || expiresAt <= nowSeconds) {
-    return false;
-  }
-  // Reject cookies outside the configured lifetime even if their signature is
-  // valid, which bounds damage if the shared password is ever disclosed.
-  if (expiresAt > nowSeconds + cfg.ACCESS_COOKIE_MAX_AGE_SEC + 60) {
-    return false;
-  }
-  return secureEqual(signature, signAccessCookie(payload, password));
-}
-
-function signAccessCookie(payload, password) {
-  return createHmac('sha256', password).update(`omp-cloud-ide:${payload}`).digest('base64url');
-}
-
-async function getAccessPassword() {
-  if (cachedPassword && Date.now() - passwordCachedAt < PASSWORD_CACHE_MS) {
-    return cachedPassword;
-  }
-
-  const response = await secrets.send(new GetSecretValueCommand({ SecretId: cfg.AUTH_SECRET_ID }));
-  if (!response.SecretString) {
-    throw new Error('Cloud IDE access password is not a SecretString');
-  }
-  cachedPassword = response.SecretString;
-  passwordCachedAt = Date.now();
-  return cachedPassword;
+function expiredOauthCookie() {
+  return `${cfg.OAUTH_COOKIE_NAME}=; Path=/auth/callback; Secure; HttpOnly; SameSite=Lax; Max-Age=0`;
 }
 
 function secureEqual(actual, expected) {
@@ -842,13 +1041,38 @@ function secureEqual(actual, expected) {
   return actualBuffer.length === expectedBuffer.length && timingSafeEqual(actualBuffer, expectedBuffer);
 }
 
-function loginPageResponse(errorMessage = '', status = '200') {
-  const error = errorMessage
-    ? `<p class="error" role="alert">${escapeHtml(errorMessage)}</p>`
-    : '<p class="hint">Use the personal Cloud IDE credentials.</p>';
+/**
+ * Completes sign-in with a same-site navigation. A 302 would continue the
+ * redirect chain that Cognito started cross-site, and browsers withhold
+ * SameSite=Strict cookies from such a chain, looping back to sign-in.
+ */
+function signedInResponse(accessCookie) {
+  const response = authPageResponse({
+    title: 'Signed in',
+    message: 'Opening the Cloud IDE session chooser...',
+    refreshTo: '/session/select',
+  });
+  response.headers['set-cookie'] = [
+    { key: 'Set-Cookie', value: createAccessCookie(accessCookie) },
+    { key: 'Set-Cookie', value: expiredOauthCookie() },
+  ];
+  return response;
+}
+
+function authFailureResponse(status, message) {
+  const response = authPageResponse({ status, title: 'Sign-in failed', message });
+  response.headers['set-cookie'] = [{ key: 'Set-Cookie', value: expiredOauthCookie() }];
+  return response;
+}
+
+function signedOutResponse() {
+  return authPageResponse({ title: 'Signed out', message: 'You have signed out of the Cloud IDE.' });
+}
+
+function authPageResponse({ status = '200', title, message, refreshTo = '' }) {
   return {
     status,
-    statusDescription: status === '200' ? 'OK' : status === '400' ? 'Bad Request' : 'Unauthorized',
+    statusDescription: status === '200' ? 'OK' : 'Error',
     headers: {
       'cache-control': [{ key: 'Cache-Control', value: 'no-store' }],
       'content-type': [{ key: 'Content-Type', value: 'text/html; charset=utf-8' }],
@@ -856,31 +1080,34 @@ function loginPageResponse(errorMessage = '', status = '200') {
       'content-security-policy': [
         {
           key: 'Content-Security-Policy',
-          value:
-            "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
+          value: "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'",
         },
       ],
     },
     body: [
       '<!doctype html><html lang="ja"><head><meta charset="utf-8">',
       '<meta name="viewport" content="width=device-width,initial-scale=1">',
-      '<title>OMP Cloud IDE Login</title>',
+      refreshTo ? `<meta http-equiv="refresh" content="0;url=${escapeHtml(refreshTo)}">` : '',
+      `<title>${escapeHtml(title)} - OMP Cloud IDE</title>`,
       '<style>html{color-scheme:dark}body{font-family:system-ui,sans-serif;background:#111827;color:#e5e7eb;',
       'min-height:100vh;margin:0;display:grid;place-items:center}.card{width:min(24rem,calc(100% - 2rem));',
       'background:#1f2937;border:1px solid #374151;border-radius:12px;padding:2rem;box-shadow:0 20px 40px #0006}',
-      'h1{font-size:1.35rem;margin:0 0 .5rem}.hint{color:#9ca3af}.error{color:#fca5a5}',
-      'label{display:block;margin-top:1rem;font-size:.9rem}input{box-sizing:border-box;width:100%;margin-top:.35rem;',
-      'padding:.7rem;border:1px solid #4b5563;border-radius:6px;background:#111827;color:#fff}',
-      'button{width:100%;margin-top:1.25rem;padding:.75rem;border:0;border-radius:6px;background:#2563eb;',
-      'color:#fff;font-weight:600;cursor:pointer}</style></head><body><main class="card">',
-      '<h1>OMP Cloud IDE</h1>',
-      error,
-      '<form method="post" action="/login" autocomplete="on">',
-      `<label>Username<input name="username" autocomplete="username" required value="${escapeHtml(cfg.BASIC_AUTH_USERNAME)}"></label>`,
-      '<label>Password<input name="password" type="password" autocomplete="current-password" required autofocus></label>',
-      '<button type="submit">Sign in</button></form></main></body></html>',
+      'h1{font-size:1.35rem;margin:0 0 .5rem}p{color:#9ca3af;line-height:1.5}a{display:block;margin-top:1.25rem;',
+      'padding:.75rem;border-radius:6px;background:#2563eb;color:#fff;font-weight:600;text-align:center;',
+      'text-decoration:none}</style></head><body><main class="card">',
+      `<h1>${escapeHtml(title)}</h1><p>${escapeHtml(message)}</p>`,
+      refreshTo ? '' : '<a href="/auth/login">Sign in</a>',
+      '</main></body></html>',
     ].join(''),
   };
+}
+
+function signOutForm() {
+  // target=_top: the control page is framed, and Cognito's logout page refuses framing.
+  return [
+    '<form method="post" action="/auth/logout" target="_top">',
+    '<button class="signout" type="submit">Sign out</button></form>',
+  ].join('');
 }
 
 function sessionSelectionResponse({
@@ -961,8 +1188,7 @@ function sessionSelectionResponse({
       'content-security-policy': [
         {
           key: 'Content-Security-Policy',
-          value:
-            "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
+          value: `default-src 'none'; style-src 'unsafe-inline'; ${FORM_ACTION}; base-uri 'none'; frame-ancestors 'none'`,
         },
       ],
     },
@@ -983,6 +1209,7 @@ function sessionSelectionResponse({
       'cursor:pointer}.primary{background:#2563eb}.new{background:#374151}.new-session{margin-top:1rem;padding-top:1.5rem;',
       'border-top:1px solid #374151}h2{font-size:1.1rem;margin:2rem 0 .25rem}.untracked .session{border-color:#92400e}',
       '.session form+form{margin-top:.5rem}.danger{background:#991b1b}',
+      '.signout{margin-top:1rem;background:transparent;border:1px solid #4b5563;color:#d1d5db}',
       '</style></head><body><main class="shell">',
       '<h1>Choose a Cloud IDE session</h1>',
       '<p class="hint">Reconnect to a running or suspended MicroVM, or start a clean session.</p>',
@@ -993,6 +1220,7 @@ function sessionSelectionResponse({
       `<input type="hidden" name="requestId" value="${escapeHtml(requestId)}">`,
       '<button class="new" type="submit">Start a new MicroVM</button></form>',
       untrackedSection,
+      signOutForm(),
       '</main></body></html>',
     ].join(''),
   };
@@ -1038,6 +1266,7 @@ function sessionControlResponse({
       '<button class="danger" type="submit">Terminate permanently...</button></form>',
     ].join('');
   }
+  controls += signOutForm();
   if (customControls !== null) controls = customControls;
 
   const headers = {
@@ -1047,8 +1276,7 @@ function sessionControlResponse({
     'content-security-policy': [
       {
         key: 'Content-Security-Policy',
-        value:
-          "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'self'",
+        value: `default-src 'none'; style-src 'unsafe-inline'; ${FORM_ACTION}; base-uri 'none'; frame-ancestors 'self'`,
       },
     ],
   };
@@ -1071,7 +1299,8 @@ function sessionControlResponse({
       '.running{color:#86efac}.paused{color:#fde68a}.error{color:#fca5a5}form{margin-top:1.25rem}button,.button{box-sizing:border-box;',
       'display:block;width:100%;padding:.75rem;border:0;border-radius:6px;color:#fff;font-weight:600;cursor:pointer;',
       'text-align:center;text-decoration:none}.primary{background:#2563eb}.danger{background:#b91c1c}.secondary{background:#374151;',
-      'margin-top:.75rem}</style></head><body><main class="card"><h1>OMP Cloud IDE Control</h1>',
+      'margin-top:.75rem}.signout{background:transparent;border:1px solid #4b5563;color:#d1d5db}',
+      '</style></head><body><main class="card"><h1>OMP Cloud IDE Control</h1>',
       controls,
       '</main></body></html>',
     ].join(''),
@@ -1178,12 +1407,12 @@ function postOnlyResponse() {
   };
 }
 
-function methodNotAllowedResponse() {
+function methodNotAllowedResponse(allow = 'GET, HEAD, POST') {
   return {
     status: '405',
     statusDescription: 'Method Not Allowed',
     headers: {
-      allow: [{ key: 'Allow', value: 'GET, HEAD, POST' }],
+      allow: [{ key: 'Allow', value: allow }],
       'cache-control': [{ key: 'Cache-Control', value: 'no-store' }],
       'content-type': [{ key: 'Content-Type', value: 'text/plain; charset=utf-8' }],
     },
@@ -1191,12 +1420,12 @@ function methodNotAllowedResponse() {
   };
 }
 
-function redirectToLogin() {
+function redirectTo(location, status = '302') {
   return {
-    status: '302',
-    statusDescription: 'Found',
+    status,
+    statusDescription: status === '303' ? 'See Other' : 'Found',
     headers: {
-      location: [{ key: 'Location', value: '/login' }],
+      location: [{ key: 'Location', value: location }],
       'cache-control': [{ key: 'Cache-Control', value: 'no-store' }],
     },
   };
@@ -1263,7 +1492,7 @@ function stripEdgeCookies(headers) {
         .filter((part) => {
           const separator = part.indexOf('=');
           const name = separator < 0 ? '' : part.slice(0, separator).trim();
-          return name !== cfg.ACCESS_COOKIE_NAME && name !== 'mvm-session';
+          return name !== cfg.ACCESS_COOKIE_NAME && name !== cfg.OAUTH_COOKIE_NAME && name !== 'mvm-session';
         })
         .join('; '),
     }))
@@ -1286,19 +1515,16 @@ function parseCookies(cookieHeaders) {
 }
 
 exports.__test = {
-  createAccessCookie,
+  authSessionKey,
   createMicrovmSessionCookie,
   escapeHtml,
-  isAccessCookieValidForPassword,
-  loginPageResponse,
+  getIdTokenVerifier,
   pausedSessionResponse,
   parseCookies,
-  parseLoginForm,
   postOnlyResponse,
   resumingPageResponse,
   sessionAttachedResponse,
   sessionControlResponse,
   sessionSelectionResponse,
   startSession,
-  signAccessCookie,
 };

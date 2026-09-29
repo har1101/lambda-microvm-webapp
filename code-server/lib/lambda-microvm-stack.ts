@@ -3,6 +3,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as cloudfront from 'aws-cdk-lib/aws-cloudfront';
 import * as origins from 'aws-cdk-lib/aws-cloudfront-origins';
+import * as cognito from 'aws-cdk-lib/aws-cognito';
 import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as kms from 'aws-cdk-lib/aws-kms';
@@ -10,7 +11,7 @@ import * as lambda from 'aws-cdk-lib/aws-lambda';
 import * as logs from 'aws-cdk-lib/aws-logs';
 import * as s3 from 'aws-cdk-lib/aws-s3';
 import * as s3assets from 'aws-cdk-lib/aws-s3-assets';
-import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
+import * as ssm from 'aws-cdk-lib/aws-ssm';
 import * as cdk from 'aws-cdk-lib/core';
 import type { Construct } from 'constructs';
 import { config, egressConnectorArn, executionRoleArn, imageArn, ingressConnectorArn } from './config';
@@ -160,13 +161,40 @@ export class OmpCloudIdeEdgeStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props: cdk.StackProps) {
     super(scope, id, props);
 
-    const accessPassword = new secretsmanager.Secret(this, 'AccessPassword', {
-      secretName: config.edge.accessSecretName,
-      description: 'Edge login password checked before a MicroVM can be started',
-      generateSecretString: {
-        passwordLength: 32,
-        excludePunctuation: true,
+    // One personal user, created by an administrator. Nobody can sign up.
+    const userPool = new cognito.UserPool(this, 'UserPool', {
+      userPoolName: 'omp-cloud-ide',
+      featurePlan: cognito.FeaturePlan.ESSENTIALS,
+      selfSignUpEnabled: false,
+      signInAliases: { email: true },
+      autoVerify: { email: true },
+      mfa: cognito.Mfa.REQUIRED,
+      mfaSecondFactor: { otp: true, sms: false },
+      passwordPolicy: {
+        minLength: 14,
+        requireLowercase: true,
+        requireUppercase: true,
+        requireDigits: true,
+        requireSymbols: false,
       },
+      accountRecovery: cognito.AccountRecovery.EMAIL_ONLY,
+      deletionProtection: true,
+      removalPolicy: cdk.RemovalPolicy.RETAIN,
+    });
+    const userPoolDomain = userPool.addDomain('Domain', {
+      cognitoDomain: { domainPrefix: config.edge.cognitoDomainPrefix },
+      managedLoginVersion: cognito.ManagedLoginVersion.NEWER_MANAGED_LOGIN,
+    });
+    const cognitoDomain = `${config.edge.cognitoDomainPrefix}.auth.${config.edgeRegion}.amazoncognito.com`;
+
+    // Browser sessions after a Cognito login. Rows are keyed by the SHA-256 of
+    // the opaque cookie value, so a table read never yields a usable cookie.
+    const authTable = new dynamodb.Table(this, 'AuthSessionsTable', {
+      tableName: config.edge.authTableName,
+      partitionKey: { name: 'id', type: dynamodb.AttributeType.STRING },
+      billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+      timeToLiveAttribute: 'ttl',
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
     });
 
     const table = new dynamodb.Table(this, 'SessionsTable', {
@@ -235,7 +263,21 @@ export class OmpCloudIdeEdgeStack extends cdk.Stack {
       'dynamodb:UpdateItem',
       'dynamodb:DeleteItem',
     );
-    accessPassword.grantRead(edgeRole);
+    authTable.grant(edgeRole, 'dynamodb:GetItem', 'dynamodb:PutItem', 'dynamodb:DeleteItem');
+    edgeRole.addToPolicy(
+      new iam.PolicyStatement({
+        actions: ['ssm:GetParameter'],
+        resources: [`arn:aws:ssm:${config.edgeRegion}:${config.account}:parameter${config.edge.cognitoParameterName}`],
+      }),
+    );
+    edgeRole.addToPolicy(
+      new iam.PolicyStatement({
+        // The client secret never enters the asset or a parameter; the edge
+        // function reads it from Cognito at runtime.
+        actions: ['cognito-idp:DescribeUserPoolClient'],
+        resources: [userPool.userPoolArn],
+      }),
+    );
     edgeRole.addToPolicy(
       new iam.PolicyStatement({
         actions: ['logs:CreateLogGroup', 'logs:CreateLogStream', 'logs:PutLogEvents'],
@@ -252,14 +294,17 @@ export class OmpCloudIdeEdgeStack extends cdk.Stack {
       EXECUTION_ROLE_ARN: executionRoleArn,
       INGRESS: ingressConnectorArn(config.microvmRegion),
       EGRESS: egressConnectorArn(config.microvmRegion),
-      // Lambda@Edge does not support environment variables. Embed the stable
-      // secret name instead of an unresolved CDK token so asset hashes remain
-      // deterministic and Secrets Manager resolves the current ARN at runtime.
-      AUTH_SECRET_ID: config.edge.accessSecretName,
-      AUTH_SECRET_REGION: config.edgeRegion,
-      BASIC_AUTH_USERNAME: config.edge.basicAuthUsername,
+      // Lambda@Edge does not support environment variables. Embed only stable
+      // names here so asset hashes stay deterministic; the generated User Pool
+      // and Client IDs are resolved at runtime from the SSM parameter.
+      AUTH_TABLE: config.edge.authTableName,
+      COGNITO_REGION: config.edgeRegion,
+      COGNITO_DOMAIN: cognitoDomain,
+      COGNITO_PARAMETER_NAME: config.edge.cognitoParameterName,
       ACCESS_COOKIE_NAME: config.edge.accessCookieName,
       ACCESS_COOKIE_MAX_AGE_SEC: config.edge.accessCookieMaxAgeSec,
+      OAUTH_COOKIE_NAME: config.edge.oauthCookieName,
+      LOGIN_TTL_SEC: config.edge.loginTtlSec,
       TOKEN_DURATION_MIN: config.edge.tokenDurationMin,
       TOKEN_REFRESH_THRESHOLD: config.edge.tokenRefreshThresholdMin,
       MAX_DURATION_SEC: config.edge.maxDurationSec,
@@ -373,7 +418,7 @@ export class OmpCloudIdeEdgeStack extends cdk.Stack {
           {
             functionVersion: edgeVersion,
             eventType: cloudfront.LambdaEdgeEventType.ORIGIN_REQUEST,
-            // The edge handler consumes only the small /login form body. Other
+            // The edge handler consumes only small /session/* form bodies. Other
             // request bodies remain read-only and CloudFront forwards them intact.
             includeBody: true,
           },
@@ -386,17 +431,54 @@ export class OmpCloudIdeEdgeStack extends cdk.Stack {
       },
     });
 
+    const distributionUrl = `https://${distribution.distributionDomainName}`;
+    const userPoolClient = userPool.addClient('WebClient', {
+      userPoolClientName: 'omp-cloud-ide-edge',
+      // Confidential client: Lambda@Edge exchanges the code server-side.
+      generateSecret: true,
+      // Only the Managed Login authorization-code flow; no direct password APIs.
+      authFlows: { userPassword: false, userSrp: false, custom: false, adminUserPassword: false },
+      oAuth: {
+        flows: { authorizationCodeGrant: true },
+        scopes: [cognito.OAuthScope.OPENID, cognito.OAuthScope.EMAIL],
+        callbackUrls: [`${distributionUrl}/auth/callback`],
+        logoutUrls: [`${distributionUrl}/auth/signed-out`],
+      },
+      supportedIdentityProviders: [cognito.UserPoolClientIdentityProvider.COGNITO],
+      // Tokens are only verified once in /auth/callback and then discarded; the
+      // browser session lives in the auth table. These are the Cognito minimums.
+      idTokenValidity: cdk.Duration.minutes(5),
+      accessTokenValidity: cdk.Duration.minutes(5),
+      refreshTokenValidity: cdk.Duration.minutes(60),
+      enableTokenRevocation: true,
+      preventUserExistenceErrors: true,
+    });
+    // Managed Login v2 renders an error page until the client has a branding style.
+    const branding = new cognito.CfnManagedLoginBranding(this, 'ManagedLoginBranding', {
+      userPoolId: userPool.userPoolId,
+      clientId: userPoolClient.userPoolClientId,
+      useCognitoProvidedValues: true,
+    });
+    branding.node.addDependency(userPoolDomain);
+    new ssm.StringParameter(this, 'CognitoParameter', {
+      parameterName: config.edge.cognitoParameterName,
+      description: 'Cognito IDs resolved at runtime by the Cloud IDE Lambda@Edge function',
+      stringValue: cdk.Stack.of(this).toJsonString({
+        userPoolId: userPool.userPoolId,
+        clientId: userPoolClient.userPoolClientId,
+      }),
+    });
+
     new cdk.CfnOutput(this, 'DistributionUrl', {
-      value: `https://${distribution.distributionDomainName}`,
-      description: 'Open this URL and authenticate with the configured edge login user',
+      value: distributionUrl,
+      description: 'Open this URL and sign in with the Cognito user',
     });
-    new cdk.CfnOutput(this, 'AccessPasswordSecretArn', {
-      value: accessPassword.secretArn,
-      description: 'Reveal this value manually in Secrets Manager when signing in',
+    new cdk.CfnOutput(this, 'UserPoolId', {
+      value: userPool.userPoolId,
+      description: 'Create the single Cloud IDE user here with admin-create-user',
     });
-    new cdk.CfnOutput(this, 'BasicAuthUsername', {
-      value: config.edge.basicAuthUsername,
-      description: 'Username accepted by the edge login form and legacy HTTP Basic clients',
+    new cdk.CfnOutput(this, 'ManagedLoginDomain', {
+      value: `https://${cognitoDomain}`,
     });
     new cdk.CfnOutput(this, 'SessionsTableName', {
       value: table.tableName,

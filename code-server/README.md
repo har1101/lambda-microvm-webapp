@@ -6,8 +6,9 @@ Personal browser IDE for `har1101`. CloudFront authenticates the browser before 
 
 ```text
 Browser
-  -> CloudFront + Lambda@Edge password form (us-east-1)
-     -> signed, HttpOnly access cookie
+  -> CloudFront + Lambda@Edge (us-east-1)
+     -> Cognito Managed Login (password + TOTP MFA, authorization code + PKCE)
+     -> opaque, HttpOnly access cookie (hash stored in DynamoDB)
      -> suspend/resume/confirmed terminate control page
   -> Lambda MicroVM endpoint token injection
   -> code-server :8080 (ap-northeast-1)
@@ -33,7 +34,7 @@ Check the auth status bar after each new MicroVM starts and before terminating i
 | Stack | Region | Purpose |
 | --- | --- | --- |
 | `OmpCloudIdeMicrovmStack` | `ap-northeast-1` | MicroVM image, KMS key, retained S3 state, runtime IAM role |
-| `OmpCloudIdeEdgeStack` | `us-east-1` | CloudFront, Lambda@Edge, access password, session table |
+| `OmpCloudIdeEdgeStack` | `us-east-1` | CloudFront, Lambda@Edge, Cognito User Pool / Managed Login, auth-session table, MicroVM session table |
 
 ## Deploy with cdkd
 
@@ -58,9 +59,18 @@ The normal deploy uses `--full-wait` so the MicroVM image build and CloudFront d
 
 ## First access
 
-1. Read `DistributionUrl`, `BasicAuthUsername`, and `AccessPasswordSecretArn` from the edge stack outputs.
-2. Open the distribution URL.
-3. Enter the output username and reveal the access password manually in the AWS Secrets Manager console. The form issues a signed, `HttpOnly`, `SameSite=Strict` access cookie for the MicroVM session lifetime. Do not print the password into build logs or commit it.
+1. Read `DistributionUrl` and `UserPoolId` from the edge stack outputs (`ManagedLoginDomain` and `SessionsTableName` are also exported).
+2. Create the single user (self sign-up is disabled):
+
+   ```bash
+   aws cognito-idp admin-create-user --region us-east-1 \
+     --user-pool-id <UserPoolId> --username <email> \
+     --user-attributes Name=email,Value=<email> Name=email_verified,Value=true \
+     --desired-delivery-mediums EMAIL
+   ```
+
+   Cognito emails a temporary password. Do not paste it into build logs or commit it.
+3. Open the distribution URL. Edge redirects to Cognito Managed Login; the first sign-in forces a new password and TOTP authenticator registration. After the callback, Edge issues an opaque `HttpOnly`, `SameSite=Strict` access cookie valid for 8 hours.
 4. In the code-server terminal, start OMP and log in:
 
    ```text
@@ -89,7 +99,7 @@ The image also installs a global OMP configuration with interactive goal continu
 
 OMP's Puppeteer browser prelude is enabled in headless mode. A checksum-pinned arm64 Chromium build is expanded into `/opt/chromium` during the image build and selected with `PUPPETEER_EXECUTABLE_PATH`, so the first E2E run does not depend on a browser download. `tab.screenshot()` evidence is saved under `/home/vscode/workspace/.artifacts/screenshots` by default.
 
-Opening `/login` only renders the access form; it does not call `RunMicrovm`. After successful login, `/session/select` lists running and suspended MicroVMs. The user explicitly chooses an existing session to connect or resume, or starts a new MicroVM. Temporary origin `502`/`504` responses preserve the browser's `mvm-session` association and return to the chooser instead of orphaning a live workspace.
+Opening `/auth/login` only redirects to Cognito Managed Login; it does not call `RunMicrovm`. After a successful sign-in, `/session/select` lists running and suspended MicroVMs. The user explicitly chooses an existing session to connect or resume, or starts a new MicroVM. The chooser and control pages have a **Sign out** button (`POST /auth/logout`) that deletes the Edge session and ends the Cognito session. Temporary origin `502`/`504` responses preserve the browser's `mvm-session` association and return to the chooser instead of orphaning a live workspace.
 
 New starts use a form UUID and a conditional DynamoDB claim to avoid duplicate MicroVMs. If registration fails after `RunMicrovm`, Edge requests compensation termination. The chooser lists MicroVMs without a session row; because a newly starting VM can briefly appear there, verify its ID and use the AWS API/Console for manual cleanup rather than an in-page untracked termination button.
 
@@ -128,11 +138,26 @@ AWS_PROFILE=fukuchi AWS_REGION=ap-northeast-1 npx cdkd events OmpCloudIdeMicrovm
 AWS_PROFILE=fukuchi AWS_REGION=us-east-1 npx cdkd events OmpCloudIdeEdgeStack --stack-region us-east-1
 ```
 
-The S3 bucket and KMS key use `Retain`; destroying the stacks does not delete persisted OAuth state. Review retained data separately before any manual deletion.
+The S3 bucket and KMS key use `Retain`; destroying the stacks does not delete persisted OAuth state. Review retained data separately before any manual deletion. The Cognito User Pool is also retained with deletion protection; the auth-session table is destroyed, which signs out every browser.
+
+Every user in the Cognito User Pool is fully authorized: pool membership is the access boundary, so any user an administrator creates (including a temporary test user) can reach every MicroVM and the shared OAuth state. Delete such users as soon as they are no longer needed.
+
+Disabling a user or changing its password in Cognito does not end Cloud IDE sessions that were already issued (they last up to 8 hours). To revoke access immediately, end the Cognito sessions and delete every Edge session row:
+
+```bash
+aws cognito-idp admin-user-global-sign-out --region us-east-1 --user-pool-id <UserPoolId> --username <email>
+aws dynamodb scan --region us-east-1 --table-name omp-cloud-ide-auth-sessions \
+  --filter-expression 'begins_with(id, :p)' --expression-attribute-values '{":p":{"S":"sess#"}}' \
+  --projection-expression id --query 'Items[].id.S' --output text | tr '\t' '\n' |
+  while read -r id; do
+    aws dynamodb delete-item --region us-east-1 --table-name omp-cloud-ide-auth-sessions --key "{\"id\":{\"S\":\"$id\"}}"
+  done
+```
 
 ## Security notes
 
-- The browser must pass the Lambda@Edge password form before `RunMicrovm` is called. Legacy HTTP Basic credentials remain accepted for non-browser smoke checks, but unauthenticated browsers are redirected to `/login` instead of relying on a native Basic-auth dialog.
+- The browser must sign in through Cognito Managed Login (password + TOTP MFA; Cognito's built-in lockout limits guessing) before `RunMicrovm` is called. Edge uses the authorization code flow with PKCE, state and nonce, verifies the ID token, and then discards the tokens. The browser only holds a random session cookie; DynamoDB stores its SHA-256 hash with an 8-hour expiry. Unauthenticated HTML navigation is redirected to `/auth/login`; other requests receive `401`. HTTP Basic and the former password form have been removed.
+- The design is single-user. Sessions are not scoped to a Cognito `sub`, and all MicroVMs restore the shared `personal/` OAuth state; per-user session ownership and per-user S3 prefixes/roles are required before adding a second user.
 - code-server has no independent password because it is reachable only through the AWS MicroVM proxy token injected by the authenticated edge function.
 - Edge removes its own access and session cookies before forwarding to code-server while preserving code-server cookies. This does not isolate same-origin `/proxy/<port>/` apps from session control routes or credentials readable inside the VM.
 - The MicroVM execution role can access only its auth-state prefix and its log group.

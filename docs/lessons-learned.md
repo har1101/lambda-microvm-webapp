@@ -65,13 +65,13 @@ Suspend中は同じMicroVMのメモリとディスク状態へ戻れるが、最
 - `OmpCloudIdeMicrovmStack`: `ap-northeast-1`
 - `OmpCloudIdeEdgeStack`: `us-east-1`
 
-リージョンを単純に東京へ一括変更するとLambda@Edge要件を満たせない。DynamoDBとSecrets ManagerはEdge側の`us-east-1`、MicroVM Image・S3・KMSは東京側という分担になっている。
+リージョンを単純に東京へ一括変更するとLambda@Edge要件を満たせない。DynamoDB、Cognito User Pool、SSM ParameterはEdge側の`us-east-1`、MicroVM Image・S3・KMSは東京側という分担になっている。
 
 ### 2.2 Lambda@Edgeでは通常の環境変数に依存できない
 
 Lambda@Edgeの設定値は、CDK synth時に`artifact/edge/config.json`へ書き出してバンドルしている。ここへ入れるのはリージョン、リソース名、ARN、設定時間などの非秘密情報だけである。
 
-アクセスパスワードそのものは埋め込まず、安定したSecrets ManagerのSecret名だけを設定し、実行時に取得する。
+秘密情報は埋め込まない。CloudFormationが生成するCognitoのUser Pool IDとClient IDは固定名のSSM Parameter(`/omp-cloud-ide/cognito`)へ書き、`config.json`にはParameter名だけを入れて実行時に読む。Client secretはCloudFormationが返せないため、Edgeが`cognito-idp:DescribeUserPoolClient`で実行時に取得する。どちらも5分キャッシュする。
 
 注意点:
 
@@ -144,7 +144,7 @@ build/runtime Roleは`lambda.amazonaws.com`をPrincipalとし、`aws:SourceAccou
 
 Chromeでは正常でも、Codex内蔵ブラウザではBasic認証ダイアログが一瞬表示されて閉じる挙動があった。ブラウザ実装・WebView・認証ダイアログの扱いに依存するため、ブラウザE2Eの入口として不安定だった。
 
-対策として、Lambda@EdgeがHTMLログインフォームを返し、成功時に署名付きCookieを発行する方式へ変更した。Basic認証は非ブラウザのスモークチェック互換用として残している。
+対策として、Lambda@EdgeがHTMLログインフォームを返し、成功時に署名付きCookieを発行する方式へ変更した。その後、このフォームとBasic認証の互換経路はどちらも削除し、Cognito Managed Loginへのリダイレクトに置き換えた(4.3〜4.5節)。
 
 ### 4.2 ログイン画面を開くだけでMicroVMを起動してはいけない
 
@@ -152,40 +152,42 @@ Chromeでは正常でも、Codex内蔵ブラウザではBasic認証ダイアロ�
 
 現在は次の境界を設けた。
 
-- `GET /login`: フォーム表示のみ
-- ログイン成功: `/session/select`へ移動するだけ
+- `GET /auth/login`: Cognitoへのリダイレクトのみ
+- サインイン成功: `/session/select`へ移動するだけ
 - `POST /session/select`かつ`action=new`: 初めて`RunMicrovm`
 
 課金や状態変更を伴う操作は、明示的なPOST操作へ寄せるべきである。
 
-### 4.3 CookieはHMAC署名・期限・属性を揃える
+### 4.3 アクセスCookieは不透明値にし、サーバーにはハッシュだけを置く
 
-アクセスCookieはSecrets Managerのパスワードを鍵にHMAC-SHA256で署名し、期限改ざんを検出する。さらに、現在時刻から設定寿命を大きく超える未来期限も拒否する。
+アクセスCookieは32バイトの乱数(base64url)で、中身に意味を持たせない。DynamoDBの認証セッション表には`sess#<SHA-256(値)>`として`sub`と期限だけを保存するので、表を読めてもCookieは再現できない。行を消せばサーバー側で即座に失効でき(ログアウト)、TTL削除が遅れても`expiresAt`で期限切れを拒否する。Cognitoのtokenは検証後に捨て、ブラウザにも表にも保存しない。
 
-両Cookieに次を付けている。
+アクセスCookieには次を付けている。
 
 - `Secure`
 - `HttpOnly`
 - `SameSite=Strict`
 - 明示的な`Max-Age`
 
-HTMLレスポンスには`Cache-Control: no-store`、CSP、`X-Content-Type-Options`を付ける。比較には`timingSafeEqual`を使う。
+一方、サインイン途中のstateを持つ`omp-cloud-ide-oauth` Cookieは`SameSite=Lax`、`Path=/auth/callback`、10分にしている。Cognitoからのトップレベルのリダイレクトでcallbackへ届かなければならないためである。state・nonce・PKCE verifierは`login#<state>`行に置き、callbackで条件付き削除して1回限りにする。
 
-### 4.4 通常デプロイでパスワードは毎回変わらない
+HTMLレスポンスには`Cache-Control: no-store`、CSP、`X-Content-Type-Options`を付ける。
 
-同一のSecrets Managerリソースを更新する通常デプロイでは、生成済みSecret値は維持される。Secretの置換、削除・再作成、明示的なローテーションを行った場合は変わる。
+### 4.4 callbackは302ではなく200 + meta refreshで返す
 
-Edge側はパスワードを5分キャッシュするため、ローテーション直後にはエッジ実行環境ごとに短い移行時間があり得る。パスワードを署名鍵にも使っているため、ローテーション後は既存のアクセスCookieも無効になる。
+callbackで`Set-Cookie`付きの302を`/session/select`へ返すと、ブラウザはそれをCognitoから始まったクロスサイトなリダイレクトの連鎖の続きとして扱い、次のリクエストに`SameSite=Strict`のアクセスCookieを付けない。結果として未ログイン扱いになり、`/auth/login`との間でループする。
 
-### 4.5 現在の認証は「個人用共有パスワード」である
+callbackは200のHTMLで`<meta http-equiv="refresh" content="0;url=/session/select">`を返し、同一サイトの画面から遷移させることで解決した。script不要なのでCSPも緩めずに済む。
 
-これはユーザーディレクトリ、MFA、監査可能な個人識別を持つ認証ではない。単一利用者の入口としては軽量だが、複数ユーザー化する場合はCognito/OIDCなどへ置き換えるべきである。
+### 4.5 認証はCognitoだが、分離は単一利用者のままである
+
+CognitoでMFA(TOTP)、ロックアウト、利用者識別(`sub`)は得たが、セッションは`sub`に紐づけておらず、全MicroVMが共有の`personal/`認証状態(GitHub・LLMの資格情報)を復元する。2人目の利用者を追加する前に、sessionの`ownerSub`による所有者限定と、利用者別のS3 prefix・実行Roleが必要である。Cognito側でユーザーを作れば入れてしまうので、自己サインアップは無効にしてある。
 
 ### 4.6 SameSite Cookieだけでは同一origin内の未信頼アプリを防げない
 
 code-server、`/proxy/<port>/`で開く開発アプリ、`/session/select`、`/session/suspend`、`/session/resume`は同じCloudFront originを共有する。cloneしたアプリが同一origin上で任意のJavaScript/HTMLを実行できる場合、SameSite=Strictはそのアプリからの状態変更requestを防がない。
 
-現在はEdgeで認証を検証した後、`omp-cloud-ide-auth`と`mvm-session`だけをorigin-requestの`Cookie`ヘッダーから除去し、code-server固有Cookieは残す。`HttpOnly`だけではサーバーへのCookie転送を防げないためである。ただし同一originアプリから制御routeを呼べることや、同一VMのコードが認証ファイルを読めることは変わらない。
+現在はEdgeで認証を検証した後、`omp-cloud-ide-auth`、`omp-cloud-ide-oauth`、`mvm-session`だけをorigin-requestの`Cookie`ヘッダーから除去し、code-server固有Cookieは残す。`HttpOnly`だけではサーバーへのCookie転送を防げないためである。ただし同一originアプリから制御routeを呼べることや、同一VMのコードが認証ファイルを読めることは変わらない。
 
 したがって現状は「MicroVM内で起動するWebアプリとcloneしたコードも信頼する」という前提を持つ。単純なCSRF tokenも同一originアプリがcontrol pageを読めるなら十分な境界にならない。根本策はIDE/proxy用hostnameとcontrol/auth用hostnameを分離することである。proxy backendへのCookie転送の実機確認、Origin/Referer検証、rate limitは残る課題である。
 
@@ -514,7 +516,7 @@ Image buildやCloudFront更新を含むdeployは数分以上かかる。短いti
 - MicroVM lifecycle hook
 - Lambda@Edge関連付けとsecurity headers
 - IAMのResource範囲
-- HTML escape、CSP、Cookie署名と期限
+- HTML escape、CSP、Cognitoサインイン(PKCE、state、1回限りのnonce)、サインイン済みセッションの要求、サインアウト
 - Suspend/ResumeのPOST制限
 - 一時的`502`でCookieを削除しないこと
 - OMP/Chromium/version pin/非root設定
@@ -553,9 +555,9 @@ CDKは複数IAM actionを1つのStatementへまとめる。`Match.arrayWith`は�
 
 当時の新規VMのうち1台で`omp/install-id`と`github/hosts.yml`が`認証復元失敗`になり、後続の2台は成功した。旧実装の逐次取得によるdeadline枯渇で同じ失敗の並びを再現し、並列取得へ変更した。デプロイ後の新規テストVM 2台では、3ファイルすべての復元と`認証 0分前`を確認し、Suspend/Resume後も維持された。ただし元の実機失敗コードは記録されておらず、同じ原因だったことやS3/KMS固有障害の解消までは証明できない。fail-openのhookが200を返すことと認証復元成功は同一視せず、利用開始時とTerminate前にstatus barを確認する。
 
-### 11.4 SecretをE2Eログへ出さない
+### 11.4 資格情報をE2Eログへ出さない
 
-ブラウザE2EのパスワードはSecrets Managerから実行時に取得し、HTTPクライアント内だけで使用した。過去のスクリプトでは`asm-exec`による子プロセスへの注入、追加のE2EではSDKによるプロセス内取得を使い、スクリーンショット、console、テスト結果へパスワードを出していない。
+ブラウザE2Eで使う資格情報は実行時に取得し、HTTPクライアント内だけで使用する。子プロセスへの注入やSDKによるプロセス内取得を使い、スクリーンショット、console、テスト結果へ資格情報やCookie値を出さない。
 
 ### 11.5 Browser runtimeがあることとOMP Browser E2Eが通ることは別である
 
@@ -599,7 +601,7 @@ Edgeデプロイ直後にテストすると旧Versionが見える可能性があ
 | CloudFront/Lambda@Edge | request、data transfer、Edge invocation/実行時間 |
 | DynamoDB | Get/Put/Update/Scan |
 | S3/KMS | 5分周期の変更確認で変更があったときのPut、Object Version、KMS request、storage |
-| Secrets Manager | Secret保管とAPI call |
+| Cognito | Essentials機能プランのMAU課金(10,000 MAUまでは無料枠)。単一利用者なら無料枠内 |
 | CloudWatch Logs | 取込、保持、検索 |
 
 AWS Budgets、Cost Anomaly Detection、Cost Explorer用tag/配賦を追加し、実測で支配項を判断する。
@@ -608,9 +610,9 @@ AWS Budgets、Cost Anomaly Detection、Cost Explorer用tag/配賦を追加し、
 
 ### 12.6 destroy時の保持方針は非対称である
 
-S3、KMS、MicroVM専用Log Group、Lambda@Edge VersionはRETAINだが、DynamoDB session tableとアクセスパスワードSecretはDeleteである。`cdkd destroy --all`やLogical ID置換をすると、生存MicroVMがあってもDDB関連付けを失い、Secret再作成でパスワード変更とアクセスCookie全失効が起こり得る。
+S3、KMS、MicroVM専用Log Group、Lambda@Edge Version、Cognito User Pool(削除保護あり)はRETAINだが、DynamoDBのsession tableと認証セッション表はDeleteである。`cdkd destroy --all`やLogical ID置換をすると、生存MicroVMがあってもDDB関連付けを失い、認証セッション表が消えるので全ブラウザのサインインも失われる。User Poolと利用者は残るので、再デプロイ後は同じアカウントでサインインし直せる。
 
-destroy前にはセッションcleanup順序を決め、DynamoDB PITRやSecret RETAINが必要か判断する。
+destroy前にはセッションcleanup順序を決め、DynamoDB PITRが必要か判断する。
 
 ### 12.7 定期cleanupしないresourceはquotaと費用になる
 
@@ -634,8 +636,8 @@ Lambda@Edgeの公開Versionは関連解除直後に消せないため`RETAIN`、
 
 ### Edge・セッション変更
 
-- [ ] 未認証GETが`/login`へ行くか
-- [ ] ログインだけで`RunMicrovm`しないか
+- [ ] 未認証のHTML GETが`/auth/login`へ行き、非HTMLは401になるか
+- [ ] サインインだけで`RunMicrovm`しないか
 - [ ] 新規作成がPOSTの明示操作か
 - [ ] existing sessionを再選択できるか
 - [ ] Suspend前に`paused=true`になるか
