@@ -144,7 +144,7 @@ OMPとGitHubの認証状態はKMS暗号化されたS3へ保存される。ワー
 | OMP `agent.db`永続化 | 実装済み | SQLite backup API→S3 `PutObject`(lifecycle.pyから標準ライブラリで直接呼ぶ)。結果・VersionIdを`~/.cache/omp-cloud-ide/auth-sync.json`へ記録しstatus barに表示 |
 | OMP `install-id`永続化 | 実装済み | 他ファイルと同じdeadline・失敗記録の対象 |
 | GitHub CLI認証永続化 | 実装済み | `hosts.yml`→S3。保存結果をstatus barに表示 |
-| `/run`復元 | 実装済み(新Imageの実機確認待ち) | 25秒の共通deadline内で3ファイルを並列取得し、atomic replace。AWS CLIを使わず、IMDSv2資格情報とSigV4でプロセス内から取得する。NoSuchKeyは正常、その他の失敗は`restoreFailed`に記録してそのkeyの自動保存を止める。fail-openで200 |
+| `/run`復元 | 実装・検証済み | 25秒の共通deadline内で3ファイルを並列取得し、atomic replace。AWS CLIを使わず、IMDSv2資格情報とSigV4でプロセス内から取得する。NoSuchKeyは正常、その他の失敗は`restoreFailed`に記録してそのkeyの自動保存を止める。fail-openで200。2026-09-29に新Imageの新規VM 3台で`restoreFailed=[]`と3ファイルの復元を確認(3.2節) |
 | 5分定期保存 | 実装済み | ETag条件付き。sha256が前回保存と同じならskip。競合・復元失敗のkeyは自動保存しない。lockが使用中なら待たずにskipし、hookが待っていれば実行中のAWS呼び出しを中断して譲る |
 | `/suspend`保存 | 実装済み | 40秒deadline(hook timeout 45秒)でETag条件付き保存。失敗・競合は`auth-sync.json`へ記録し、Suspendを止めないfail-openで200。手動保存がlockを握っている間(最大約2分)は保存をskipし得る |
 | `/terminate`保存 | 実装済み | 同上 |
@@ -220,13 +220,22 @@ npm run diff             # deploy後は両Stack差分ゼロ
 
 その後、旧`/run`の先頭`get-object`を遅延させた回帰テストで、後続2ファイルが`DeadlineExceeded`になり、実機と同じ復元失敗の並びになることを再現した。3ファイルを共通deadline内で並列取得するImageをデプロイし、新規テストVMを2台連続で起動。両方で`auth-sync.json`の`restoreFailed=[]`、3ファイルのSHA-256記録、status barの`認証 0分前`、VM内からのS3取得成功を確認した。Suspend/Resume後も正常表示され、テストVMだけをTerminate・行削除し、既存VMは維持された。元の実機失敗のエラーコードは取得できていないため、同じ遅延が唯一の原因だったとは断定しない。
 
-2026-09-29、2026-09-28のdeploy(code-server 4.139.1/OMP 18.4.0の新Image v16)の翌日に起動したVMで、3ファイルすべてが`restoreFailed`になった。同じVMでは後からの`GetObject`は0.9秒で成功した。原因は起動直後のAWS CLIである。root diskの未読blockは約4 MB/sでしか読めず(24 MBの未読ファイルに5.9秒)、`aws s3api`は1回で110 MB以上を読むため、CLIの初回起動だけで25秒を超える。並列化した3プロセスは同じファイルを待つので同時に`Timeout`になる。`lifecycle.py`をAWS CLIから標準ライブラリのS3呼び出し(IMDSv2資格情報、SigV4)へ切り替え、同じVMの実execution roleと実bucketで、3ファイル復元0.27秒・読み込み約1.3 MB、ETag/VersionIdがCLIと一致、`If-None-Match`/`If-Match`の412、`NoSuchKey`を確認した。新Imageでの新規VM起動は未確認である。
+2026-09-29、2026-09-28のdeploy(code-server 4.139.1/OMP 18.4.0の新Image v16)の翌日に起動したVMで、3ファイルすべてが`restoreFailed`になった。同じVMでは後からの`GetObject`は0.9秒で成功した。原因は起動直後のAWS CLIである。root diskの未読blockは約4 MB/sでしか読めず(24 MBの未読ファイルに5.9秒)、`aws s3api`は1回で110 MB以上を読むため、CLIの初回起動だけで25秒を超える。並列化した3プロセスは同じファイルを待つので同時に`Timeout`になる。`lifecycle.py`をAWS CLIから標準ライブラリのS3呼び出し(IMDSv2資格情報、SigV4)へ切り替え、同じVMの実execution roleと実bucketで、3ファイル復元0.27秒・読み込み約1.3 MB、ETag/VersionIdがCLIと一致、`If-None-Match`/`If-Match`の412、`NoSuchKey`を確認した。その後の新Imageでの新規VM起動は、下記の`npm run e2e`で確認した。
 
 2026-09-29、Cognitoへの移行後のEdge Stackをデプロイし(`cdkd deploy OmpCloudIdeEdgeStack --exclusively`)、次を確認した。
 
 - curlで、未認証のHTMLナビゲーションは`/auth/login`へ302、非HTMLは401、`/session/control`は`target="_top"`のサインインリンク付き401、Cookieなしの`POST /auth/logout`は何も消さずに`/auth/signed-out`へ303、旧`/login`は`/auth/login`へ302になる。`/auth/login`はS256の`code_challenge`付きでCognitoの`/oauth2/authorize`へ302し、Cognitoはredirect_uriを受け付けてログイン画面へ進む。
 - 一時的な検証ユーザー(管理者作成、確認済み)で、実ブラウザからManaged Login→初回TOTP登録→callback→選択画面まで進み、`omp-cloud-ide-auth`は`SameSite=Strict`のままループしなかった。既存の稼働中MicroVMへ`Connect`し、code-server(`workspace - code-server`)が表示された。制御画面の`Sign out`でCognitoの`/logout`を経て`/auth/signed-out`へ戻り、access Cookieと`sess#`行が消え、再訪時はCognitoのログイン画面(資格情報の再入力)になった。検証ユーザーは削除した。
 - 当時同梱していたSparticuz Chromiumでは描画できなかったため(5.9.1節)、このE2Eは一時的に展開したPlaywrightのarm64 Chromium(不足ライブラリとフォントをユーザー領域へ展開)で行い、検証後に削除した。
+
+2026-09-29、Phase Aの各変更をdeployするたびに`npm run e2e`(5.6節)を実行し、3回とも全項目が成功した(最終回はChrome for Testing・Git状態表示を含むImageで24項目)。確認した内容:
+
+- 新規VMで`restoreFailed=[]`、`omp/agent.db`・`omp/install-id`・`github/hosts.yml`の復元(stdlib S3化後のImageで、起動直後の復元失敗が再発しないこと)
+- `session.json`にEdgeから渡したcontrol URL(`https://<distribution>/session/control`)が記録されること
+- Suspend直後の通常通信が`/session/control`へ302、`SUSPENDED`到達、Resume後に同じVM、誤ったID入力の拒否、Terminate後の`TERMINATED`と行削除、既存VMの保護
+- Image build logで`Google Chrome for Testing 154.0.8037.57`の起動を確認
+
+status bar(Suspendボタンのクリック、Git状態表示)の画面上の確認はしていない。
 
 ### 3.3 手動利用確認
 
@@ -424,7 +433,7 @@ Edge専用の`omp-cloud-ide-auth`と`mvm-session`は、認証後にcode-server�
 
 同一originのまま単純CSRF tokenだけを追加しても、同一originアプリがtokenを読めるため完全な境界にならない。
 
-実装設計(2026-09-29時点、未着手):
+実装設計(2026-09-29時点、未着手。Phase Aで唯一残っている項目。作業VMの寿命切れのため次のVMで着手する):
 
 - CloudFront Distributionを2つにする。control用(`/auth/*`、`/session/*`、Cognito callback/logout URL、access Cookie)とIDE用(MicroVMへのproxyと`/_handoff`だけ)。`*.cloudfront.net`はPublic Suffix Listに載っているため、2つの標準ドメインは別siteとして扱われ、Cookieは互いに届かない(custom domain不要)
 - 同じEdge関数を両方に関連付け、`distributionDomainName`でどちらの役割かを判定する。Lambda@Edgeは環境変数もStack出力も読めず、Distributionと関数Versionが循環参照になるため、2つのoriginは既存のCognito用SSM Parameter(`/omp-cloud-ide/cognito`)へ追加して実行時に読む
