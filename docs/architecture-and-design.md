@@ -244,6 +244,12 @@ DynamoDBとCognito(User Pool・SSM Parameter)をEdge側(`us-east-1`)に置いた
 - 決めたこと: `gh auth login --web`で通常の`github.com`へOAuthログインし、gitの認証もGitHub CLIに任せる。
 - 理由: PATを発行・配布・失効させる運用をなくすため。要件上、GitHub Enterprise固有の機能は不要だった。
 
+### 4.10 MicroVMのサイズごとにImageを分ける
+
+- 決めたこと: ベースラインメモリ2GB・4GB・8GBの3つのImage(`omp-cloud-ide`、`omp-cloud-ide-4gb`、`omp-cloud-ide-8gb`)を同じ`artifact/base-image`から作り、新規起動フォームでどれを使うか選ぶ。既定は2GB。サイズの一覧は`lib/config.ts`の`sizes`に置き、先頭が既定になる。
+- 理由: `RunMicrovm`にはメモリやディスクを指定するパラメータがなく、`minimumMemoryInMiB`はImage versionごとに固定される。ディスク上限もベースラインで決まる(2GBまでは8GB、4GBは16GB、8GBは32GB)。1つのImageのversionを使い分ける方法では、CloudFormationの1回の更新で1versionしか作れず、サイズごとに中身がずれる。Imageを分ければ、1回のdeployで全サイズが同じコードになる。
+- 受け入れたこと: コードを変えたdeployでは3つのImageを並行してbuildする。4GBはベースライン料金が2倍、8GBは4倍になる。
+
 ## 5. AWSリソース
 
 ### 5.1 `OmpCloudIdeMicrovmStack`(ap-northeast-1)
@@ -252,13 +258,13 @@ DynamoDBとCognito(User Pool・SSM Parameter)をEdge側(`us-east-1`)に置いた
 | --- | --- | --- | --- |
 | KMS Key | `alias/omp-cloud-ide-auth-state` | 自動ローテーション有効 | 残す(RETAIN) |
 | S3 Bucket | `omp-cloud-ide-auth-<account>-ap-northeast-1` | SSE-KMS、Versioning、Block Public Access、SSL必須、旧versionのlifecycle rule(10.6節) | 残す(RETAIN) |
-| CloudWatch Log Group | `/aws/lambda-microvms/omp-cloud-ide` | 保持1週間、削除保護。Image buildと検証用MicroVMの出力だけが入る | 残す(RETAIN) |
+| CloudWatch Log Group | `/aws/lambda-microvms/<Image名>`(Imageごと) | 保持1週間、削除保護。Image buildと検証用MicroVMの出力だけが入る | 残す(RETAIN) |
 | S3 Asset | `artifact/base-image`をzip化 | Image buildの入力 | cdkdが管理 |
-| IAM Role(Build) | `omp-cloud-ide-microvm-build` | Assetの読み取り、Log Groupへの書き込み | 削除 |
-| IAM Role(Execution) | `omp-cloud-ide-microvm-execution` | S3の`personal/*`、KMS、Log Group | 削除 |
-| MicroVM Image | `omp-cloud-ide` | ARM64、ベース`al2023-1`、最小メモリ2048MiB、hook port 9000 | 削除 |
+| IAM Role(Build) | `omp-cloud-ide-microvm-build` | Assetの読み取り、各Log Groupへの書き込み | 削除 |
+| IAM Role(Execution) | `omp-cloud-ide-microvm-execution` | S3の`personal/*`、KMS、各Log Group | 削除 |
+| MicroVM Image | `omp-cloud-ide`、`omp-cloud-ide-4gb`、`omp-cloud-ide-8gb` | ARM64、ベース`al2023-1`、最小メモリはそれぞれ2048/4096/8192MiB、hook port 9000。中身は共通(4.10節) | 削除 |
 
-MicroVM ImageにはCDKのL2 Constructがまだないため、`cdk.CfnResource`で`AWS::Lambda::MicrovmImage`を直接定義している(`lib/lambda-microvm-stack.ts`)。
+MicroVM ImageにはCDKのL2 Constructがまだないため、`cdk.CfnResource`で`AWS::Lambda::MicrovmImage`を直接定義している(`lib/lambda-microvm-stack.ts`)。2GBのImageとLog Groupは、サイズを選べるようにする前からある論理ID(`MicrovmImage`、`MicrovmLogGroup`)をそのまま使い、置き換えではなく更新でdeployされるようにしている。
 
 ### 5.2 `OmpCloudIdeEdgeStack`(us-east-1)
 
@@ -577,7 +583,7 @@ sequenceDiagram
 
 | パラメータ | 値 | 意味 |
 | --- | --- | --- |
-| `imageIdentifier` | `omp-cloud-ide`のImage ARN | 起動元のImage |
+| `imageIdentifier` | 選択画面で選んだサイズのImage ARN(既定は`omp-cloud-ide`) | 起動元のImage。フォームの`size`が一覧にない値なら400で拒否し、`size`がなければ既定を使う |
 | `executionRoleArn` | `omp-cloud-ide-microvm-execution` | MicroVM内で使うIAM Role |
 | `ingressNetworkConnectors` | `ALL_INGRESS` | endpoint経由の受信を許可する |
 | `egressNetworkConnectors` | `INTERNET_EGRESS` | インターネットへの送信を許可する |
@@ -698,7 +704,7 @@ MicroVM endpointは、ResumeやMicroVM起動の途中で一時的に502や504を
 | MicroVMのベースイメージ | `arn:aws:lambda:ap-northeast-1:aws:microvm-image:al2023-1`、version 1 |
 | DockerfileのFROM | `public.ecr.aws/lambda/microvms:al2023-minimal` |
 | アーキテクチャ | ARM64 |
-| 最小メモリ | 2048MiB(AWSの説明では2GB/1vCPUがベースライン、ピーク時は4倍まで伸びる) |
+| 最小メモリ | 2048/4096/8192MiBから起動時に選ぶ(Imageを分けている。4.10節)。AWSの説明ではvCPUはメモリ2GBあたり1、ピーク時は4倍まで伸びる |
 | 実行ユーザー | `vscode`(UID/GID 1000の一般ユーザー) |
 | workspace | `/home/vscode/workspace` |
 | OMPの設定ディレクトリ | `/home/vscode/.omp/agent`(`PI_CODING_AGENT_DIR`) |
@@ -978,10 +984,10 @@ lifecycle ruleにはprefixを付けず、Bucket全体を対象にしている。
 
 | Action | Resource | 補足 |
 | --- | --- | --- |
-| `lambda:RunMicrovm` | 対象Image ARN | |
-| `lambda:CreateMicrovmAuthToken` | 対象Image ARN | 入力はMicroVM IDだが、IAMは元のImage ARNで評価される |
-| `lambda:GetMicrovm`、`SuspendMicrovm`、`ResumeMicrovm`、`TerminateMicrovm` | 対象Image ARNと、アカウント内の`microvm:*` | 状態によって評価対象が変わるため両方を許可する |
-| `lambda:ListMicrovms` | `*` | APIがresource-level認可を提供しない。呼び出しでは対象Imageに絞る |
+| `lambda:RunMicrovm` | 全サイズのImage ARN | |
+| `lambda:CreateMicrovmAuthToken` | 全サイズのImage ARN | 入力はMicroVM IDだが、IAMは元のImage ARNで評価される |
+| `lambda:GetMicrovm`、`SuspendMicrovm`、`ResumeMicrovm`、`TerminateMicrovm` | 全サイズのImage ARNと、アカウント内の`microvm:*` | 状態によって評価対象が変わるため両方を許可する |
+| `lambda:ListMicrovms` | `*` | APIがresource-level認可を提供しない。呼び出しではImageごとに絞る |
 | `lambda:PassNetworkConnector` | `ALL_INGRESS`と`INTERNET_EGRESS`のconnector ARN | |
 | `iam:PassRole` | Execution Role ARN | `iam:PassedToService`条件は実際の呼び出しと合わず失敗したため付けていない |
 | DynamoDB `GetItem`、`PutItem`、`Scan`、`UpdateItem`、`DeleteItem` | セッション表 | 削除は対象MicroVM ID一致が条件 |

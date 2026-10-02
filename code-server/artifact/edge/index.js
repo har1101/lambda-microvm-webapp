@@ -42,6 +42,7 @@ const RANDOM_TOKEN_PATTERN = /^[A-Za-z0-9_-]{43}$/;
 const START_CLAIM_TTL_SEC = 15 * 60;
 // Edge pages submit forms to themselves; only the sign-out redirect leaves for Cognito.
 const FORM_ACTION = `form-action 'self' https://${cfg.COGNITO_DOMAIN}`;
+const DEFAULT_IMAGE = cfg.IMAGES[0];
 
 exports.handler = async (event) => {
   const { request, config: distribution } = event.Records[0].cf;
@@ -168,7 +169,7 @@ exports.handler = async (event) => {
   return request;
 };
 
-async function startSession(requestId, siteOrigin) {
+async function startSession(requestId, siteOrigin, image = DEFAULT_IMAGE) {
   // The chooser renders a fresh UUID into each "new" form. Using it as the
   // session ID and claiming it before RunMicrovm means a double-submitted form
   // starts one MicroVM, not two.
@@ -203,7 +204,7 @@ async function startSession(requestId, siteOrigin) {
   try {
     run = await mvm.send(
       new RunMicrovmCommand({
-        imageIdentifier: cfg.IMAGE_ARN,
+        imageIdentifier: image.arn,
         executionRoleArn: cfg.EXECUTION_ROLE_ARN,
         ingressNetworkConnectors: [cfg.INGRESS],
         egressNetworkConnectors: [cfg.EGRESS],
@@ -329,7 +330,13 @@ async function handleSessionSelection(request, currentSessionId, siteOrigin) {
 
   const action = form.get('action');
   if (action === 'new') {
-    return startSession(form.get('requestId'), siteOrigin);
+    // Forms rendered before sizes existed carry no size; they get the default.
+    const size = form.get('size');
+    const image = size === null ? DEFAULT_IMAGE : cfg.IMAGES.find((candidate) => candidate.id === size);
+    if (!image) {
+      return chooserResponse({ currentSessionId, errorMessage: 'Choose one of the listed sizes.', status: '400' });
+    }
+    return startSession(form.get('requestId'), siteOrigin, image);
   }
   if (action === 'terminate-confirm' || action === 'terminate') {
     return handleTermination(form, currentSessionId, action === 'terminate');
@@ -393,6 +400,7 @@ async function listAvailableSessions() {
           microvmId,
           state: microvm.state ?? 'UNKNOWN',
           imageVersion: microvm.imageVersion ?? '',
+          sizeLabel: cfg.IMAGES.find((image) => image.arn === microvm.imageArn)?.label ?? '',
           paused: item.paused?.BOOL === true,
           terminationPending: item.terminationPending?.BOOL === true,
           createdAt: Number(item.createdAt?.N ?? 0),
@@ -421,31 +429,33 @@ async function listAvailableSessions() {
 }
 
 /**
- * Live MicroVMs of this image with no session row: typically a start whose
+ * Live MicroVMs of these images with no session row: typically a start whose
  * registration failed and whose compensating terminate also failed. They are
  * unreachable through the proxy but keep billing, so the chooser shows them.
  */
 async function listUntrackedMicrovms(trackedMicrovmIds) {
   const untracked = [];
   try {
-    let nextToken;
-    do {
-      const result = await mvm.send(
-        new ListMicrovmsCommand({ imageIdentifier: cfg.IMAGE_ARN, maxResults: 50, nextToken }),
-      );
-      untracked.push(
-        ...(result.items ?? [])
-          .filter((item) => item.microvmId && item.imageArn === cfg.IMAGE_ARN)
-          .filter((item) => item.state !== 'TERMINATED' && item.state !== 'TERMINATING')
-          .filter((item) => !trackedMicrovmIds.has(item.microvmId))
-          .map((item) => ({
-            microvmId: item.microvmId,
-            state: item.state ?? 'UNKNOWN',
-            startedAt: item.startedAt ? new Date(item.startedAt).getTime() : 0,
-          })),
-      );
-      nextToken = result.nextToken;
-    } while (nextToken);
+    for (const image of cfg.IMAGES) {
+      let nextToken;
+      do {
+        const result = await mvm.send(
+          new ListMicrovmsCommand({ imageIdentifier: image.arn, maxResults: 50, nextToken }),
+        );
+        untracked.push(
+          ...(result.items ?? [])
+            .filter((item) => item.microvmId && item.imageArn === image.arn)
+            .filter((item) => item.state !== 'TERMINATED' && item.state !== 'TERMINATING')
+            .filter((item) => !trackedMicrovmIds.has(item.microvmId))
+            .map((item) => ({
+              microvmId: item.microvmId,
+              state: item.state ?? 'UNKNOWN',
+              startedAt: item.startedAt ? new Date(item.startedAt).getTime() : 0,
+            })),
+        );
+        nextToken = result.nextToken;
+      } while (nextToken);
+    }
   } catch (error) {
     // Reconciliation must never hide the chooser itself.
     console.error('Could not list MicroVMs for reconciliation', error?.name);
@@ -489,7 +499,7 @@ async function handleTermination(form, currentSessionId, confirmed) {
     const microvmId = row.Item.microvmId.S;
 
     const microvm = await mvm.send(new GetMicrovmCommand({ microvmIdentifier: microvmId }));
-    if (microvm.imageArn !== cfg.IMAGE_ARN || microvm.microvmId !== microvmId) {
+    if (!cfg.IMAGES.some((image) => image.arn === microvm.imageArn) || microvm.microvmId !== microvmId) {
       return chooserResponse({
         currentSessionId,
         errorMessage: 'The MicroVM does not belong to this IDE.',
@@ -1140,7 +1150,7 @@ function sessionSelectionResponse({
             `<strong>${escapeHtml(session.microvmId)}</strong>`,
             `<span class="state ${escapeHtml(String(session.state).toLowerCase())}">${escapeHtml(session.state)}</span>`,
             '</div>',
-            `<p>Image ${escapeHtml(session.imageVersion || 'unknown')} · ${escapeHtml(created)}${escapeHtml(lifetime)}</p>`,
+            `<p>${escapeHtml(session.sizeLabel || 'Unknown size')} · Image ${escapeHtml(session.imageVersion || 'unknown')} · ${escapeHtml(created)}${escapeHtml(lifetime)}</p>`,
             isCurrent ? '<p class="current-label">Currently selected in this browser</p>' : '',
             session.terminationPending
               ? '<p class="current-label">Termination pending; do not reconnect.</p>'
@@ -1212,6 +1222,8 @@ function sessionSelectionResponse({
       'border-top:1px solid #374151}h2{font-size:1.1rem;margin:2rem 0 .25rem}.untracked .session{border-color:#92400e}',
       '.session form+form{margin-top:.5rem}.danger{background:#991b1b}',
       '.signout{margin-top:1rem;background:transparent;border:1px solid #4b5563;color:#d1d5db}',
+      '.sizes{border:1px solid #374151;border-radius:8px;margin:0 0 1rem;padding:.75rem 1rem}',
+      '.sizes label{display:flex;gap:.5rem;align-items:center;padding:.25rem 0;color:#d1d5db}',
       '</style></head><body><main class="shell">',
       '<h1>Choose a Cloud IDE session</h1>',
       '<p class="hint">Reconnect to a running or suspended MicroVM, or start a clean session.</p>',
@@ -1220,6 +1232,15 @@ function sessionSelectionResponse({
       '<form class="new-session" method="post" action="/session/select">',
       '<input type="hidden" name="action" value="new">',
       `<input type="hidden" name="requestId" value="${escapeHtml(requestId)}">`,
+      '<fieldset class="sizes"><legend>MicroVM size</legend>',
+      ...cfg.IMAGES.map((image) =>
+        [
+          `<label><input type="radio" name="size" value="${escapeHtml(image.id)}"`,
+          image === DEFAULT_IMAGE ? ' checked' : '',
+          ` required>${escapeHtml(image.label)}</label>`,
+        ].join(''),
+      ),
+      '</fieldset>',
       '<button class="new" type="submit">Start a new MicroVM</button></form>',
       untrackedSection,
       signOutForm(),

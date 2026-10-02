@@ -43,6 +43,7 @@ type EdgeTestHelpers = {
       microvmId: string;
       state: string;
       imageVersion: string;
+      sizeLabel?: string;
       paused: boolean;
       createdAt: number;
       expiresAt?: number;
@@ -290,6 +291,21 @@ describe('OMP Cloud IDE infrastructure', () => {
       },
       EnvironmentVariables: Match.arrayWith([{ Key: 'PI_CODING_AGENT_DIR', Value: '/home/vscode/.omp/agent' }]),
     });
+
+    // Each size is its own image from the same artifact; disk capacity follows baseline memory.
+    const images = Object.entries(template.findResources('AWS::Lambda::MicrovmImage')).map(([logicalId, image]) => ({
+      logicalId,
+      name: image.Properties.Name,
+      memory: image.Properties.Resources[0].MinimumMemoryInMiB,
+      artifact: JSON.stringify(image.Properties.CodeArtifact),
+    }));
+    expect(images.map(({ logicalId, name, memory }) => ({ logicalId, name, memory }))).toEqual([
+      // The pre-existing image keeps its logical ID so deploys update it in place instead of replacing it.
+      { logicalId: 'MicrovmImage', name: 'omp-cloud-ide', memory: 2048 },
+      { logicalId: 'MicrovmImage4gb', name: 'omp-cloud-ide-4gb', memory: 4096 },
+      { logicalId: 'MicrovmImage8gb', name: 'omp-cloud-ide-8gb', memory: 8192 },
+    ]);
+    expect(new Set(images.map((image) => image.artifact)).size).toBe(1);
   });
 
   test('fronts the IDE with an admin-only, MFA-required Cognito user pool', async () => {
@@ -335,9 +351,22 @@ describe('OMP Cloud IDE infrastructure', () => {
       PolicyDocument: Match.objectLike({
         Statement: Match.arrayWith([
           Match.objectLike({
+            Action: 'lambda:RunMicrovm',
+            Effect: 'Allow',
+            Resource: [
+              'arn:aws:lambda:ap-northeast-1:123456789012:microvm-image:omp-cloud-ide',
+              'arn:aws:lambda:ap-northeast-1:123456789012:microvm-image:omp-cloud-ide-4gb',
+              'arn:aws:lambda:ap-northeast-1:123456789012:microvm-image:omp-cloud-ide-8gb',
+            ],
+          }),
+          Match.objectLike({
             Action: 'lambda:CreateMicrovmAuthToken',
             Effect: 'Allow',
-            Resource: 'arn:aws:lambda:ap-northeast-1:123456789012:microvm-image:omp-cloud-ide',
+            Resource: [
+              'arn:aws:lambda:ap-northeast-1:123456789012:microvm-image:omp-cloud-ide',
+              'arn:aws:lambda:ap-northeast-1:123456789012:microvm-image:omp-cloud-ide-4gb',
+              'arn:aws:lambda:ap-northeast-1:123456789012:microvm-image:omp-cloud-ide-8gb',
+            ],
           }),
           Match.objectLike({
             Action: Match.arrayWith([
@@ -349,6 +378,8 @@ describe('OMP Cloud IDE infrastructure', () => {
             Effect: 'Allow',
             Resource: [
               'arn:aws:lambda:ap-northeast-1:123456789012:microvm-image:omp-cloud-ide',
+              'arn:aws:lambda:ap-northeast-1:123456789012:microvm-image:omp-cloud-ide-4gb',
+              'arn:aws:lambda:ap-northeast-1:123456789012:microvm-image:omp-cloud-ide-8gb',
               'arn:aws:lambda:ap-northeast-1:123456789012:microvm:*',
             ],
           }),
@@ -597,6 +628,7 @@ describe('OMP Cloud IDE infrastructure', () => {
           microvmId: 'microvm-<unsafe>',
           state: 'SUSPENDED',
           imageVersion: '11.0',
+          sizeLabel: '4 GB <disk>',
           paused: false,
           createdAt: 1_800_000_000_000,
           expiresAt: 1_800_028_800_000,
@@ -614,6 +646,11 @@ describe('OMP Cloud IDE infrastructure', () => {
     expect(response.body).toContain('Resume and connect');
     expect(response.body).toContain('name="sessionId" value="7d041485-dff5-4033-bdbc-a921757e217b"');
     expect(response.body).toContain('Start a new MicroVM');
+    expect(response.body).toContain('4 GB &lt;disk&gt; · Image 11.0');
+    // Every size is offered and the 2 GB default is preselected.
+    expect(response.body).toContain('<input type="radio" name="size" value="2gb" checked required>');
+    expect(response.body).toContain('<input type="radio" name="size" value="4gb" required>');
+    expect(response.body).toContain('<input type="radio" name="size" value="8gb" required>');
     expect(response.headers['content-security-policy'][0].value).toContain("form-action 'self'");
     expect(response.body).toContain('Ends 2027-01-15T16:00:00.000Z (2h 30m left)');
 
@@ -660,6 +697,31 @@ describe('OMP Cloud IDE infrastructure', () => {
     expect(payload.expiresAt).toBeLessThanOrEqual(runCalledAt + 28_800_000);
     // The shared image learns the control page from the distribution that started it.
     expect(payload.controlUrl).toBe('https://d111.cloudfront.net/session/control');
+  });
+
+  test('starts the image of the chosen size and rejects unknown sizes', async () => {
+    const edge = getEdgeModule();
+    const post = (form: Record<string, string>) =>
+      edge.handler(
+        edgeEvent({
+          method: 'POST',
+          uri: '/session/select',
+          headers: { cookie: [{ key: 'Cookie', value: ACCESS_COOKIE }] },
+          body: { encoding: 'text', data: new URLSearchParams(form).toString() },
+        }),
+      );
+    const { calls } = await withAwsMocks({}, async () => {
+      expect((await post({ action: 'new', size: '8gb' })).status).toBe('200');
+      // A form from before sizes existed starts the default size.
+      expect((await post({ action: 'new' })).status).toBe('200');
+      const rejected = await post({ action: 'new', size: '16gb' });
+      expect(rejected.status).toBe('400');
+      expect(rejected.body).toContain('Choose one of the listed sizes.');
+    });
+    expect(calls.filter((c) => c.name === 'RunMicrovmCommand').map((c) => c.input.imageIdentifier)).toEqual([
+      'arn:aws:lambda:ap-northeast-1:123456789012:microvm-image:omp-cloud-ide-8gb',
+      'arn:aws:lambda:ap-northeast-1:123456789012:microvm-image:omp-cloud-ide',
+    ]);
   });
 
   test('terminates a new MicroVM that could not be registered', async () => {
@@ -827,7 +889,8 @@ describe('OMP Cloud IDE infrastructure', () => {
     const accessCookie = ACCESS_COOKIE;
     const sessionId = '7d041485-dff5-4033-bdbc-a921757e217b';
     const microvmId = 'microvm-40287cea-cb68-32ac-a059-02188a827bff';
-    const imageArn = 'arn:aws:lambda:ap-northeast-1:123456789012:microvm-image:omp-cloud-ide';
+    // A non-default size: every configured image belongs to this IDE.
+    const imageArn = 'arn:aws:lambda:ap-northeast-1:123456789012:microvm-image:omp-cloud-ide-8gb';
     let state = 'RUNNING';
     let rowExists = true;
     const row = { sessionId: { S: sessionId }, microvmId: { S: microvmId }, paused: { BOOL: true } };

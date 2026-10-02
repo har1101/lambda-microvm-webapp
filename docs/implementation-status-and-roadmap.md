@@ -86,6 +86,7 @@ OMPとGitHubの認証状態はKMS暗号化されたS3へ保存される。ワー
 | 項目 | 状態 | 現状 |
 | --- | --- | --- |
 | 新規MicroVM起動 | 実装・検証済み | 明示POST、UUIDの条件付きclaimで二重POSTを409として抑止。登録失敗は補償Terminateを要求 |
+| MicroVMサイズ選択 | 実装・検証済み | 新規起動フォームで2GB(既定、disk 8GB)・4GB(disk 16GB)・8GB(disk 32GB)を選ぶ。サイズごとに別Image(`omp-cloud-ide`、`-4gb`、`-8gb`)を同じartifactからbuildする。一覧カードにサイズを表示。2026-10-02のdeployで3 Imageとも同じartifactからSUCCESSFUL/ACTIVE(2048/4096/8192MiB)になり、`npm run e2e`が4GB Imageで起動からTerminateまで26項目成功 |
 | 既存セッション一覧 | 実装・検証済み | 終了済み以外を表示。PENDING/SUSPENDING/UNKNOWNのUXは未整備 |
 | 既存RUNNINGへ再接続 | 実装・検証済み | session Cookie再発行 |
 | 既存SUSPENDEDのResume | 実装・検証済み | `ResumeMicrovm`後に同じsessionへ接続 |
@@ -94,7 +95,7 @@ OMPとGitHubの認証状態はKMS暗号化されたS3へ保存される。ワー
 | 一時的502/504からの復旧 | 実装・検証済み | Cookie維持、一覧へ戻す |
 | token自動更新 | 実装済み | 1時間token、15分前更新。更新失敗時、旧tokenが失効済みなら503で止める |
 | セッションTerminate UI | 実装・検証済み | 追跡中の行だけ選択画面・制御画面からID再入力で終了。曖昧な失敗は遮断を維持し、終了確認後に対象DDB行を削除 |
-| セッション名・用途ラベル | 未実装 | MicroVM IDと作成時刻のみ |
+| セッション名・用途ラベル | 未実装 | MicroVM ID、サイズ、作成時刻のみ |
 | 一覧ページング | 実装済み | DDB Scanと`ListMicrovms`を全ページ照合。個人用のため件数上限・bounded concurrencyはない |
 | 一覧の負荷制御 | 未実装 | 全候補を並列`GetMicrovm`、bounded concurrency/retry/cacheなし |
 | stale DDB行の即時削除 | 部分実装 | 一覧確認時にTERMINATED/NotFound行を対象ID一致で削除。TERMINATING中は保持 |
@@ -394,7 +395,7 @@ Lambda@Edgeのログは実行リージョンへ分散し得るため、中央集
 `code-server/scripts/e2e.mjs`(`npm run e2e`)として実装し、実環境で24項目の成功を確認した。
 
 - 未認証の302/401、`/auth/login`からCognitoへのPKCE付きredirectを確認する。Cognito Managed LoginのTOTPは人手が必要なため、その先は一時的なEdgeサインイン行(`sub=e2e-test`、1時間)をDynamoDBへ直接書いて代替し、終了時に削除する
-- chooserのフォームで新規MicroVMを1台だけ起動し、code-server readiness、`/vscode-remote-resource`経由でVM内の`session.json`(microvmId・期限・control URL)と`auth-sync.json`(`restoreFailed=[]`、復元ファイルのSHA-256)を確認する
+- chooserが全サイズを表示し既定の2GBが選択済みであることを確認する。新規MicroVMは既定以外の4GB(`omp-cloud-ide-4gb`)で1台だけ起動し、そのImageで起動したことを確かめる(既定へのfallbackや既定以外のImageへのIAM漏れを検出するため)。code-server readiness、`/vscode-remote-resource`経由でVM内の`session.json`(microvmId・期限・control URL)と`auth-sync.json`(`restoreFailed=[]`、復元ファイルのSHA-256)を確認する
 - 明示Suspend直後に通常通信が`/session/control`へ302されること、`SUSPENDED`到達、Resume後に同じVMへ戻ること、誤ったID入力の拒否、Terminate後の`TERMINATED`と行削除を確認する
 - 実行前の生存MicroVMを保護対象としてsnapshotし、終了時に全て生存していることを確認する。cleanupはフォームUUIDから辿れる今回作成したIDだけを対象にし、保護対象は決して終了しない。`TERMINATED`を確認できなければsession行を残す
 - `artifact/edge/config.json`はJestのsynthでも架空accountの値に書き換わるため、実行accountと一致しなければ中止する(`npm run synth`で再生成)

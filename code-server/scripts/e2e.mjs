@@ -123,16 +123,16 @@ async function remoteJson(path) {
 
 async function listLiveMicrovms() {
   const ids = new Set();
-  let nextToken;
-  do {
-    const page = await mvm.send(
-      new ListMicrovmsCommand({ imageIdentifier: edgeConfig.IMAGE_ARN, maxResults: 50, nextToken }),
-    );
-    for (const item of page.items ?? []) {
-      if (item.microvmId && item.state !== 'TERMINATED' && item.state !== 'TERMINATING') ids.add(item.microvmId);
-    }
-    nextToken = page.nextToken;
-  } while (nextToken);
+  for (const image of edgeConfig.IMAGES) {
+    let nextToken;
+    do {
+      const page = await mvm.send(new ListMicrovmsCommand({ imageIdentifier: image.arn, maxResults: 50, nextToken }));
+      for (const item of page.items ?? []) {
+        if (item.microvmId && item.state !== 'TERMINATED' && item.state !== 'TERMINATING') ids.add(item.microvmId);
+      }
+      nextToken = page.nextToken;
+    } while (nextToken);
+  }
   return ids;
 }
 
@@ -151,7 +151,7 @@ async function main() {
   const account = execFileSync('aws', ['sts', 'get-caller-identity', '--query', 'Account', '--output', 'text'], {
     encoding: 'utf8',
   }).trim();
-  if (!edgeConfig.IMAGE_ARN.includes(`:${account}:`)) {
+  if (!edgeConfig.IMAGES.every((image) => image.arn.includes(`:${account}:`))) {
     throw new Error(`artifact/edge/config.json is not for account ${account}; run \`npm run synth\` first`);
   }
   console.log(`E2E target ${origin}`);
@@ -206,11 +206,23 @@ async function main() {
     jar.set(edgeConfig.ACCESS_COOKIE_NAME, accessCookie);
 
     const chooser = await http('/session/select');
+    const defaultImage = edgeConfig.IMAGES[0];
+    // Start a non-default size: a missing or ignored `size` would fall back to the
+    // default and pass, and only a real start proves IAM covers the other images.
+    const chosenImage = edgeConfig.IMAGES[1];
     check('signed-in chooser renders', chooser.status === 200 && chooser.text.includes('Start a new MicroVM'));
+    check(
+      'chooser offers every MicroVM size with the default selected',
+      edgeConfig.IMAGES.every((image) => chooser.text.includes(`name="size" value="${image.id}"`)) &&
+        chooser.text.includes(`value="${defaultImage.id}" checked`),
+    );
 
     // ---- start exactly one MicroVM ----
     requestId = randomUUID();
-    const started = await http('/session/select', { method: 'POST', form: { action: 'new', requestId } });
+    const started = await http('/session/select', {
+      method: 'POST',
+      form: { action: 'new', requestId, size: chosenImage.id },
+    });
     sessionId = jar.get('mvm-session');
     check('new MicroVM start is accepted', started.status === 200 && sessionId === requestId, `HTTP ${started.status}`);
     const row = await ddb.send(
@@ -221,6 +233,8 @@ async function main() {
     check('new MicroVM is not a pre-existing one', !protectedIds.has(microvmId));
     // Only now is the ID eligible for cleanup.
     createdMicrovmId = microvmId;
+    const createdImageArn = (await mvm.send(new GetMicrovmCommand({ microvmIdentifier: microvmId }))).imageArn;
+    check('new MicroVM uses the selected size image', createdImageArn === chosenImage.arn, createdImageArn);
 
     const startClock = Date.now();
     await waitFor('code-server after start', editorReady, READY_TIMEOUT_MS);

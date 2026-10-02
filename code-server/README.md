@@ -101,6 +101,8 @@ OMP's Puppeteer browser prelude is enabled in headless mode. A checksum-pinned C
 
 Opening `/auth/login` only redirects to Cognito Managed Login; it does not call `RunMicrovm`. After a successful sign-in, `/session/select` lists running and suspended MicroVMs. The user explicitly chooses an existing session to connect or resume, or starts a new MicroVM. The chooser and control pages have a **Sign out** button (`POST /auth/logout`) that deletes the Edge session and ends the Cognito session. Temporary origin `502`/`504` responses preserve the browser's `mvm-session` association and return to the chooser instead of orphaning a live workspace.
 
+The new-session form picks the MicroVM size: 2 GB baseline memory with an 8 GB disk (default), 4 GB with a 16 GB disk, or 8 GB with a 32 GB disk. Lambda MicroVMs fix memory per image version and derive the disk limit from it, and `RunMicrovm` cannot override either, so each size is its own image (`omp-cloud-ide`, `omp-cloud-ide-4gb`, `omp-cloud-ide-8gb`) built from the same artifact on every deploy. The sizes live in `config.sizes` in `lib/config.ts`; the first entry is the default. Larger sizes cost 2x and 4x the baseline rate.
+
 New starts use a form UUID and a conditional DynamoDB claim to avoid duplicate MicroVMs. If registration fails after `RunMicrovm`, Edge requests compensation termination. The chooser lists MicroVMs without a session row; because a newly starting VM can briefly appear there, verify its ID and use the AWS API/Console for manual cleanup rather than an in-page untracked termination button.
 
 ## Suspend and resume
@@ -138,7 +140,7 @@ AWS_PROFILE=fukuchi AWS_REGION=ap-northeast-1 npm run synth   # regenerates arti
 AWS_PROFILE=fukuchi npm run e2e                               # or: node scripts/e2e.mjs --url https://<distribution>
 ```
 
-`scripts/e2e.mjs` checks the unauthenticated redirects and the Cognito PKCE redirect, then writes a temporary one-hour Edge sign-in row (`sub=e2e-test`) directly to the auth table because Managed Login needs a human TOTP. It starts one MicroVM from the chooser, reads `session.json` and `auth-sync.json` inside it through code-server's remote-resource endpoint, suspends, resumes, and terminates it through the confirmation form. MicroVMs that were alive before the run are recorded first, never terminated, and verified afterwards; cleanup touches only the MicroVM and rows this run created. `npm test` overwrites `config.json` with a fake account, so the script refuses to run until `synth` has regenerated it.
+`scripts/e2e.mjs` checks the unauthenticated redirects and the Cognito PKCE redirect, then writes a temporary one-hour Edge sign-in row (`sub=e2e-test`) directly to the auth table because Managed Login needs a human TOTP. It checks that the chooser offers every size with the default preselected, then starts one MicroVM of the second size (`omp-cloud-ide-4gb`, 2x baseline cost) so a broken size selection or a missing permission on a non-default image fails the run. It reads `session.json` and `auth-sync.json` inside it through code-server's remote-resource endpoint, suspends, resumes, and terminates it through the confirmation form. MicroVMs that were alive before the run are recorded first, never terminated, and verified afterwards; cleanup touches only the MicroVM and rows this run created. `npm test` overwrites `config.json` with a fake account, so the script refuses to run until `synth` has regenerated it.
 
 ## Operations
 

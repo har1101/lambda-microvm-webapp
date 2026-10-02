@@ -13,11 +13,32 @@ export const config = {
   edgeRegion: EDGE_REGION,
   microvmStackName: 'OmpCloudIdeMicrovmStack',
   edgeStackName: 'OmpCloudIdeEdgeStack',
-  imageName: 'omp-cloud-ide',
+  // One MicroVM image per baseline size: RunMicrovm cannot override memory, and
+  // disk scales with it (https://docs.aws.amazon.com/lambda/latest/dg/microvms-images.html#microvms-images-sizing).
+  // The first entry is the chooser default. Every image builds from the same artifact.
+  sizes: [
+    {
+      id: '2gb',
+      imageName: 'omp-cloud-ide',
+      minimumMemoryInMiB: 2048,
+      label: '2 GB / 1 vCPU (peak 8 GB / 4 vCPU), disk 8 GB',
+    },
+    {
+      id: '4gb',
+      imageName: 'omp-cloud-ide-4gb',
+      minimumMemoryInMiB: 4096,
+      label: '4 GB / 2 vCPU (peak 16 GB / 8 vCPU), disk 16 GB, 2x baseline cost',
+    },
+    {
+      id: '8gb',
+      imageName: 'omp-cloud-ide-8gb',
+      minimumMemoryInMiB: 8192,
+      label: '8 GB / 4 vCPU (peak 32 GB / 16 vCPU), disk 32 GB, 4x baseline cost',
+    },
+  ],
   imageDescription: 'Personal OMP cloud IDE on Lambda MicroVM',
   baseImageArn: `arn:aws:lambda:${MICROVM_REGION}:aws:microvm-image:al2023-1`,
   baseImageVersion: '1',
-  minimumMemoryInMiB: 2048,
   artifactDir: 'artifact/base-image',
   authState: {
     bucketName: `omp-cloud-ide-auth-${ACCOUNT}-${MICROVM_REGION}`,
@@ -45,8 +66,9 @@ export const config = {
   },
 } as const;
 
-export const imageArn =
-  `arn:aws:lambda:${config.microvmRegion}:${config.account}:microvm-image:${config.imageName}` as const;
+export const imageArn = (imageName: string) =>
+  `arn:aws:lambda:${config.microvmRegion}:${config.account}:microvm-image:${imageName}` as const;
+export const imageArns = config.sizes.map((size) => imageArn(size.imageName));
 export const executionRoleArn = `arn:aws:iam::${config.account}:role/omp-cloud-ide-microvm-execution` as const;
 
 export const ingressConnectorArn = (region: string) =>

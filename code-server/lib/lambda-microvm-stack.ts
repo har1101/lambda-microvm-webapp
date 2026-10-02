@@ -14,7 +14,7 @@ import * as s3assets from 'aws-cdk-lib/aws-s3-assets';
 import * as ssm from 'aws-cdk-lib/aws-ssm';
 import * as cdk from 'aws-cdk-lib/core';
 import type { Construct } from 'constructs';
-import { config, egressConnectorArn, executionRoleArn, imageArn, ingressConnectorArn } from './config';
+import { config, egressConnectorArn, executionRoleArn, imageArn, imageArns, ingressConnectorArn } from './config';
 
 const microvmSourceArn = `arn:aws:lambda:${config.microvmRegion}:${config.account}:microvm-image:*` as const;
 const microvmInstanceArn = `arn:aws:lambda:${config.microvmRegion}:${config.account}:microvm:*` as const;
@@ -68,14 +68,6 @@ export class OmpCloudIdeMicrovmStack extends cdk.Stack {
       removalPolicy: cdk.RemovalPolicy.RETAIN,
     });
 
-    const imageLogGroup = new logs.LogGroup(this, 'MicrovmLogGroup', {
-      logGroupName: `/aws/lambda-microvms/${config.imageName}`,
-      retention: logs.RetentionDays.ONE_WEEK,
-      // Keep failed build output available when cdkd rolls back a new stack.
-      removalPolicy: cdk.RemovalPolicy.RETAIN,
-      deletionProtectionEnabled: true,
-    });
-
     const codeArtifact = new s3assets.Asset(this, 'CodeArtifact', {
       path: path.join(__dirname, '..', config.artifactDir),
       exclude: ['**/__pycache__/**', '**/*.pyc'],
@@ -88,7 +80,6 @@ export class OmpCloudIdeMicrovmStack extends cdk.Stack {
     });
     hardenMicrovmRoleTrust(buildRole);
     codeArtifact.grantRead(buildRole);
-    imageLogGroup.grantWrite(buildRole);
 
     const executionRole = new iam.Role(this, 'MicrovmExecutionRole', {
       roleName: 'omp-cloud-ide-microvm-execution',
@@ -97,55 +88,70 @@ export class OmpCloudIdeMicrovmStack extends cdk.Stack {
     });
     hardenMicrovmRoleTrust(executionRole);
     authBucket.grantReadWrite(executionRole, `${config.authState.prefix}/*`);
-    imageLogGroup.grantWrite(executionRole);
 
-    const microvmImage = new cdk.CfnResource(this, 'MicrovmImage', {
-      type: 'AWS::Lambda::MicrovmImage',
-      properties: {
-        Name: config.imageName,
-        Description: config.imageDescription,
-        BaseImageArn: config.baseImageArn,
-        BaseImageVersion: config.baseImageVersion,
-        BuildRoleArn: buildRole.roleArn,
-        CodeArtifact: { Uri: codeArtifact.s3ObjectUrl },
-        CpuConfigurations: [{ Architecture: 'ARM_64' }],
-        AdditionalOsCapabilities: [],
-        EgressNetworkConnectors: [egressConnectorArn(config.microvmRegion)],
-        EnvironmentVariables: [
-          { Key: 'AUTH_STATE_BUCKET', Value: authBucket.bucketName },
-          { Key: 'AUTH_STATE_PREFIX', Value: config.authState.prefix },
-          { Key: 'AUTH_SYNC_INTERVAL_SECONDS', Value: String(config.authState.syncIntervalSeconds) },
-          { Key: 'PI_CODING_AGENT_DIR', Value: '/home/vscode/.omp/agent' },
-        ],
-        Hooks: {
-          Port: 9000,
-          MicrovmImageHooks: {
-            Ready: 'ENABLED',
-            ReadyTimeoutInSeconds: 120,
-            Validate: 'ENABLED',
-            ValidateTimeoutInSeconds: 30,
+    for (const size of config.sizes) {
+      // The 2gb image predates selectable sizes. Keeping its logical IDs updates
+      // the existing image and log group in place instead of replacing them.
+      const idSuffix = size.id === '2gb' ? '' : size.id;
+      const logGroup = new logs.LogGroup(this, `MicrovmLogGroup${idSuffix}`, {
+        logGroupName: `/aws/lambda-microvms/${size.imageName}`,
+        retention: logs.RetentionDays.ONE_WEEK,
+        // Keep failed build output available when cdkd rolls back a new stack.
+        removalPolicy: cdk.RemovalPolicy.RETAIN,
+        deletionProtectionEnabled: true,
+      });
+      logGroup.grantWrite(buildRole);
+      logGroup.grantWrite(executionRole);
+
+      const microvmImage = new cdk.CfnResource(this, `MicrovmImage${idSuffix}`, {
+        type: 'AWS::Lambda::MicrovmImage',
+        properties: {
+          Name: size.imageName,
+          Description: config.imageDescription,
+          BaseImageArn: config.baseImageArn,
+          BaseImageVersion: config.baseImageVersion,
+          BuildRoleArn: buildRole.roleArn,
+          CodeArtifact: { Uri: codeArtifact.s3ObjectUrl },
+          CpuConfigurations: [{ Architecture: 'ARM_64' }],
+          AdditionalOsCapabilities: [],
+          EgressNetworkConnectors: [egressConnectorArn(config.microvmRegion)],
+          EnvironmentVariables: [
+            { Key: 'AUTH_STATE_BUCKET', Value: authBucket.bucketName },
+            { Key: 'AUTH_STATE_PREFIX', Value: config.authState.prefix },
+            { Key: 'AUTH_SYNC_INTERVAL_SECONDS', Value: String(config.authState.syncIntervalSeconds) },
+            { Key: 'PI_CODING_AGENT_DIR', Value: '/home/vscode/.omp/agent' },
+          ],
+          Hooks: {
+            Port: 9000,
+            MicrovmImageHooks: {
+              Ready: 'ENABLED',
+              ReadyTimeoutInSeconds: 120,
+              Validate: 'ENABLED',
+              ValidateTimeoutInSeconds: 30,
+            },
+            MicrovmHooks: {
+              Run: 'ENABLED',
+              RunTimeoutInSeconds: 30,
+              Resume: 'ENABLED',
+              ResumeTimeoutInSeconds: 10,
+              Suspend: 'ENABLED',
+              SuspendTimeoutInSeconds: 45,
+              Terminate: 'ENABLED',
+              TerminateTimeoutInSeconds: 45,
+            },
           },
-          MicrovmHooks: {
-            Run: 'ENABLED',
-            RunTimeoutInSeconds: 30,
-            Resume: 'ENABLED',
-            ResumeTimeoutInSeconds: 10,
-            Suspend: 'ENABLED',
-            SuspendTimeoutInSeconds: 45,
-            Terminate: 'ENABLED',
-            TerminateTimeoutInSeconds: 45,
-          },
+          Resources: [{ MinimumMemoryInMiB: size.minimumMemoryInMiB }],
+          Logging: { CloudWatch: { LogGroup: logGroup.logGroupName } },
         },
-        Resources: [{ MinimumMemoryInMiB: config.minimumMemoryInMiB }],
-        Logging: { CloudWatch: { LogGroup: imageLogGroup.logGroupName } },
-      },
-    });
-    microvmImage.node.addDependency(codeArtifact, buildRole, imageLogGroup);
+      });
+      microvmImage.node.addDependency(codeArtifact, buildRole, logGroup);
 
-    new cdk.CfnOutput(this, 'MicrovmImageArn', {
-      value: imageArn,
-      description: 'Lambda MicroVM image ARN used by the edge control plane',
-    });
+      new cdk.CfnOutput(this, `MicrovmImageArn${idSuffix}`, {
+        value: imageArn(size.imageName),
+        description: `Lambda MicroVM image ARN for the ${size.id} baseline size`,
+      });
+    }
+
     new cdk.CfnOutput(this, 'MicrovmExecutionRoleArn', {
       value: executionRole.roleArn,
       description: 'Least-privilege role assumed inside a running MicroVM',
@@ -210,12 +216,12 @@ export class OmpCloudIdeEdgeStack extends cdk.Stack {
         new iam.ServicePrincipal('lambda.amazonaws.com'),
         new iam.ServicePrincipal('edgelambda.amazonaws.com'),
       ),
-      description: 'Starts and proxies only the personal OMP MicroVM image',
+      description: 'Starts and proxies only the personal OMP MicroVM images',
     });
     edgeRole.addToPolicy(
       new iam.PolicyStatement({
         actions: ['lambda:RunMicrovm'],
-        resources: [imageArn],
+        resources: imageArns,
       }),
     );
     edgeRole.addToPolicy(
@@ -223,7 +229,7 @@ export class OmpCloudIdeEdgeStack extends cdk.Stack {
         actions: ['lambda:CreateMicrovmAuthToken'],
         // CreateMicrovmAuthToken authorizes against the source image ARN,
         // even though the API input is a running MicroVM identifier.
-        resources: [imageArn],
+        resources: imageArns,
       }),
     );
     edgeRole.addToPolicy(
@@ -232,7 +238,7 @@ export class OmpCloudIdeEdgeStack extends cdk.Stack {
         // Current MicroVM lifecycle authorization can evaluate the source
         // image while running and the instance ARN while suspended. Keep both
         // scopes account-local instead of granting these actions on "*".
-        resources: [imageArn, microvmInstanceArn],
+        resources: [...imageArns, microvmInstanceArn],
       }),
     );
     edgeRole.addToPolicy(
@@ -290,7 +296,8 @@ export class OmpCloudIdeEdgeStack extends cdk.Stack {
       MVM_REGION: config.microvmRegion,
       TABLE_REGION: config.edgeRegion,
       TABLE: config.edge.tableName,
-      IMAGE_ARN: imageArn,
+      // The first image is the chooser default.
+      IMAGES: config.sizes.map((size) => ({ id: size.id, arn: imageArn(size.imageName), label: size.label })),
       EXECUTION_ROLE_ARN: executionRoleArn,
       INGRESS: ingressConnectorArn(config.microvmRegion),
       EGRESS: egressConnectorArn(config.microvmRegion),

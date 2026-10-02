@@ -71,11 +71,13 @@ ttl             DynamoDBレコードの自動削除時刻
 - `SUSPENDED`または明示停止中: `Resume and connect`
 - `SUSPENDING`: 完了待ちを案内
 - `PENDING`/`UNKNOWN`: 現状は接続操作を表示するが、endpoint/code-serverのreadyは保証されない
-- 候補がない場合: `Start a new MicroVM`
+- 新規起動: MicroVMのサイズ(2GB/disk 8GB、4GB/disk 16GB、8GB/disk 32GB、既定は2GB)を選んで`Start a new MicroVM`
+
+各候補にはMicroVMのサイズ(`GetMicrovm`の`imageArn`から判定)とImage versionも表示する。
 
 ### 3-A. 新規セッション
 
-`POST /session/select`の`action=new`には画面に埋め込んだrequest UUIDを付ける。Lambda@EdgeはまずDynamoDBへ条件付き`PutItem`で短命の起動claimを確保し、同じフォームの二重送信では2台目を起動しない。次に`RunMicrovm`を実行し、port 8080だけを許可したauth tokenを作成してセッション行を保存し、最後に`mvm-session`を発行する。旧`/session/start`は起動せず選択画面へ戻す。
+`POST /session/select`の`action=new`には画面に埋め込んだrequest UUIDと、選んだサイズ(`size`)を付ける。`size`が設定にない値なら400で拒否し、`size`がない古いフォームは既定の2GBで起動する。Lambda@EdgeはまずDynamoDBへ条件付き`PutItem`で短命の起動claimを確保し、同じフォームの二重送信では2台目を起動しない。次に選んだサイズのImageで`RunMicrovm`を実行し、port 8080だけを許可したauth tokenを作成してセッション行を保存し、最後に`mvm-session`を発行する。旧`/session/start`は起動せず選択画面へ戻す。
 
 この操作はtransactionではない。`RunMicrovm`後のtoken作成や行保存が失敗した場合は、作成したIDに対して`TerminateMicrovm`を要求する。補償失敗や不明な結果で残った稼働中MicroVMは、選択画面の`ListMicrovms`照合で「Untracked MicroVMs」へ表示する。ただし起動中の一時的な不整合と区別できないため、untrackedの画面内Terminateは設けない。IDと状態を確認し、AWS API/Consoleで手動終了する。起動claimは15分のTTLを持ち、行が完成するまでは接続候補にならない。
 
