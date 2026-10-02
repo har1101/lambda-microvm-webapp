@@ -15,7 +15,7 @@
 ```text
 CloudFront URLを開く
   ↓
-Cognito Managed Loginでサインイン(パスワード + TOTP)
+Cognito Managed Loginでサインイン(パスワード。TOTPを有効にした管理者はさらにTOTP)
   ↓
 既存MicroVMを選ぶ / 新規MicroVMを開始
   ↓
@@ -49,7 +49,7 @@ OMPとGitHubの認証状態はKMS暗号化されたS3へ保存される。ワー
 | Lambda@Edge origin-request | 実装・検証済み | 認証、セッション管理、origin差し替え、token付与 |
 | Lambda@Edge origin-response | 実装・検証済み | 一時的`502`/`504`から選択画面へ復帰 |
 | DynamoDBセッションテーブル | 実装・検証済み | PAY_PER_REQUEST、TTL。選択画面は25件ずつ全ページScan |
-| Cognito User Pool / Managed Login | 実装・検証済み | us-east-1、Essentials、管理者作成のみ、TOTP MFA必須、RETAIN・削除保護。Pool/Client IDはSSM Parameter、client secretは`DescribeUserPoolClient`でEdgeが実行時取得 |
+| Cognito User Pool / Managed Login | 実装・検証済み | us-east-1、Essentials、管理者作成のみ、TOTP MFA任意、RETAIN・削除保護。Pool/Client IDはSSM Parameter、client secretは`DescribeUserPoolClient`でEdgeが実行時取得 |
 | DynamoDB認証セッションテーブル | 実装・検証済み | `omp-cloud-ide-auth-sessions`。PAY_PER_REQUEST、TTL、DESTROY。Cookieのハッシュだけを保存 |
 | S3認証状態Bucket | 実装・検証済み | KMS、Versioning、Block Public Access、RETAIN。非現行Version lifecycleあり。実行Roleと実bucketでETag条件付き書き込みを確認済み |
 | KMS Key rotation | 実装済み | rotation有効、RETAIN |
@@ -72,8 +72,8 @@ OMPとGitHubの認証状態はKMS暗号化されたS3へ保存される。ワー
 | MicroVM実行Role最小化 | 実装・検証済み | 管理者用は認証状態S3/bucket、KMS、ログに限定。ゲスト用`omp-cloud-ide-microvm-guest`はログだけ(IAM simulatorで`personal/omp/agent.db`のGet/Putがゲストは`implicitDeny`、管理者は`allowed`) |
 | Edge Role最小化 | 実装・検証済み | 対象Image、Role、Table、SSM Parameter、User Pool等に限定 |
 | セキュリティヘッダー | 実装・検証済み | CSP、HSTS、nosniff、no-referrer等 |
-| MFA | 実装・検証済み | CognitoのTOTP必須(SMSなし) |
-| ユーザー別認証・分離 | 実装・検証済み(Cognito経由のゲストサインインは単体テストのみ) | Cognitoグループ`admins`/`guests`で役割を決め、どちらにも属さない利用者はサインインを拒否する。利用者は管理者が`admin-create-user`で招待する。セッション行の`ownerSub`で一覧・接続・制御を所有者に限定し、ゲストは別の実行Role(S3・KMSなし)と`authState:false`で共有認証状態を持たない。利用者別のS3 prefixはない(ゲストは認証状態を保存しない)。deployed E2Eは認証行を直接書くため、ID tokenの`cognito:groups`から役割を決める部分は単体テストでだけ確認している |
+| MFA | 実装・検証済み | CognitoのTOTP(SMSなし)。MFAは任意で、TOTPを有効にした利用者(現在は管理者)だけが求められる。ゲストはパスワードだけ。2026-10-02に一時ユーザーで、TOTPを有効にすると`ADMIN_USER_PASSWORD_AUTH`もManaged Loginも`SOFTWARE_TOKEN_MFA`を求めることを確認(3.2節) |
+| ユーザー別認証・分離 | 実装・検証済み | Cognitoグループ`admins`/`guests`で役割を決め、どちらにも属さない利用者はサインインを拒否する。利用者は管理者が`admin-create-user`で招待する。セッション行の`ownerSub`で一覧・接続・制御を所有者に限定し、ゲストは別の実行Role(S3・KMSなし)と`authState:false`で共有認証状態を持たない。利用者別のS3 prefixはない(ゲストは認証状態を保存しない)。deployed E2Eは認証行を直接書くため、ID tokenの`cognito:groups`から役割を決める部分は単体テストと、2026-10-02の一時ゲストによるManaged Loginからのサインイン1回(3.2節)で確認している |
 | Cognito側の失効の反映 | 未実装 | Edgeはサインイン後にCognitoを再確認しない。無効化・削除した利用者も認証行の期限(最大8時間)まで使える |
 | ログイン試行ロック | 実装済み | Cognito組み込みのロックアウト(5回失敗後に指数的に待機、最大約15分) |
 | ログアウトUI | 実装・検証済み | 選択画面・制御画面の「Sign out」。Edgeセッション行を削除し、Cognitoセッションも終了 |
@@ -240,6 +240,12 @@ npm run diff             # deploy後は両Stack差分ゼロ
 
 status bar(Suspendボタンのクリック、Git状態表示)の画面上の確認はしていない。
 
+2026-10-02、User PoolのMFAを必須から任意へ変えた(`cdkd deploy --all`、差分はUser Poolだけ)。deploy前に既存の管理者へ`admin-set-user-mfa-preference`でTOTPを有効化し、`UserMFASettingList`が`SOFTWARE_TOKEN_MFA`になったことを確認した(MFA必須の時期に登録したTOTPは、利用者ごとの設定として記録されていなかった)。deploy後に`MfaConfiguration`が`OPTIONAL`、TOTPが有効なことを確認し、一時ユーザーで次を確認した。
+
+- `guests`の一時ユーザー: 実ブラウザでManaged Login→一時パスワード→新しいパスワード→TOTPの登録や入力なしで選択画面。2GB・4GBだけが表示され、管理者のMicroVMは表示されない
+- 同じユーザーにTOTPを登録・有効化すると、`ADMIN_USER_PASSWORD_AUTH`(検証用の一時app client)は`SOFTWARE_TOKEN_MFA`を返し、Managed Loginもパスワードの後に`/mfa/totp`でコードを求め、正しいコードで選択画面へ進んだ
+- 一時ユーザーと一時app clientは削除した
+
 ### 3.3 手動利用確認
 
 - OMP起動
@@ -396,7 +402,7 @@ Lambda@Edgeのログは実行リージョンへ分散し得るため、中央集
 
 `code-server/scripts/e2e.mjs`(`npm run e2e`)として実装した。管理者とゲストの2つの流れへ拡張した版で、2026-10-02に実環境で52項目の成功を確認した。
 
-- 未認証の302/401、`/auth/login`からCognitoへのPKCE付きredirectを確認する。Cognito Managed LoginのTOTPは人手が必要なため、その先は実行ごとの一時的なEdgeサインイン行(管理者`e2e-admin-<runId>`とゲスト`e2e-guest-<runId>`、`role`・`email`付き)をDynamoDBへ直接書いて代替し、終了時に削除する
+- 未認証の302/401、`/auth/login`からCognitoへのPKCE付きredirectを確認する。Cognito Managed LoginはJavaScriptの画面で、管理者のサインインには人手のTOTPが要るため、その先は実行ごとの一時的なEdgeサインイン行(管理者`e2e-admin-<runId>`とゲスト`e2e-guest-<runId>`、`role`・`email`付き)をDynamoDBへ直接書いて代替し、終了時に削除する
 - 管理者のchooserが全サイズを表示し既定の2GBが選択済みであることを確認する。管理者は既定以外の4GB(`omp-cloud-ide-4gb`)で1台起動し、そのImageと管理者用実行Roleで起動したこと、行に所有者が記録されたことを確かめる。code-server readiness、`/vscode-remote-resource`経由でVM内の`session.json`(microvmId・期限・control URL)と`auth-sync.json`(認証保存が有効、`restoreFailed=[]`、復元ファイルのSHA-256)を確認する
 - ゲストのchooserに管理者のMicroVMが出ないこと、ゲスト用サイズだけが出ること、管理者セッションへのattachと偽造したsession Cookieが拒否されること、8GBの起動が400になることを確認する。ゲストは自分のMicroVMをゲスト用実行Roleで起動し、認証保存が無効で管理者のOMP認証が復元されていないこと、2台目が409で拒否されMicroVMが増えないことを確認する。管理者の一覧には所有者付きでゲストのMicroVMが出るがattachは拒否されること、ゲストのTerminate後に`slot#<sub>`が解放されることを確認する
 - 管理者のMicroVMで、明示Suspend直後に通常通信が`/session/control`へ302されること、`SUSPENDED`到達、Resume後に同じVMへ戻ること、誤ったID入力の拒否、Terminate後の`TERMINATED`と行削除を確認する
@@ -415,11 +421,11 @@ Lambda@Edgeのログは実行リージョンへ分散し得るため、中央集
 
 #### 5.7 個人用パスワードをOIDCへ置き換える(実装済み: Cognito Managed Login)
 
-Cognito Managed LoginとEdge側セッションへ移行し、MFA(TOTP)、利用者識別(`sub`)、サーバー側のセッション失効(ログアウト)、ログイン試行のロックアウトを得た。
+Cognito Managed LoginとEdge側セッションへ移行し、MFA(TOTP。現在は任意で管理者だけ)、利用者識別(`sub`)、サーバー側のセッション失効(ログアウト)、ログイン試行のロックアウトを得た。
 
 2人目以降の利用者のために、管理者・ゲストの役割を実装した(2026-10-02にdeployし、deployed E2Eで確認。設計は`architecture-and-design.md`の4.11節)。
 
-- Cognitoグループ`admins`/`guests`で役割を決め、どちらにも属さない利用者はサインインを拒否する。利用者は管理者が`admin-create-user`で招待し、招待メールの一時パスワードで初回サインインしてTOTPを登録する
+- Cognitoグループ`admins`/`guests`で役割を決め、どちらにも属さない利用者はサインインを拒否する。利用者は管理者が`admin-create-user`で招待し、招待メールの一時パスワードで初回サインインして新しいパスワードを決める。MFAは任意で、ゲストはTOTPを登録しない
 - session tableへ`ownerSub`・`ownerEmail`・`ownerRole`を持たせ、一覧・接続・制御を所有者に限定する。管理者は他人のセッションを終了だけできる
 - 利用者別のS3 prefixと実行Roleの代わりに、認証状態を持たないゲスト用実行Roleを1つ置く。`RunMicrovm`はタグやsession tagを受け取らないため、1つのRoleを利用者ごとに絞るABACはできず、利用者別Roleは利用者ごとのdeployを要する
 

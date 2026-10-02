@@ -445,13 +445,14 @@ describe('OMP Cloud IDE infrastructure', () => {
     expect(guestActions.filter((action: string) => /^(s3|kms):/.test(action))).toEqual([]);
   });
 
-  test('fronts the IDE with an admin-only, MFA-required Cognito user pool', async () => {
+  test('fronts the IDE with an admin-only Cognito user pool that keeps TOTP available', async () => {
     const template = getEdgeTemplate();
 
     template.resourceCountIs('AWS::SecretsManager::Secret', 0);
     template.hasResourceProperties('AWS::Cognito::UserPool', {
       AdminCreateUserConfig: { AllowAdminCreateUserOnly: true },
-      MfaConfiguration: 'ON',
+      // Optional, not off: users with TOTP enabled must still be challenged.
+      MfaConfiguration: 'OPTIONAL',
       EnabledMfas: ['SOFTWARE_TOKEN_MFA'],
       DeletionProtection: 'ACTIVE',
     });

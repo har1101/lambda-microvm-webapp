@@ -187,9 +187,13 @@ CognitoでMFA(TOTP)、ロックアウト、利用者識別(`sub`)を得たうえ
 
 `RunMicrovm`で利用者ごとに変えられるAWS権限は`executionRoleArn`だけで、タグやsession tagを渡すパラメータがない。そのため、1つのRoleで`${aws:PrincipalTag/...}`を使って利用者ごとのS3 prefixに絞るABACはできない。利用者ごとに分けるなら利用者ごとのRole、つまり利用者を追加するたびのdeployが要る。今回は分離の単位を「認証状態を持つ管理者」と「何も持たないゲスト」の2つに絞り、Roleを2つにした。
 
-### 4.5.2 CognitoのメールOTPサインインはMFA必須と両立しない
+### 4.5.2 CognitoのメールOTPサインインには自前のSESが要る
 
-招待した利用者にパスワードを覚えさせないよう、メールOTPでのパスワードレスサインイン(choice-based sign-in)を検討した。しかしこれはMFA必須のUser Poolでは使えず、Cognito組み込みのメール送信でも使えないので、自前のSESとsandbox解除も要る。MFA必須を保つため、`admin-create-user`の招待メールで一時パスワードを送り、初回サインインでパスワードとTOTPを登録させる方式にした。組み込みのメール送信はUser Poolあたり1日50通までである。
+招待した利用者にパスワードを覚えさせないよう、メールOTPでのパスワードレスサインイン(choice-based sign-in)を検討した。しかしこれはCognito組み込みのメール送信では使えず、自前のSESが要る(宛先を1件ずつ検証しないならsandbox解除の申請も)。MFA必須のUser Poolとも両立しない。SESの申請を避け、`admin-create-user`の招待メールで一時パスワードを送り、初回サインインでパスワードを決めさせる方式にした。組み込みのメール送信はUser Poolあたり1日50通までである。
+
+### 4.5.3 MFAを必須から任意へ変えると、登録済みのTOTPが求められなくなる
+
+ゲストにTOTP登録まで求めないよう、MFAを必須(`ON`)から任意(`OPTIONAL`)へ変えた。MFA必須の時期にManaged LoginでTOTPを登録した管理者は、`admin-get-user`の`UserMFASettingList`も`PreferredMfaSetting`も空だった。必須のUser Poolは利用者ごとの設定を見ずに全員へTOTPを求めるためで、このまま任意へ変えると、TOTPを登録済みの管理者もパスワードだけで入れるようになる。任意のUser PoolでTOTPを求められるのは、TOTPが有効(`UserMFASettingList`に`SOFTWARE_TOKEN_MFA`)な利用者だけである。deployの前に`admin-set-user-mfa-preference --software-token-mfa-settings Enabled=true,PreferredMfa=true`で有効にしておく。Managed LoginはMFA任意のUser PoolでTOTPの登録を促さないので、新しい利用者はパスワードだけになる。
 
 ### 4.6 SameSite Cookieだけでは同一origin内の未信頼アプリを防げない
 

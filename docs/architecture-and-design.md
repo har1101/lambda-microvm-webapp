@@ -41,7 +41,7 @@
 ### 1.2 利用者から見た流れ
 
 1. CloudFrontのURLを開くと、Lambda@EdgeがAmazon CognitoのManaged Loginへリダイレクトする。
-2. メールアドレス・パスワード・TOTP(認証アプリのワンタイムコード)でサインインすると、`/auth/callback`を経てセッション選択画面(`/session/select`)へ移動する。
+2. メールアドレスとパスワード(TOTPを有効にした利用者はさらに認証アプリのワンタイムコード)でサインインすると、`/auth/callback`を経てセッション選択画面(`/session/select`)へ移動する。
 3. 選択画面で、既存のMicroVMへ接続するか、新しいMicroVMを起動するかを選ぶ。
 4. code-serverが開く。ターミナルで`omp`や`git`を使って開発する。
 5. 作業を中断するときは、code-serverのステータスバーにある`Suspend Cloud IDE`から制御画面を開き、Suspendする。
@@ -80,7 +80,7 @@
 | Lambda@Edge | CloudFrontのリクエスト・レスポンスに割り込んで動くLambda。このシステムではorigin-requestとorigin-responseの2つを使う |
 | セッション | ブラウザと1台のMicroVMの対応関係。DynamoDBの1レコードで表す |
 | access Cookie | `omp-cloud-ide-auth`。ログイン済みであることを示す不透明なランダム値のCookie。DynamoDBにはそのSHA-256ハッシュだけを保存する |
-| Cognito User Pool | `omp-cloud-ide`。利用者(管理者とゲスト)のID・パスワード・TOTPを管理するAmazon Cognitoのディレクトリ。グループ`admins`・`guests`で役割を決める。サインイン画面はCognitoのManaged Loginを使う |
+| Cognito User Pool | `omp-cloud-ide`。利用者(管理者とゲスト)のID・パスワード・TOTP(有効にした利用者のみ)を管理するAmazon Cognitoのディレクトリ。グループ`admins`・`guests`で役割を決める。サインイン画面はCognitoのManaged Loginを使う |
 | oauth Cookie | `omp-cloud-ide-oauth`。サインイン開始から`/auth/callback`までの間だけstate値を持つ短命Cookie |
 | session Cookie | `mvm-session`。どのセッション(MicroVM)へ接続するかを示すCookie。中身はDynamoDBのキーになるUUID |
 | paused | DynamoDBのフラグ。利用者が明示的にSuspendした状態を表し、trueの間はLambda@Edgeがエディタの通信を止める |
@@ -150,7 +150,7 @@ flowchart LR
 | Lambda@Edge origin-response | 同上 | MicroVMが一時的に502/504を返したとき、HTML画面だけを選択画面へ戻す |
 | DynamoDB `omp-cloud-ide-sessions` | us-east-1 | セッションID、MicroVM ID、endpoint、proxy token、paused状態を保存する |
 | DynamoDB `omp-cloud-ide-auth-sessions` | us-east-1 | サインイン途中のstate・nonce・PKCE verifier(`login#<state>`、10分)と、access Cookieのハッシュ(`sess#<hash>`、8時間)を保存する |
-| Cognito User Pool `omp-cloud-ide` / App client `omp-cloud-ide-edge` | us-east-1 | 利用者のパスワード・TOTP MFA・ロックアウトを管理し、Managed Loginでサインイン画面を出す。Edgeはauthorization code grantでID tokenを受け取る |
+| Cognito User Pool `omp-cloud-ide` / App client `omp-cloud-ide-edge` | us-east-1 | 利用者のパスワード・TOTP MFA(任意)・ロックアウトを管理し、Managed Loginでサインイン画面を出す。Edgeはauthorization code grantでID tokenを受け取る |
 | SSM Parameter `/omp-cloud-ide/cognito` | us-east-1 | 生成されたUser Pool IDとClient IDを公開する。Lambda@Edgeは環境変数を使えないため実行時に読む |
 | MicroVM Image `omp-cloud-ide` | ap-northeast-1 | code-server、OMP、開発ツール、hook serverを含む実行イメージ |
 | Lambda MicroVM | ap-northeast-1 | code-serverとOMPを動かす実行環境。1セッションにつき1台 |
@@ -235,7 +235,7 @@ DynamoDBとCognito(User Pool・SSM Parameter)をEdge側(`us-east-1`)に置いた
 
 ### 4.8 Cognito Managed LoginとEdge側セッションで利用者認証する
 
-- 決めたこと: 利用者認証はAmazon Cognito User PoolのManaged Login(メールアドレス、パスワード、TOTP MFA必須)に任せる。Lambda@EdgeはOIDCのauthorization code grant(PKCE、state、nonce)でID tokenを受け取り、`aws-jwt-verify`で検証したらtokenを捨て、自前の不透明なaccess Cookieを発行する。Cookieのハッシュだけを8時間の期限付きでDynamoDBに置く。
+- 決めたこと: 利用者認証はAmazon Cognito User PoolのManaged Login(メールアドレス、パスワード、TOTP MFAは任意)に任せる。Lambda@EdgeはOIDCのauthorization code grant(PKCE、state、nonce)でID tokenを受け取り、`aws-jwt-verify`で検証したらtokenを捨て、自前の不透明なaccess Cookieを発行する。Cookieのハッシュだけを8時間の期限付きでDynamoDBに置く。
 - 理由: 以前はSecrets Managerの自動生成パスワードとHMAC署名付きCookieを使っていたが、MFA、ログイン試行回数の制限、サーバー側で取り消せるログアウトがなかった。Cognitoはパスワード保管、TOTP、ロックアウトを提供し、少人数ならEssentialsの無料枠(10,000 MAU)に収まる。tokenをブラウザへ渡さずEdge側セッションにすると、Cookieを失効させる手段(行の削除)がサーバー側に残り、token更新の処理も要らない。
 - 受け入れたこと: 通常のリクエストごとに認証行のDynamoDB読み取りが増える(session行と並列に読むので往復は増えない)。Lambda@Edgeは環境変数を使えないため、生成されたPool/Client IDはSSM Parameterから、client secretは`DescribeUserPoolClient`から実行時に取得する(5分キャッシュ)。サインイン後はCognitoへ問い合わせ直さないため、Cognitoで利用者を無効化・削除しても、既存の認証行は期限(最大8時間)まで有効なままになる(4.11節)。
 
@@ -252,7 +252,7 @@ DynamoDBとCognito(User Pool・SSM Parameter)をEdge側(`us-east-1`)に置いた
 
 ### 4.11 管理者とゲストをCognitoグループで分ける
 
-- 決めたこと: 利用者は管理者が`admin-create-user`で作る(自己サインアップは無効のまま)。Cognitoは一時パスワード(7日有効)を招待メールで送り、初回サインインで新しいパスワードとTOTPを登録させる。役割はCDKが作るCognitoグループで決める。サインイン時にID tokenの`cognito:groups`を読み、`admins`なら管理者、`guests`ならゲスト(両方なら管理者)とし、どちらにも属さない利用者は認証行もCookieも作らずに拒否する。役割とメールアドレスは認証行に保存する。
+- 決めたこと: 利用者は管理者が`admin-create-user`で作る(自己サインアップは無効のまま)。Cognitoは一時パスワード(7日有効)を招待メールで送り、初回サインインで新しいパスワードを決めさせる。MFAは任意(`OPTIONAL`)で、ゲストはパスワードだけでサインインする。MFA必須の時期にTOTPを登録した管理者は、`admin-set-user-mfa-preference`でTOTPを有効にしてあるので引き続きTOTPを求められる。役割はCDKが作るCognitoグループで決める。サインイン時にID tokenの`cognito:groups`を読み、`admins`なら管理者、`guests`ならゲスト(両方なら管理者)とし、どちらにも属さない利用者は認証行もCookieも作らずに拒否する。役割とメールアドレスは認証行に保存する。
   - 管理者: 共有の`personal/`認証状態を復元・保存する(Execution Role `omp-cloud-ide-microvm-execution`)。全サイズを起動でき、台数の制限はない。選択画面には全員のセッションと「Untracked MicroVMs」を表示する。他人のセッションには所有者を表示し、Terminateだけを許す(接続・制御・Suspend・Resume・proxyは不可)。
   - ゲスト: Execution Role `omp-cloud-ide-microvm-guest`(S3・KMSの権限なし、Log Groupへの書き込みだけ)でMicroVMを起動し、`runHookPayload`に`authState:false`を渡す。lifecycle.pyは復元も保存もせず、status barに`認証保存なし`を表示する。サイズは2GB・4GBだけ(`lib/config.ts`の`sizes[].roles`)。同時に持てるMicroVMは稼働中・Suspend中を合わせて1台までで、DynamoDBの`slot#<sub>`行で管理する。選択画面には自分のセッションだけを表示する。
   - セッション行には`ownerSub`・`ownerEmail`・`ownerRole`を書き、セッション単位の全route(エディタ通信、制御、Suspend、Resume、接続)で所有者を確認する。他人のセッションを指すsession Cookieは、セッションなしとして扱う。所有者を記録する前に作られた行(`ownerSub`なし)は管理者のものとする。
@@ -260,8 +260,9 @@ DynamoDBとCognito(User Pool・SSM Parameter)をEdge側(`us-east-1`)に置いた
   - `RunMicrovm`にはタグやsession tagを渡すパラメータがなく、渡せるのは`executionRoleArn`だけである。そのため、1つのRoleを`${aws:PrincipalTag/...}`で利用者ごとのS3 prefixに絞るABACは使えない。利用者ごとのRoleを作るとゲストを追加するたびにdeployが要る。分離の単位を「認証状態を持つ管理者」と「何も持たないゲスト」の2種類に絞れば、Roleは2つで済む。ゲストにOAuth状態を残さないのは意図した制限で、ゲストは毎回自分でサインインし直す。
   - 管理者に他人のセッションへの接続を許すと、ゲストが書いたコードや`/proxy/<port>/`のアプリが、管理者のブラウザで同じoriginのまま動く。同一originのアプリは制御routeを叩けるので(12.2節)、管理者にはTerminateだけを許して、ゲストのコードを管理者のブラウザへ持ち込まない。
   - ゲストの台数を1台に絞るのは費用の上限を決めるためである。`slot#<sub>`行は`RunMicrovm`の前に条件付きPutで取り、取れなければ409で断る。保持者のセッション行がない、保持者のMicroVMが`TERMINATED`かNotFound、または保持者が期限切れの起動予約である場合は、古い保持者を条件にした更新で引き継ぐ。TTL切れを待たずに済む。
-  - パスワードレスのメールOTPサインイン(Cognito Essentialsのchoice-based sign-in)も検討したが、MFA必須のUser Poolでは使えず、Cognito組み込みのメール送信でも使えないため自前のSESとsandbox解除が必要になる。招待メールの一時パスワードなら、MFA必須のまま組み込みのメール送信で済む。
-- 受け入れたこと: Cognito組み込みのメール送信はUser Poolあたり1日50通まで。配布URLは管理者が別に伝える。ゲストの削除はCognitoで無効化・削除し、選択画面からMicroVMを終了する手順になるが、Edgeのサインインは期限(最大8時間)まで残るので、すぐ止めるには認証表(`omp-cloud-ide-auth-sessions`)から該当`sub`の行を消す。役割を持たない旧形式の認証行はサインアウト扱いになるため、このdeployの後は全員がサインインし直す。
+  - パスワードレスのメールOTPサインイン(Cognito Essentialsのchoice-based sign-in)も検討したが、Cognito組み込みのメール送信では使えず、自前のSES(宛先を個別に検証しないならsandbox解除も)が必要になる。SESの申請を避け、招待メールの一時パスワードとCognito組み込みのメール送信で済ませた。
+  - ゲストにTOTP登録まで求めるのは外部の利用者には重いため、MFAを必須から任意へ変えた。Managed LoginはMFA任意のUser PoolでTOTPの登録を促さないので、新しい利用者はパスワードだけになる。
+- 受け入れたこと: Cognito組み込みのメール送信はUser Poolあたり1日50通まで。ゲストのパスワードは第二要素なしで、推測への備えは14文字以上の制約とCognitoのロックアウトだけになる。配布URLは管理者が別に伝える。ゲストの削除はCognitoで無効化・削除し、選択画面からMicroVMを終了する手順になるが、Edgeのサインインは期限(最大8時間)まで残るので、すぐ止めるには認証表(`omp-cloud-ide-auth-sessions`)から該当`sub`の行を消す。役割を持たない旧形式の認証行はサインアウト扱いになるため、このdeployの後は全員がサインインし直す。
 
 ## 5. AWSリソース
 
@@ -284,7 +285,7 @@ MicroVM ImageにはCDKのL2 Constructがまだないため、`cdk.CfnResource`�
 
 | リソース | 名前 | 主な設定 | 削除時 |
 | --- | --- | --- | --- |
-| Cognito User Pool | `omp-cloud-ide` | Essentials、自己サインアップ無効(管理者が`admin-create-user`で招待)、メールでサインイン、TOTP MFA必須(SMSなし)、パスワード14文字以上(大文字・小文字・数字)、復旧はメールのみ、削除保護 | 残す(RETAIN) |
+| Cognito User Pool | `omp-cloud-ide` | Essentials、自己サインアップ無効(管理者が`admin-create-user`で招待)、メールでサインイン、TOTP MFA任意(SMSなし。有効にした利用者だけ求める)、パスワード14文字以上(大文字・小文字・数字)、復旧はメールのみ、削除保護 | 残す(RETAIN) |
 | Cognito User Pool Group | `admins`、`guests` | 役割を決める(4.11節)。どちらにも属さない利用者はサインインを拒否する | 削除 |
 | Cognito Domain・Managed Login Branding | `omp-cloud-ide-<account>.auth.us-east-1.amazoncognito.com` | Managed Login v2、Cognito既定のスタイル | 削除 |
 | Cognito App client | `omp-cloud-ide-edge` | client secretあり、authorization code grantのみ、scope `openid`・`email`、callback `/auth/callback`、logout `/auth/signed-out`、ID/access token 5分、refresh token 60分(いずれも最小値) | 削除 |
@@ -445,7 +446,7 @@ sequenceDiagram
     B->>E: GET /auth/login
     E->>D: PutItem login#<state> (nonce, PKCE verifier, 10分)
     E-->>B: 302 /oauth2/authorize (S256) + oauth Cookie(state)
-    B->>C: Managed Login(メール、パスワード、TOTP)
+    B->>C: Managed Login(メール、パスワード、有効ならTOTP)
     C-->>B: 302 /auth/callback?code&state
     B->>E: GET /auth/callback + oauth Cookie
     E->>D: DeleteItem login#<state>(条件付き、1回限り)
@@ -1050,7 +1051,7 @@ Build RoleとExecution Roleは、`lambda.amazonaws.com`に対して`sts:AssumeRo
 - rootでの実行(UID 1000で動かす)
 - 広いAWS権限(Execution Roleは認証状態の保存に必要な分だけ)
 - ImageとGitへのsecretの混入(Cognitoのclient secret、OAuth tokenはどちらにも入れない)
-- パスワードの推測(CognitoのTOTP MFA必須と組み込みロックアウト)
+- パスワードの推測(14文字以上のパスワード、Cognito組み込みのロックアウト、TOTPを有効にした管理者はTOTP)
 
 ### 12.2 守れていないもの
 
@@ -1189,7 +1190,7 @@ code-server/
 | 対象 | 確認している内容 |
 | --- | --- |
 | MicroVM Stack | S3のKMS暗号化・Versioning・公開遮断、hookの設定、東京リージョン |
-| Edge Stack | Cognito User Pool(管理者作成のみ、MFA必須)、Lambda@Edgeの関連付け、セキュリティヘッダー、IAMのResource範囲 |
+| Edge Stack | Cognito User Pool(管理者作成のみ、MFA任意でTOTPは有効)、Lambda@Edgeの関連付け、セキュリティヘッダー、IAMのResource範囲 |
 | 利用者認証 | Cognito経由のサインイン(PKCE、state、1回限りのnonce)、全routeでのサインイン済みセッション要求、サインアウト時のセッション削除とCognitoセッション終了 |
 | 画面 | HTMLエスケープ、CSP、選択画面、制御画面、起動画面がscriptを使わないこと |
 | Suspend / Resume | paused中の302と409、POST以外の拒否 |

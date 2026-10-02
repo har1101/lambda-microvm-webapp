@@ -190,14 +190,16 @@ export class OmpCloudIdeEdgeStack extends cdk.Stack {
     super(scope, id, props);
 
     // Users are created only by an administrator (admin-create-user), which
-    // emails a temporary password. Nobody can sign up.
+    // emails a temporary password. Nobody can sign up. MFA is optional so
+    // guests sign in with a password alone; a user whose TOTP is enabled
+    // (admin-set-user-mfa-preference) is still challenged for it.
     const userPool = new cognito.UserPool(this, 'UserPool', {
       userPoolName: 'omp-cloud-ide',
       featurePlan: cognito.FeaturePlan.ESSENTIALS,
       selfSignUpEnabled: false,
       signInAliases: { email: true },
       autoVerify: { email: true },
-      mfa: cognito.Mfa.REQUIRED,
+      mfa: cognito.Mfa.OPTIONAL,
       mfaSecondFactor: { otp: true, sms: false },
       passwordPolicy: {
         minLength: 14,
@@ -215,7 +217,7 @@ export class OmpCloudIdeEdgeStack extends cdk.Stack {
           'You have been invited to OMP Cloud IDE.<br><br>',
           'Username: {username}<br>Temporary password: {####}<br><br>',
           'Open the Cloud IDE URL you received from the administrator and sign in with this email address ',
-          'and the temporary password. You will choose a new password and register an authenticator app (TOTP). ',
+          'and the temporary password, then choose a new password. ',
           'The temporary password expires in 7 days.',
         ].join(''),
       },

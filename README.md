@@ -10,7 +10,7 @@ The Cloud IDE is customized for `har1101` and uses:
 - OMP goal/ask defaults with yolo approvals and explicit destructive-command denies
 - an OMP browser E2E runtime with a preinstalled arm64 Chrome for Testing headless shell and screenshot artifacts
 - encrypted S3 persistence for OMP and GitHub OAuth state
-- Amazon Cognito Managed Login (email + password + TOTP MFA) enforced at CloudFront, with an opaque `HttpOnly` session cookie, before `RunMicrovm`
+- Amazon Cognito Managed Login (email + password; TOTP for users who have it enabled) enforced at CloudFront, with an opaque `HttpOnly` session cookie, before `RunMicrovm`
 - an explicit suspend/resume control that prevents editor reconnects from waking a paused MicroVM
 - an authenticated session chooser for reconnecting to an existing MicroVM or starting a new one
 - `cdkd` as the dev/test deployment engine

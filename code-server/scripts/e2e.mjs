@@ -4,9 +4,10 @@
 //
 // It exercises the real CloudFront/Lambda@Edge/MicroVM path with temporary Edge
 // sign-in rows (one admin, one guest) written straight to DynamoDB (Cognito
-// Managed Login needs a human TOTP, so only its redirect is checked). The admin
-// starts one MicroVM; the run checks code-server, the restored auth state and the
-// session file through code-server's remote-resource endpoint. While it runs, the
+// Managed Login is a JavaScript page and the admin's sign-in needs a human TOTP,
+// so only its redirect is checked). The admin starts one MicroVM; the run checks
+// code-server, the restored auth state and the session file through
+// code-server's remote-resource endpoint. While it runs, the
 // guest must not see or reach it, starts its own MicroVM without auth state, is
 // held to one MicroVM, and terminates it. The admin then suspends, resumes and
 // terminates its MicroVM via the confirmation form, and the run verifies that
@@ -311,7 +312,7 @@ async function main() {
       authorize?.origin,
     );
 
-    // ---- temporary Edge sign-ins (bypass Cognito's human TOTP only) ----
+    // ---- temporary Edge sign-ins (bypass Cognito Managed Login only) ----
     const admin = makeBrowser();
     const guest = makeBrowser();
     await signIn(admin, adminUser);

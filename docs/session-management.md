@@ -70,9 +70,9 @@ ownerRole       起動時の役割(admin / guest)
 
 ### 1. サインイン
 
-`GET /auth/login`はCognitoのManaged Loginへリダイレクトするだけで、MicroVMを起動しない。メールアドレス・パスワード・TOTPでサインインすると、`/auth/callback`がID tokenを検証し、`cognito:groups`から役割を決める(`admins`なら管理者、`guests`ならゲスト、両方なら管理者)。どちらにも属さない利用者には403の画面を返し、認証行もCookieも作らない。役割が決まれば`omp-cloud-ide-auth`を発行し、`/session/select`へ移動する。選択画面と制御画面の「Sign out」(`POST /auth/logout`)は、認証行を削除してCognitoのセッションも終了する。
+`GET /auth/login`はCognitoのManaged Loginへリダイレクトするだけで、MicroVMを起動しない。メールアドレスとパスワード(TOTPを有効にした利用者はさらにTOTP)でサインインすると、`/auth/callback`がID tokenを検証し、`cognito:groups`から役割を決める(`admins`なら管理者、`guests`ならゲスト、両方なら管理者)。どちらにも属さない利用者には403の画面を返し、認証行もCookieも作らない。役割が決まれば`omp-cloud-ide-auth`を発行し、`/session/select`へ移動する。選択画面と制御画面の「Sign out」(`POST /auth/logout`)は、認証行を削除してCognitoのセッションも終了する。
 
-利用者は管理者が`admin-create-user`で作り、グループへ追加する。初回サインインでは招待メールの一時パスワードから新しいパスワードを決め、TOTPを登録する。Edgeはサインイン後にCognitoを再確認しないため、Cognitoで無効化した利用者も認証行の期限(最大8時間)までは使える。
+利用者は管理者が`admin-create-user`で作り、グループへ追加する。初回サインインでは招待メールの一時パスワードから新しいパスワードを決める。MFAは任意で、ゲストはTOTPを登録しない。Edgeはサインイン後にCognitoを再確認しないため、Cognitoで無効化した利用者も認証行の期限(最大8時間)までは使える。
 
 ### 2. セッション選択
 
