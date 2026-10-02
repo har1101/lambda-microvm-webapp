@@ -57,19 +57,23 @@ The normal deploy uses `--full-wait` so the MicroVM image build and CloudFront d
 
 `npm run deploy` first runs `predeploy` (`npm run update-versions`), which rewrites `ARG CODE_SERVER_VERSION` and `ARG OMP_VERSION` in `artifact/base-image/Dockerfile` to the latest code-server GitHub release (with an arm64 RPM) and the npm `latest` of `@oh-my-pi/pi-coding-agent`. A changed Dockerfile changes the image asset hash, so the MicroVM image is rebuilt; if both are already current, nothing is rewritten and the image is not rebuilt. New versions apply to MicroVMs started after the deploy. `deploy:dry-run` does not run the updater. The script fails the deploy if either lookup fails.
 
+Upgrading a deployment from before roles existed: the deploy creates the `admins` and `guests` groups, and Edge then refuses users in neither group and treats older sign-ins as signed out. Right after the deploy, add the existing user to `admins` (`aws cognito-idp admin-add-user-to-group --region us-east-1 --user-pool-id <UserPoolId> --username <email or username> --group-name admins`) and sign in again. MicroVMs started before the upgrade have no recorded owner and stay usable by administrators.
+
 ## First access
 
 1. Read `DistributionUrl` and `UserPoolId` from the edge stack outputs (`ManagedLoginDomain` and `SessionsTableName` are also exported).
-2. Create the single user (self sign-up is disabled):
+2. Create the administrator and put them in the `admins` group (self sign-up is disabled; a user in neither `admins` nor `guests` is refused at sign-in):
 
    ```bash
    aws cognito-idp admin-create-user --region us-east-1 \
      --user-pool-id <UserPoolId> --username <email> \
      --user-attributes Name=email,Value=<email> Name=email_verified,Value=true \
      --desired-delivery-mediums EMAIL
+   aws cognito-idp admin-add-user-to-group --region us-east-1 \
+     --user-pool-id <UserPoolId> --username <email> --group-name admins
    ```
 
-   Cognito emails a temporary password. Do not paste it into build logs or commit it.
+   Cognito emails a temporary password. Do not paste it into build logs or commit it. The group is read from the ID token at sign-in, so sign in again after changing it.
 3. Open the distribution URL. Edge redirects to Cognito Managed Login; the first sign-in forces a new password and TOTP authenticator registration. After the callback, Edge issues an opaque `HttpOnly`, `SameSite=Strict` access cookie valid for 8 hours.
 4. In the code-server terminal, start OMP and log in:
 
@@ -103,7 +107,31 @@ Opening `/auth/login` only redirects to Cognito Managed Login; it does not call 
 
 The new-session form picks the MicroVM size: 2 GB baseline memory with an 8 GB disk (default), 4 GB with a 16 GB disk, or 8 GB with a 32 GB disk. Lambda MicroVMs fix memory per image version and derive the disk limit from it, and `RunMicrovm` cannot override either, so each size is its own image (`omp-cloud-ide`, `omp-cloud-ide-4gb`, `omp-cloud-ide-8gb`) built from the same artifact on every deploy. The sizes live in `config.sizes` in `lib/config.ts`; the first entry is the default. Larger sizes cost 2x and 4x the baseline rate.
 
-New starts use a form UUID and a conditional DynamoDB claim to avoid duplicate MicroVMs. If registration fails after `RunMicrovm`, Edge requests compensation termination. The chooser lists MicroVMs without a session row; because a newly starting VM can briefly appear there, verify its ID and use the AWS API/Console for manual cleanup rather than an in-page untracked termination button.
+New starts use a form UUID and a conditional DynamoDB claim to avoid duplicate MicroVMs. If registration fails after `RunMicrovm`, Edge requests compensation termination. The chooser shows administrators the MicroVMs without a session row; because a newly starting VM can briefly appear there, verify its ID and use the AWS API/Console for manual cleanup rather than an in-page untracked termination button.
+
+## Users and roles
+
+Only an administrator creates users; there is no self sign-up. Cognito groups decide the role:
+
+| | `admins` | `guests` |
+|---|---|---|
+| OAuth state (OMP `agent.db`, GitHub CLI) | restored and saved (execution role `omp-cloud-ide-microvm-execution`) | none: the MicroVM runs as `omp-cloud-ide-microvm-guest`, which has no S3/KMS access, and the status bar shows `認証保存なし` |
+| Sizes | 2 GB, 4 GB, 8 GB | 2 GB, 4 GB |
+| MicroVMs at once | no limit | one, running or suspended |
+| Chooser | every session; others' sessions show the owner and only **Terminate** (no Connect) | own sessions only |
+
+Invite a guest with the address you collected. Cognito emails the invitation with a temporary password (valid 7 days); the first sign-in sets a new password and registers a TOTP authenticator. Send the distribution URL yourself.
+
+```bash
+aws cognito-idp admin-create-user --region us-east-1 \
+  --user-pool-id <UserPoolId> --username <email> \
+  --user-attributes Name=email,Value=<email> Name=email_verified,Value=true \
+  --desired-delivery-mediums EMAIL
+aws cognito-idp admin-add-user-to-group --region us-east-1 \
+  --user-pool-id <UserPoolId> --username <email> --group-name guests
+```
+
+Cognito's built-in email sender allows 50 messages per day per user pool. To remove a guest, disable or delete the Cognito user, then terminate their MicroVM from the chooser. Edge sign-ins do not re-check Cognito, so an existing sign-in stays valid until it expires (at most 8 hours) unless its row is deleted from the `omp-cloud-ide-auth-sessions` table (rows carry the user's `sub`).
 
 ## Suspend and resume
 
@@ -140,7 +168,7 @@ AWS_PROFILE=fukuchi AWS_REGION=ap-northeast-1 npm run synth   # regenerates arti
 AWS_PROFILE=fukuchi npm run e2e                               # or: node scripts/e2e.mjs --url https://<distribution>
 ```
 
-`scripts/e2e.mjs` checks the unauthenticated redirects and the Cognito PKCE redirect, then writes a temporary one-hour Edge sign-in row (`sub=e2e-test`) directly to the auth table because Managed Login needs a human TOTP. It checks that the chooser offers every size with the default preselected, then starts one MicroVM of the second size (`omp-cloud-ide-4gb`, 2x baseline cost) so a broken size selection or a missing permission on a non-default image fails the run. It reads `session.json` and `auth-sync.json` inside it through code-server's remote-resource endpoint, suspends, resumes, and terminates it through the confirmation form. MicroVMs that were alive before the run are recorded first, never terminated, and verified afterwards; cleanup touches only the MicroVM and rows this run created. `npm test` overwrites `config.json` with a fake account, so the script refuses to run until `synth` has regenerated it.
+`scripts/e2e.mjs` checks the unauthenticated redirects and the Cognito PKCE redirect, then writes temporary one-hour Edge sign-in rows for an admin and a guest (per-run `sub`s, `role` set) directly to the auth table because Managed Login needs a human TOTP. The admin's chooser must offer every size with the default preselected; the admin starts one MicroVM of the second size (`omp-cloud-ide-4gb`, 2x baseline cost) so a broken size selection or a missing permission on a non-default image fails the run, and the run reads `session.json` and `auth-sync.json` inside it through code-server's remote-resource endpoint. While it runs, the guest must not see it, attach to it, or reach its editor with a forged session cookie, cannot start the 8 GB size, starts a 2 GB MicroVM under the guest execution role with auth persistence disabled and without the admin's `agent.db`, is refused a second MicroVM, and terminates its own; the admin sees the guest MicroVM with its owner but cannot attach to it. The admin then suspends, resumes, and terminates its MicroVM through the confirmation form. MicroVMs that were alive before the run are recorded first, never terminated, and verified afterwards; cleanup touches only the MicroVMs and rows this run created. `npm test` overwrites `config.json` with a fake account, so the script refuses to run until `synth` has regenerated it.
 
 ## Operations
 
@@ -172,10 +200,11 @@ aws dynamodb scan --region us-east-1 --table-name omp-cloud-ide-auth-sessions \
 ## Security notes
 
 - The browser must sign in through Cognito Managed Login (password + TOTP MFA; Cognito's built-in lockout limits guessing) before `RunMicrovm` is called. Edge uses the authorization code flow with PKCE, state and nonce, verifies the ID token, and then discards the tokens. The browser only holds a random session cookie; DynamoDB stores its SHA-256 hash with an 8-hour expiry. Unauthenticated HTML navigation is redirected to `/auth/login`; other requests receive `401`. HTTP Basic and the former password form have been removed.
-- The design is single-user. Sessions are not scoped to a Cognito `sub`, and all MicroVMs restore the shared `personal/` OAuth state; per-user session ownership and per-user S3 prefixes/roles are required before adding a second user.
+- Sessions belong to the Cognito `sub` that started them. Every per-session route (editor traffic, control, suspend, resume, connect) requires the owner; a session cookie for someone else's session is treated as no session. Administrators may list and terminate every session but never connect to another user's MicroVM, so a guest's code never runs in an administrator's browser on the shared origin. Sessions started before owners were recorded belong to administrators.
+- Only administrators get the shared `personal/` OAuth state. Guests run with an execution role that has no S3 or KMS permission, and Edge tells their MicroVM not to restore or save anything.
 - code-server has no independent password because it is reachable only through the AWS MicroVM proxy token injected by the authenticated edge function.
 - Edge removes its own access and session cookies before forwarding to code-server while preserving code-server cookies. This does not isolate same-origin `/proxy/<port>/` apps from session control routes or credentials readable inside the VM.
-- The MicroVM execution role can access only its auth-state prefix and its log group.
+- The admin execution role can access only its auth-state prefix and the image log groups; the guest execution role can only write those log groups.
 - OMP, GitHub, and access credentials are not included in the Docker image or Git repository.
 - The MicroVM container runs as UID 1000, not root.
 - `gh auth login --web` uses GitHub OAuth. PAT-based setup is intentionally not documented or required.

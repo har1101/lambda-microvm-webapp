@@ -69,9 +69,19 @@ function clockOffsetMs(dateHeader, sentAt, receivedAt) {
  * Summarizes lifecycle.py's auth-sync.json for the status bar. Ages use the local
  * clock on purpose: lifecycle.py stamps the file with the same guest clock.
  * Failures outrank staleness; a sync older than three intervals means the
- * periodic sync is not running and S3 may be missing recent logins.
+ * periodic sync is not running and S3 may be missing recent logins. A guest
+ * MicroVM never persists auth state by design, so that is neutral, not a failure.
  */
 function describeAuthSync(status, nowMs, syncIntervalMs) {
+  if (status?.persistence === 'disabled') {
+    return {
+      text: '$(circle-slash) 認証保存なし',
+      level: 'normal',
+      detail:
+        'このMicroVMはゲスト用のため、OMP/GitHubのOAuth認証状態を保存・復元しません。ログインはこのVMの終了とともに失われます。',
+      saveable: false,
+    };
+  }
   const restoreFailed = Array.isArray(status?.restoreFailed) ? status.restoreFailed : [];
   const failed = Array.isArray(status?.failed) ? status.failed : [];
   const conflicts = Array.isArray(status?.conflicts) ? status.conflicts : [];

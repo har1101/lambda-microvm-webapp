@@ -160,7 +160,7 @@ Chromeでは正常でも、Codex内蔵ブラウザではBasic認証ダイアロ�
 
 ### 4.3 アクセスCookieは不透明値にし、サーバーにはハッシュだけを置く
 
-アクセスCookieは32バイトの乱数(base64url)で、中身に意味を持たせない。DynamoDBの認証セッション表には`sess#<SHA-256(値)>`として`sub`と期限だけを保存するので、表を読めてもCookieは再現できない。行を消せばサーバー側で即座に失効でき(ログアウト)、TTL削除が遅れても`expiresAt`で期限切れを拒否する。Cognitoのtokenは検証後に捨て、ブラウザにも表にも保存しない。
+アクセスCookieは32バイトの乱数(base64url)で、中身に意味を持たせない。DynamoDBの認証セッション表には`sess#<SHA-256(値)>`として`sub`、役割(`role`)、メールアドレスと期限だけを保存するので、表を読めてもCookieは再現できない。行を消せばサーバー側で即座に失効でき(ログアウト)、TTL削除が遅れても`expiresAt`で期限切れを拒否する。Cognitoのtokenは検証後に捨て、ブラウザにも表にも保存しない。裏返すと、サインイン後はCognitoを見ないので、Cognitoで利用者を無効化しても行が残る間(最大8時間)は使える。
 
 アクセスCookieには次を付けている。
 
@@ -179,9 +179,17 @@ callbackで`Set-Cookie`付きの302を`/session/select`へ返すと、ブラウ�
 
 callbackは200のHTMLで`<meta http-equiv="refresh" content="0;url=/session/select">`を返し、同一サイトの画面から遷移させることで解決した。script不要なのでCSPも緩めずに済む。
 
-### 4.5 認証はCognitoだが、分離は単一利用者のままである
+### 4.5 利用者の分離はCognitoグループと2つの実行Roleで行う
 
-CognitoでMFA(TOTP)、ロックアウト、利用者識別(`sub`)は得たが、セッションは`sub`に紐づけておらず、全MicroVMが共有の`personal/`認証状態(GitHub・LLMの資格情報)を復元する。2人目の利用者を追加する前に、sessionの`ownerSub`による所有者限定と、利用者別のS3 prefix・実行Roleが必要である。Cognito側でユーザーを作れば入れてしまうので、自己サインアップは無効にしてある。
+CognitoでMFA(TOTP)、ロックアウト、利用者識別(`sub`)を得たうえで、グループ`admins`/`guests`で役割を分けた(実装済み、deploy・実機確認待ち)。セッション行に`ownerSub`を書き、一覧・接続・制御を所有者に限定する。管理者は全員のセッションを見て終了できるが、他人のMicroVMには接続しない。ゲストのコードが管理者のブラウザで同じoriginのまま動くのを避けるためである。共有の`personal/`認証状態(GitHub・LLMの資格情報)を使うのは管理者のMicroVMだけで、ゲストのMicroVMはS3・KMSの権限を持たない実行Roleで動き、認証状態を復元も保存もしない。どちらのグループにも属さない利用者はサインインを拒否し、利用者は管理者が`admin-create-user`で招待する(自己サインアップは無効)。
+
+### 4.5.1 RunMicrovmはタグを受け取らないので、分離の単位ごとに実行Roleが要る
+
+`RunMicrovm`で利用者ごとに変えられるAWS権限は`executionRoleArn`だけで、タグやsession tagを渡すパラメータがない。そのため、1つのRoleで`${aws:PrincipalTag/...}`を使って利用者ごとのS3 prefixに絞るABACはできない。利用者ごとに分けるなら利用者ごとのRole、つまり利用者を追加するたびのdeployが要る。今回は分離の単位を「認証状態を持つ管理者」と「何も持たないゲスト」の2つに絞り、Roleを2つにした。
+
+### 4.5.2 CognitoのメールOTPサインインはMFA必須と両立しない
+
+招待した利用者にパスワードを覚えさせないよう、メールOTPでのパスワードレスサインイン(choice-based sign-in)を検討した。しかしこれはMFA必須のUser Poolでは使えず、Cognito組み込みのメール送信でも使えないので、自前のSESとsandbox解除も要る。MFA必須を保つため、`admin-create-user`の招待メールで一時パスワードを送り、初回サインインでパスワードとTOTPを登録させる方式にした。組み込みのメール送信はUser Poolあたり1日50通までである。
 
 ### 4.6 SameSite Cookieだけでは同一origin内の未信頼アプリを防げない
 
@@ -237,9 +245,9 @@ Lambda@Edgeは分散して実行されるため、複数リクエストが同時
 
 ## 6. OMP認証状態の永続化で得た知見
 
-### 6.1 単一利用者・単一IDEならAuth Brokerなしでも成立する
+### 6.1 共有の認証状態を使う利用者が1人ならAuth Brokerなしでも成立する
 
-OMPのClaude/Codex OAuth情報は`agent.db`へまとまる。個人用で同時実行を前提にしないなら、常駐Auth Brokerを追加するより、MicroVMのライフサイクルに合わせてS3へ退避する方が小さく保てる。
+OMPのClaude/Codex OAuth情報は`agent.db`へまとまる。共有の認証状態を使うのが管理者1人で、同時実行を前提にしないなら、常駐Auth Brokerを追加するより、MicroVMのライフサイクルに合わせてS3へ退避する方が小さく保てる。ゲストは認証状態を持たないので、この仕組みに乗らない。
 
 採用した処理:
 
@@ -278,7 +286,7 @@ OMPが書き込み中の`agent.db`を単純に`cp`すると、不整合なスナ
 
 ### 6.4 同時に複数VMを使うと古い状態で上書きし得る。ETag楽観ロックで検出する
 
-すべてのMicroVMが同じS3 keyへ書き込むため、以前は後から保存したVMが勝っていた（last-writer-wins）。複数VMでOAuth tokenがrefreshされると、古いtokenで他VMの新しい状態を上書きし得る。単一利用者でも複数セッションを同時に開けるため、これは現実に起こる。
+すべてのMicroVMが同じS3 keyへ書き込むため、以前は後から保存したVMが勝っていた（last-writer-wins）。複数VMでOAuth tokenがrefreshされると、古いtokenで他VMの新しい状態を上書きし得る。共有の認証状態を使う管理者1人でも複数セッションを同時に開けるため、これは現実に起こる。
 
 現在はETag楽観ロックで上書きを検出する。
 
@@ -338,7 +346,7 @@ persist-auth-state
 
 これらはAWSホストや他MicroVM、広いAWSアカウント権限を守る一方、同一MicroVM内のsecretを未信頼コードから隔離しない。cloneしたコード、dependency install script、VS Code extension、OMPは同じUID 1000で動き、`agent.db`、GitHub `hosts.yml`、実行Role資格情報へアクセスでき、`INTERNET_EGRESS`で外部送信も可能である。
 
-従って現状は利用者、OMP/provider、clone先repositoryと実行する依存スクリプトを信頼する単一ユーザー環境である。未知repoでは実行前にコードを確認し、必要ならWorkspace Trustを再有効化する。より強い分離が必要なら、credentialをBroker/別UIDへ移す、egress proxy/allowlistを使う、未信頼コード専用のcredential-free Image/Sessionを分ける。
+従って現状は、各利用者が自分のMicroVMのOMP/provider、clone先repositoryと実行する依存スクリプトを信頼する環境である。利用者間はセッション所有と実行Roleで分けたが、1台のMicroVMの中は分けていない。未知repoでは実行前にコードを確認し、必要ならWorkspace Trustを再有効化する。より強い分離が必要なら、credentialをBroker/別UIDへ移す、egress proxy/allowlistを使う。credentialを持たないMicroVMは、ゲストの実行Roleとして実装した。
 
 ### 7.4 モデルIDとprovider仕様は変わり得る
 
@@ -603,7 +611,7 @@ Edgeデプロイ直後にテストすると旧Versionが見える可能性があ
 | CloudFront/Lambda@Edge | request、data transfer、Edge invocation/実行時間 |
 | DynamoDB | Get/Put/Update/Scan |
 | S3/KMS | 5分周期の変更確認で変更があったときのPut、Object Version、KMS request、storage |
-| Cognito | Essentials機能プランのMAU課金(10,000 MAUまでは無料枠)。単一利用者なら無料枠内 |
+| Cognito | Essentials機能プランのMAU課金(10,000 MAUまでは無料枠)。管理者と少数のゲストなら無料枠内 |
 | CloudWatch Logs | 取込、保持、検索 |
 
 AWS Budgets、Cost Anomaly Detection、Cost Explorer用tag/配賦を追加し、実測で支配項を判断する。

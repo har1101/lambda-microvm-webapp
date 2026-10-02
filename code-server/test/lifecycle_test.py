@@ -11,6 +11,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import subprocess
 import sqlite3
 import sys
 import tempfile
@@ -156,6 +157,8 @@ class LifecycleTest(unittest.TestCase):
         spec.loader.exec_module(self.lifecycle)
         self.lifecycle.S3_ENDPOINT = endpoint
         self.lifecycle.IMDS_ENDPOINT = endpoint
+        # Existing behavior is the admin VM's; guest tests start their own session.
+        self.start_run({"authState": True})
 
     def tearDown(self) -> None:
         self.aws.release.set()
@@ -163,6 +166,11 @@ class LifecycleTest(unittest.TestCase):
         self.server.server_close()
         os.environ.clear()
         os.environ.update(self.saved_env)
+
+    def start_run(self, fields: dict) -> None:
+        """Records the /run hook as Lambda delivers it: Edge payload wrapped in an envelope."""
+        payload = json.dumps({"expiresAt": 1_800_028_800_000, **fields})
+        self.lifecycle.record_session(json.dumps({"microvmId": "mvm-test", "runHookPayload": payload}).encode())
 
     def aws_calls(self) -> list[str]:
         return list(self.aws.calls)
@@ -179,8 +187,67 @@ class LifecycleTest(unittest.TestCase):
     def test_missing_objects_on_first_run_are_not_failures(self) -> None:
         self.lifecycle.restore_state(self.lifecycle.Deadline(25))
         status = self.status()
+        self.assertEqual(status["persistence"], "enabled")
         self.assertEqual(status["restoreFailed"], [])
         self.assertIsInstance(status["lastSuccessAt"], int)
+
+    def test_guest_or_unknown_run_payload_never_touches_s3(self) -> None:
+        envelope = lambda payload: json.dumps({"microvmId": "m", "runHookPayload": json.dumps(payload)})  # noqa: E731
+        cases = {
+            "authState false": envelope({"expiresAt": 1, "authState": False}),
+            "authState missing": envelope({"expiresAt": 1}),
+            "authState not a boolean": envelope({"expiresAt": 1, "authState": "true"}),
+            "unparseable payload": "not json",
+        }
+        self.aws.store("github/hosts.yml", "admin: token\n")
+        for name, body in cases.items():
+            with self.subTest(name):
+                self.lifecycle.SESSION_FILE.unlink(missing_ok=True)
+                self.lifecycle.STATUS_FILE.unlink(missing_ok=True)
+                self.lifecycle.record_session(body.encode())
+                self.lifecycle.restore_state(self.lifecycle.Deadline(25))
+                self.assertEqual(self.status()["persistence"], "disabled")
+                self.assertFalse(self.lifecycle.STATE_FILES["github/hosts.yml"].exists())
+
+                hosts = self.write_hosts("guest: token\n")
+                self.assertEqual(
+                    self.lifecycle.persist_state("periodic", self.lifecycle.Deadline(10), wait_for_lock=False), {}
+                )
+                for hook in ("suspend", "terminate"):
+                    self.assertEqual(
+                        self.lifecycle.persist_state(hook, self.lifecycle.Deadline(10), wait_for_lock=True), {}
+                    )
+                self.assertEqual(self.lifecycle.manual_sync(), 0)
+                self.assertEqual(self.lifecycle.manual_sync(overwrite=True), 0)
+
+                self.assertEqual(self.status()["persistence"], "disabled")
+                self.assertEqual(self.aws_calls(), [])
+                self.assertEqual(self.aws.token_requests, 0)
+                self.assertEqual(self.aws.read("github/hosts.yml"), "admin: token\n")
+                hosts.unlink()
+
+    def test_nothing_is_uploaded_before_the_run_hook(self) -> None:
+        # Snapshot/build phase: the hook server and periodic thread run, but /run has not arrived.
+        self.lifecycle.SESSION_FILE.unlink()
+        self.write_hosts("build: token\n")
+        self.assertEqual(self.lifecycle.persist_state("periodic", self.lifecycle.Deadline(10), wait_for_lock=False), {})
+        self.assertEqual(self.lifecycle.persist_state("suspend", self.lifecycle.Deadline(10), wait_for_lock=True), {})
+        self.assertEqual(self.aws_calls(), [])
+        self.assertEqual(self.aws.token_requests, 0)
+
+    def test_persist_auth_state_command_exits_zero_when_disabled(self) -> None:
+        self.start_run({"authState": False})
+        result = subprocess.run(
+            [sys.executable, str(LIFECYCLE), "--sync"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            # An unreachable endpoint would fail the command if it tried S3/IMDS.
+            env={**os.environ, "AWS_REGION": "invalid-region-for-test"},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("disabled for this MicroVM", result.stdout)
+        self.assertEqual(self.aws_calls(), [])
 
     def test_slow_first_download_does_not_starve_other_auth_files(self) -> None:
         for key in ("omp/agent.db", "omp/install-id", "github/hosts.yml"):
@@ -347,8 +414,9 @@ class LifecycleTest(unittest.TestCase):
 
     def test_run_hook_records_deadline_from_lambda_envelope_only(self) -> None:
         session_file = self.lifecycle.SESSION_FILE
+        session_file.unlink()
         # A bare payload (not wrapped by Lambda) must not be mistaken for a deadline.
-        self.lifecycle.record_session(json.dumps({"expiresAt": 1_800_028_800_000}).encode())
+        self.lifecycle.record_session(json.dumps({"expiresAt": 1_800_028_800_000, "authState": True}).encode())
         self.lifecycle.record_session(b"not json")
         self.assertFalse(session_file.exists())
 
@@ -357,6 +425,7 @@ class LifecycleTest(unittest.TestCase):
                 "sessionId": "7d041485-dff5-4033-bdbc-a921757e217b",
                 "expiresAt": 1_800_028_800_000,
                 "controlUrl": "https://d111.cloudfront.net/session/control",
+                "authState": True,
             }
         )
         self.lifecycle.record_session(json.dumps({"microvmId": "mvm-test", "runHookPayload": payload}).encode())
@@ -366,6 +435,7 @@ class LifecycleTest(unittest.TestCase):
             {
                 "microvmId": "mvm-test",
                 "expiresAt": 1_800_028_800_000,
+                "authState": True,
                 "controlUrl": "https://d111.cloudfront.net/session/control",
             },
         )
@@ -374,7 +444,8 @@ class LifecycleTest(unittest.TestCase):
         payload = json.dumps({"expiresAt": 1_800_028_800_000, "controlUrl": "http://evil.example/"})
         self.lifecycle.record_session(json.dumps({"microvmId": "mvm-test", "runHookPayload": payload}).encode())
         self.assertEqual(
-            json.loads(session_file.read_text()), {"microvmId": "mvm-test", "expiresAt": 1_800_028_800_000}
+            json.loads(session_file.read_text()),
+            {"microvmId": "mvm-test", "expiresAt": 1_800_028_800_000, "authState": False},
         )
 
 

@@ -14,7 +14,15 @@ import * as s3assets from 'aws-cdk-lib/aws-s3-assets';
 import * as ssm from 'aws-cdk-lib/aws-ssm';
 import * as cdk from 'aws-cdk-lib/core';
 import type { Construct } from 'constructs';
-import { config, egressConnectorArn, executionRoleArn, imageArn, imageArns, ingressConnectorArn } from './config';
+import {
+  config,
+  egressConnectorArn,
+  executionRoleArn,
+  guestExecutionRoleArn,
+  imageArn,
+  imageArns,
+  ingressConnectorArn,
+} from './config';
 
 const microvmSourceArn = `arn:aws:lambda:${config.microvmRegion}:${config.account}:microvm-image:*` as const;
 const microvmInstanceArn = `arn:aws:lambda:${config.microvmRegion}:${config.account}:microvm:*` as const;
@@ -89,6 +97,15 @@ export class OmpCloudIdeMicrovmStack extends cdk.Stack {
     hardenMicrovmRoleTrust(executionRole);
     authBucket.grantReadWrite(executionRole, `${config.authState.prefix}/*`);
 
+    // Guests run with this role instead: no S3 or KMS access, so their MicroVMs
+    // can neither restore nor overwrite the admin's OAuth state.
+    const guestExecutionRole = new iam.Role(this, 'MicrovmGuestExecutionRole', {
+      roleName: 'omp-cloud-ide-microvm-guest',
+      assumedBy: new iam.ServicePrincipal('lambda.amazonaws.com'),
+      description: 'Runtime role for guest MicroVMs; log writes only',
+    });
+    hardenMicrovmRoleTrust(guestExecutionRole);
+
     for (const size of config.sizes) {
       // The 2gb image predates selectable sizes. Keeping its logical IDs updates
       // the existing image and log group in place instead of replacing them.
@@ -102,6 +119,7 @@ export class OmpCloudIdeMicrovmStack extends cdk.Stack {
       });
       logGroup.grantWrite(buildRole);
       logGroup.grantWrite(executionRole);
+      logGroup.grantWrite(guestExecutionRole);
 
       const microvmImage = new cdk.CfnResource(this, `MicrovmImage${idSuffix}`, {
         type: 'AWS::Lambda::MicrovmImage',
@@ -154,7 +172,11 @@ export class OmpCloudIdeMicrovmStack extends cdk.Stack {
 
     new cdk.CfnOutput(this, 'MicrovmExecutionRoleArn', {
       value: executionRole.roleArn,
-      description: 'Least-privilege role assumed inside a running MicroVM',
+      description: 'Least-privilege role assumed inside an admin MicroVM',
+    });
+    new cdk.CfnOutput(this, 'MicrovmGuestExecutionRoleArn', {
+      value: guestExecutionRole.roleArn,
+      description: 'Role assumed inside a guest MicroVM (no auth-state access)',
     });
     new cdk.CfnOutput(this, 'AuthStateBucketName', {
       value: authBucket.bucketName,
@@ -167,7 +189,8 @@ export class OmpCloudIdeEdgeStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props: cdk.StackProps) {
     super(scope, id, props);
 
-    // One personal user, created by an administrator. Nobody can sign up.
+    // Users are created only by an administrator (admin-create-user), which
+    // emails a temporary password. Nobody can sign up.
     const userPool = new cognito.UserPool(this, 'UserPool', {
       userPoolName: 'omp-cloud-ide',
       featurePlan: cognito.FeaturePlan.ESSENTIALS,
@@ -186,6 +209,28 @@ export class OmpCloudIdeEdgeStack extends cdk.Stack {
       accountRecovery: cognito.AccountRecovery.EMAIL_ONLY,
       deletionProtection: true,
       removalPolicy: cdk.RemovalPolicy.RETAIN,
+      userInvitation: {
+        emailSubject: 'OMP Cloud IDE invitation',
+        emailBody: [
+          'You have been invited to OMP Cloud IDE.<br><br>',
+          'Username: {username}<br>Temporary password: {####}<br><br>',
+          'Open the Cloud IDE URL you received from the administrator and sign in with this email address ',
+          'and the temporary password. You will choose a new password and register an authenticator app (TOTP). ',
+          'The temporary password expires in 7 days.',
+        ].join(''),
+      },
+    });
+    // The edge reads `cognito:groups` from the ID token at sign-in; a user in
+    // neither group is refused.
+    new cognito.CfnUserPoolGroup(this, 'AdminsGroup', {
+      userPoolId: userPool.userPoolId,
+      groupName: config.edge.groups.admin,
+      description: 'Shared OAuth state, every size, sees and terminates all sessions',
+    });
+    new cognito.CfnUserPoolGroup(this, 'GuestsGroup', {
+      userPoolId: userPool.userPoolId,
+      groupName: config.edge.groups.guest,
+      description: 'No OAuth state, 2 GB/4 GB only, one MicroVM at a time',
     });
     const userPoolDomain = userPool.addDomain('Domain', {
       cognitoDomain: { domainPrefix: config.edge.cognitoDomainPrefix },
@@ -258,7 +303,7 @@ export class OmpCloudIdeEdgeStack extends cdk.Stack {
     edgeRole.addToPolicy(
       new iam.PolicyStatement({
         actions: ['iam:PassRole'],
-        resources: [executionRoleArn],
+        resources: [executionRoleArn, guestExecutionRoleArn],
       }),
     );
     table.grant(
@@ -296,9 +341,17 @@ export class OmpCloudIdeEdgeStack extends cdk.Stack {
       MVM_REGION: config.microvmRegion,
       TABLE_REGION: config.edgeRegion,
       TABLE: config.edge.tableName,
-      // The first image is the chooser default.
-      IMAGES: config.sizes.map((size) => ({ id: size.id, arn: imageArn(size.imageName), label: size.label })),
+      // The first image is the chooser default; `roles` gates who may start it.
+      IMAGES: config.sizes.map((size) => ({
+        id: size.id,
+        arn: imageArn(size.imageName),
+        label: size.label,
+        roles: size.roles,
+      })),
       EXECUTION_ROLE_ARN: executionRoleArn,
+      GUEST_EXECUTION_ROLE_ARN: guestExecutionRoleArn,
+      ADMIN_GROUP: config.edge.groups.admin,
+      GUEST_GROUP: config.edge.groups.guest,
       INGRESS: ingressConnectorArn(config.microvmRegion),
       EGRESS: egressConnectorArn(config.microvmRegion),
       // Lambda@Edge does not support environment variables. Embed only stable

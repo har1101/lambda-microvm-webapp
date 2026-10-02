@@ -169,14 +169,18 @@ function createAuthSyncStatus() {
   item.command = 'ompCloudIde.persistAuthState';
   item.show();
 
+  // Guest MicroVMs have nothing to save; clicking must not claim a save to S3.
+  let saveable = true;
   const refresh = async () => {
     const status = await fs
       .readFile(AUTH_SYNC_FILE, 'utf8')
       .then(JSON.parse, () => null)
       .catch(() => null);
     const view = timer.describeAuthSync(status, Date.now(), SYNC_INTERVAL_MS);
+    saveable = view.saveable !== false;
     item.text = view.text;
     item.tooltip = `OMP/GitHubの認証状態(S3): ${view.detail}`;
+    item.command = saveable ? 'ompCloudIde.persistAuthState' : undefined;
     item.backgroundColor =
       view.level === 'normal' ? undefined : new vscode.ThemeColor(`statusBarItem.${view.level}Background`);
   };
@@ -184,6 +188,10 @@ function createAuthSyncStatus() {
   let saving = false;
   const persist = vscode.commands.registerCommand('ompCloudIde.persistAuthState', async () => {
     if (saving) return;
+    if (!saveable) {
+      void vscode.window.showInformationMessage('このMicroVMでは認証状態を保存しません(ゲスト用)。');
+      return;
+    }
     saving = true;
     try {
       const { failed, output } = await vscode.window.withProgress(

@@ -42,7 +42,7 @@ const RANDOM_TOKEN_PATTERN = /^[A-Za-z0-9_-]{43}$/;
 const START_CLAIM_TTL_SEC = 15 * 60;
 // Edge pages submit forms to themselves; only the sign-out redirect leaves for Cognito.
 const FORM_ACTION = `form-action 'self' https://${cfg.COGNITO_DOMAIN}`;
-const DEFAULT_IMAGE = cfg.IMAGES[0];
+const ROLES = ['admin', 'guest'];
 
 exports.handler = async (event) => {
   const { request, config: distribution } = event.Records[0].cf;
@@ -79,7 +79,7 @@ exports.handler = async (event) => {
   }
 
   if (request.uri === '/session/select') {
-    return handleSessionSelection(request, sessionId, siteOrigin);
+    return handleSessionSelection(request, authSession, sessionId, siteOrigin);
   }
   if (request.uri === '/session/start') {
     return redirectToSessionSelect();
@@ -92,7 +92,9 @@ exports.handler = async (event) => {
     return redirectToSessionSelect();
   }
 
-  if (!sessionItem?.microvmId?.S) {
+  // A cookie for someone else's session (e.g. left by another account that
+  // used this browser) is treated exactly like a missing session.
+  if (!sessionItem?.microvmId?.S || !ownsSession(authSession, sessionItem)) {
     if (isControlRoute || isSuspendRoute || isResumeRoute) {
       return sessionControlResponse({ hasSession: false, clearSessionCookie: true });
     }
@@ -169,7 +171,25 @@ exports.handler = async (event) => {
   return request;
 };
 
-async function startSession(requestId, siteOrigin, image = DEFAULT_IMAGE) {
+/**
+ * Whether the user may operate this session: connect, control, suspend,
+ * resume. Rows from before owners were recorded belong to admins.
+ */
+function ownsSession(authSession, item) {
+  const ownerSub = item.ownerSub?.S;
+  return ownerSub ? ownerSub === authSession.sub : authSession.role === 'admin';
+}
+
+/** Sizes the role may start, in chooser order; the first is the role's default. */
+function imagesFor(role) {
+  return cfg.IMAGES.filter((image) => image.roles.includes(role));
+}
+
+function ownerAttributes({ sub, email, role }) {
+  return { ownerSub: { S: sub }, ownerEmail: { S: email }, ownerRole: { S: role } };
+}
+
+async function startSession(owner, requestId, siteOrigin, image) {
   // The chooser renders a fresh UUID into each "new" form. Using it as the
   // session ID and claiming it before RunMicrovm means a double-submitted form
   // starts one MicroVM, not two.
@@ -182,6 +202,7 @@ async function startSession(requestId, siteOrigin, image = DEFAULT_IMAGE) {
         // No microvmId yet, so the chooser ignores this row until it is filled.
         Item: {
           sessionId: { S: id },
+          ...ownerAttributes(owner),
           createdAt: { N: String(claimedAt) },
           ttl: { N: String(Math.floor(claimedAt / 1000) + START_CLAIM_TTL_SEC) },
         },
@@ -190,11 +211,31 @@ async function startSession(requestId, siteOrigin, image = DEFAULT_IMAGE) {
     );
   } catch (error) {
     if (error?.name !== 'ConditionalCheckFailedException') throw error;
-    return chooserResponse({
+    return chooserResponse(owner, {
       errorMessage:
         'This start request was already submitted and is still starting. Reload in a few seconds to connect.',
       status: '409',
     });
+  }
+
+  const isAdmin = owner.role === 'admin';
+  if (!isAdmin) {
+    let acquired;
+    try {
+      acquired = await acquireGuestSlot(owner.sub, id);
+    } catch (error) {
+      console.error('Guest MicroVM slot could not be acquired', error?.name);
+      // The slot write may have landed before the error surfaced.
+      await releaseGuestSlot(owner.sub, id);
+      return chooserResponse(owner, { errorMessage: 'Could not start a new MicroVM. Please retry.', status: '502' });
+    }
+    if (!acquired) {
+      return chooserResponse(owner, {
+        errorMessage:
+          'Guest accounts can keep only one MicroVM at a time. Resume or terminate your existing MicroVM first; a MicroVM that is terminating frees its place within a few seconds.',
+        status: '409',
+      });
+    }
   }
 
   // Measured before RunMicrovm, so this is never later than the service-side
@@ -205,7 +246,8 @@ async function startSession(requestId, siteOrigin, image = DEFAULT_IMAGE) {
     run = await mvm.send(
       new RunMicrovmCommand({
         imageIdentifier: image.arn,
-        executionRoleArn: cfg.EXECUTION_ROLE_ARN,
+        // Guests get a role without access to the shared sign-in state.
+        executionRoleArn: isAdmin ? cfg.EXECUTION_ROLE_ARN : cfg.GUEST_EXECUTION_ROLE_ARN,
         ingressNetworkConnectors: [cfg.INGRESS],
         egressNetworkConnectors: [cfg.EGRESS],
         idlePolicy: {
@@ -216,16 +258,22 @@ async function startSession(requestId, siteOrigin, image = DEFAULT_IMAGE) {
         maximumDurationInSeconds: cfg.MAX_DURATION_SEC,
         // The image is shared by every distribution, so the IDE learns the
         // control page URL from the origin that started it, not from a build-time constant.
-        runHookPayload: JSON.stringify({ sessionId: id, expiresAt, controlUrl: `${siteOrigin}/session/control` }),
+        runHookPayload: JSON.stringify({
+          sessionId: id,
+          expiresAt,
+          controlUrl: `${siteOrigin}/session/control`,
+          authState: isAdmin,
+        }),
       }),
     );
   } catch (error) {
     console.error('RunMicrovm failed', error?.name);
-    return chooserResponse({ errorMessage: 'Could not start a new MicroVM. Please retry.', status: '502' });
+    if (!isAdmin) await releaseGuestSlot(owner.sub, id);
+    return chooserResponse(owner, { errorMessage: 'Could not start a new MicroVM. Please retry.', status: '502' });
   }
 
   try {
-    await registerSession(id, run);
+    await registerSession(id, run, owner);
   } catch (error) {
     // Without a session row the MicroVM would be unreachable from the chooser
     // yet keep running and billing, so undo the start.
@@ -237,10 +285,15 @@ async function startSession(requestId, siteOrigin, image = DEFAULT_IMAGE) {
     } catch (terminateError) {
       console.error('Compensating TerminateMicrovm failed', terminateError?.name, run.microvmId);
     }
-    return chooserResponse({
+    if (!isAdmin) await releaseGuestSlot(owner.sub, id);
+    // Only admins see the Untracked MicroVMs section.
+    const remedy = isAdmin
+      ? `Check Untracked MicroVMs for ${run.microvmId}.`
+      : `Ask the administrator to terminate ${run.microvmId}.`;
+    return chooserResponse(owner, {
       errorMessage: terminated
         ? 'The new MicroVM could not be registered, so termination was requested. Please retry.'
-        : `The new MicroVM could not be registered and termination failed. Check Untracked MicroVMs for ${run.microvmId}.`,
+        : `The new MicroVM could not be registered and termination failed. ${remedy}`,
       status: '502',
     });
   }
@@ -248,7 +301,93 @@ async function startSession(requestId, siteOrigin, image = DEFAULT_IMAGE) {
   return startingPageResponse(id);
 }
 
-async function registerSession(id, run) {
+function guestSlotId(sub) {
+  return `slot#${sub}`;
+}
+
+/**
+ * Guests may keep one MicroVM, running or suspended. The slot item names the
+ * session holding it; a holder whose MicroVM is gone is taken over rather
+ * than blocking the guest until the slot's TTL.
+ */
+async function acquireGuestSlot(sub, id) {
+  const Key = { sessionId: { S: guestSlotId(sub) } };
+  const ttl = { N: String(Math.floor(Date.now() / 1000) + cfg.MAX_DURATION_SEC + 3600) };
+  // The SDK retries a write whose response was lost; matching our own id keeps
+  // that retry from reporting the slot as held by someone else.
+  try {
+    await ddb.send(
+      new PutItemCommand({
+        TableName: cfg.TABLE,
+        Item: { ...Key, holder: { S: id }, ttl },
+        ConditionExpression: 'attribute_not_exists(sessionId) OR holder = :id',
+        ExpressionAttributeValues: { ':id': { S: id } },
+      }),
+    );
+    return true;
+  } catch (error) {
+    if (error?.name !== 'ConditionalCheckFailedException') throw error;
+  }
+
+  const slot = await ddb.send(new GetItemCommand({ TableName: cfg.TABLE, Key, ConsistentRead: true }));
+  const holder = slot.Item?.holder?.S;
+  if (holder === id) return true;
+  if (holder && !(await isStaleSlotHolder(holder))) return false;
+  try {
+    // Conditional on the holder just inspected, so concurrent starts cannot both take over.
+    await ddb.send(
+      new UpdateItemCommand({
+        TableName: cfg.TABLE,
+        Key,
+        UpdateExpression: 'SET holder = :id, #ttl = :ttl',
+        ConditionExpression: holder ? 'holder = :old OR holder = :id' : 'attribute_not_exists(holder) OR holder = :id',
+        ExpressionAttributeNames: { '#ttl': 'ttl' },
+        ExpressionAttributeValues: { ':id': { S: id }, ':ttl': ttl, ...(holder ? { ':old': { S: holder } } : {}) },
+      }),
+    );
+    return true;
+  } catch (error) {
+    if (error?.name !== 'ConditionalCheckFailedException') throw error;
+    return false;
+  }
+}
+
+async function isStaleSlotHolder(holderId) {
+  const { Item } = await ddb.send(
+    new GetItemCommand({ TableName: cfg.TABLE, Key: { sessionId: { S: holderId } }, ConsistentRead: true }),
+  );
+  if (!Item) return true;
+  if (!Item.microvmId?.S) {
+    // A start claim is still starting until it expires.
+    return Number(Item.ttl?.N ?? 0) * 1000 <= Date.now();
+  }
+  try {
+    return (await getMicrovmState(Item.microvmId.S)) === 'TERMINATED';
+  } catch (error) {
+    if (error?.name === 'ResourceNotFoundException') return true;
+    throw error;
+  }
+}
+
+/** Never throws: a slot left behind is taken over once its holder is gone. */
+async function releaseGuestSlot(sub, holderId) {
+  try {
+    await ddb.send(
+      new DeleteItemCommand({
+        TableName: cfg.TABLE,
+        Key: { sessionId: { S: guestSlotId(sub) } },
+        ConditionExpression: 'holder = :id',
+        ExpressionAttributeValues: { ':id': { S: holderId } },
+      }),
+    );
+  } catch (error) {
+    if (error?.name !== 'ConditionalCheckFailedException') {
+      console.error('Guest MicroVM slot could not be released', error?.name);
+    }
+  }
+}
+
+async function registerSession(id, run, owner) {
   const tokenResponse = await mvm.send(
     new CreateMicrovmAuthTokenCommand({
       microvmIdentifier: run.microvmId,
@@ -266,6 +405,7 @@ async function registerSession(id, run) {
       Item: {
         sessionId: { S: id },
         microvmId: { S: run.microvmId },
+        ...ownerAttributes(owner),
         endpoint: { S: run.endpoint },
         token: { S: token },
         tokenExpiry: { N: String(now + cfg.TOKEN_DURATION_MIN * 60000) },
@@ -309,9 +449,9 @@ function startingPageResponse(id) {
   };
 }
 
-async function handleSessionSelection(request, currentSessionId, siteOrigin) {
+async function handleSessionSelection(request, authSession, currentSessionId, siteOrigin) {
   if (request.method === 'GET' || request.method === 'HEAD') {
-    return chooserResponse({
+    return chooserResponse(authSession, {
       currentSessionId,
     });
   }
@@ -321,7 +461,7 @@ async function handleSessionSelection(request, currentSessionId, siteOrigin) {
 
   const form = parseFormBody(request.body);
   if (!form) {
-    return chooserResponse({
+    return chooserResponse(authSession, {
       currentSessionId,
       errorMessage: 'The session request was invalid or too large.',
       status: '400',
@@ -330,19 +470,24 @@ async function handleSessionSelection(request, currentSessionId, siteOrigin) {
 
   const action = form.get('action');
   if (action === 'new') {
-    // Forms rendered before sizes existed carry no size; they get the default.
+    const allowed = imagesFor(authSession.role);
+    // Forms rendered before sizes existed carry no size; they get the role's default.
     const size = form.get('size');
-    const image = size === null ? DEFAULT_IMAGE : cfg.IMAGES.find((candidate) => candidate.id === size);
+    const image = size === null ? allowed[0] : allowed.find((candidate) => candidate.id === size);
     if (!image) {
-      return chooserResponse({ currentSessionId, errorMessage: 'Choose one of the listed sizes.', status: '400' });
+      return chooserResponse(authSession, {
+        currentSessionId,
+        errorMessage: 'Choose one of the listed sizes.',
+        status: '400',
+      });
     }
-    return startSession(form.get('requestId'), siteOrigin, image);
+    return startSession(authSession, form.get('requestId'), siteOrigin, image);
   }
   if (action === 'terminate-confirm' || action === 'terminate') {
-    return handleTermination(form, currentSessionId, action === 'terminate');
+    return handleTermination(authSession, form, currentSessionId, action === 'terminate');
   }
   if (action !== 'attach') {
-    return chooserResponse({
+    return chooserResponse(authSession, {
       currentSessionId,
       errorMessage: 'Choose an existing session or start a new MicroVM.',
       status: '400',
@@ -351,29 +496,30 @@ async function handleSessionSelection(request, currentSessionId, siteOrigin) {
 
   const selectedSessionId = form.get('sessionId') ?? '';
   if (!/^[0-9a-f-]{36}$/i.test(selectedSessionId)) {
-    return chooserResponse({
+    return chooserResponse(authSession, {
       currentSessionId,
       errorMessage: 'The selected session ID was invalid.',
       status: '400',
     });
   }
-  return attachSession(selectedSessionId, currentSessionId);
+  return attachSession(authSession, selectedSessionId, currentSessionId);
 }
 
-async function chooserResponse(options) {
-  const { sessions, trackedMicrovmIds } = await listAvailableSessions();
-  const untracked = await listUntrackedMicrovms(trackedMicrovmIds);
-  return sessionSelectionResponse({ ...options, sessions, untracked });
+async function chooserResponse(viewer, options) {
+  const { sessions, trackedMicrovmIds } = await listAvailableSessions(viewer);
+  // Untracked MicroVMs have no owner to check, so only admins see them.
+  const untracked = viewer.role === 'admin' ? await listUntrackedMicrovms(trackedMicrovmIds) : [];
+  return sessionSelectionResponse({ ...options, role: viewer.role, sessions, untracked });
 }
 
-async function listAvailableSessions() {
+async function listAvailableSessions(viewer) {
   const items = [];
   let lastKey;
   do {
     const result = await ddb.send(
       new ScanCommand({
         TableName: cfg.TABLE,
-        ProjectionExpression: 'sessionId,microvmId,paused,terminationPending,createdAt,#ttl',
+        ProjectionExpression: 'sessionId,microvmId,paused,terminationPending,createdAt,#ttl,ownerSub,ownerEmail',
         ExpressionAttributeNames: { '#ttl': 'ttl' },
         Limit: 25,
         ExclusiveStartKey: lastKey,
@@ -388,6 +534,9 @@ async function listAvailableSessions() {
       const sessionId = item.sessionId?.S;
       const microvmId = item.microvmId?.S;
       if (!sessionId || !microvmId) return null;
+      // Admins see every session; guests only their own.
+      const owned = ownsSession(viewer, item);
+      if (!owned && viewer.role !== 'admin') return null;
       try {
         const microvm = await mvm.send(new GetMicrovmCommand({ microvmIdentifier: microvmId }));
         if (microvm.state === 'TERMINATED') {
@@ -408,6 +557,8 @@ async function listAvailableSessions() {
             ? new Date(microvm.startedAt).getTime() + (microvm.maximumDurationInSeconds ?? cfg.MAX_DURATION_SEC) * 1000
             : 0,
           ttl: Number(item.ttl?.N ?? 0),
+          owned,
+          ownerLabel: ownerLabel(viewer, item),
         };
       } catch (error) {
         if (error?.name === 'ResourceNotFoundException') {
@@ -426,6 +577,14 @@ async function listAvailableSessions() {
       .sort((left, right) => (right.createdAt || right.ttl * 1000) - (left.createdAt || left.ttl * 1000)),
     trackedMicrovmIds: new Set(items.map((item) => item.microvmId?.S).filter(Boolean)),
   };
+}
+
+/** Empty for the viewer's own sessions; otherwise who started it. */
+function ownerLabel(viewer, item) {
+  const ownerSub = item.ownerSub?.S;
+  if (!ownerSub) return 'legacy';
+  if (ownerSub === viewer.sub) return '';
+  return item.ownerEmail?.S || ownerSub;
 }
 
 /**
@@ -463,26 +622,38 @@ async function listUntrackedMicrovms(trackedMicrovmIds) {
   return untracked;
 }
 
+/** Only called once the MicroVM is TERMINATED or gone, which also frees its guest slot. */
 async function deleteSessionRecord(sessionId, microvmId) {
+  let deleted;
   try {
-    await ddb.send(
+    deleted = await ddb.send(
       new DeleteItemCommand({
         TableName: cfg.TABLE,
         Key: { sessionId: { S: sessionId } },
         ConditionExpression: 'microvmId = :id',
         ExpressionAttributeValues: { ':id': { S: microvmId } },
+        ReturnValues: 'ALL_OLD',
       }),
     );
   } catch (error) {
     if (error?.name !== 'ConditionalCheckFailedException') throw error;
+    return;
+  }
+  const owner = deleted.Attributes;
+  if (owner?.ownerRole?.S === 'guest' && owner.ownerSub?.S) {
+    await releaseGuestSlot(owner.ownerSub.S, sessionId);
   }
 }
 
-async function handleTermination(form, currentSessionId, confirmed) {
+async function handleTermination(authSession, form, currentSessionId, confirmed) {
   const sessionId = form.get('sessionId') ?? '';
   const requestedMicrovmId = form.get('microvmId') ?? '';
   if (!UUID_PATTERN.test(sessionId)) {
-    return chooserResponse({ currentSessionId, errorMessage: 'The session ID was invalid.', status: '400' });
+    return chooserResponse(authSession, {
+      currentSessionId,
+      errorMessage: 'The session ID was invalid.',
+      status: '400',
+    });
   }
 
   try {
@@ -493,14 +664,23 @@ async function handleTermination(form, currentSessionId, confirmed) {
         ConsistentRead: true,
       }),
     );
-    if (!row.Item?.microvmId?.S || (requestedMicrovmId && row.Item.microvmId.S !== requestedMicrovmId)) {
-      return chooserResponse({ currentSessionId, errorMessage: 'The selected session has changed.', status: '409' });
+    if (
+      !row.Item?.microvmId?.S ||
+      // Admins may terminate anyone's MicroVM; to anyone else, others' sessions do not exist.
+      (authSession.role !== 'admin' && !ownsSession(authSession, row.Item)) ||
+      (requestedMicrovmId && row.Item.microvmId.S !== requestedMicrovmId)
+    ) {
+      return chooserResponse(authSession, {
+        currentSessionId,
+        errorMessage: 'The selected session has changed.',
+        status: '409',
+      });
     }
     const microvmId = row.Item.microvmId.S;
 
     const microvm = await mvm.send(new GetMicrovmCommand({ microvmIdentifier: microvmId }));
     if (!cfg.IMAGES.some((image) => image.arn === microvm.imageArn) || microvm.microvmId !== microvmId) {
-      return chooserResponse({
+      return chooserResponse(authSession, {
         currentSessionId,
         errorMessage: 'The MicroVM does not belong to this IDE.',
         status: '403',
@@ -508,7 +688,7 @@ async function handleTermination(form, currentSessionId, confirmed) {
     }
     if (microvm.state === 'TERMINATED' || microvm.state === 'TERMINATING') {
       if (microvm.state === 'TERMINATED') await deleteSessionRecord(sessionId, microvmId);
-      return chooserResponse({
+      return chooserResponse(authSession, {
         currentSessionId,
         errorMessage: 'This MicroVM is already terminating or terminated.',
         status: '409',
@@ -560,7 +740,7 @@ async function handleTermination(form, currentSessionId, confirmed) {
     return response;
   } catch (error) {
     console.error('Could not terminate MicroVM', error?.name);
-    return chooserResponse({
+    return chooserResponse(authSession, {
       currentSessionId,
       errorMessage: 'Could not confirm termination. Check the session state and retry if it is still running.',
       status: '502',
@@ -597,7 +777,7 @@ function terminationResultResponse(microvmId, uncertain = false) {
   });
 }
 
-async function attachSession(selectedSessionId, currentSessionId) {
+async function attachSession(authSession, selectedSessionId, currentSessionId) {
   const result = await ddb.send(
     new GetItemCommand({
       TableName: cfg.TABLE,
@@ -605,8 +785,8 @@ async function attachSession(selectedSessionId, currentSessionId) {
       ConsistentRead: true,
     }),
   );
-  if (!result.Item?.microvmId?.S) {
-    return chooserResponse({
+  if (!result.Item?.microvmId?.S || !ownsSession(authSession, result.Item)) {
+    return chooserResponse(authSession, {
       currentSessionId,
       errorMessage: 'That session no longer exists. Choose another session or start a new MicroVM.',
       status: '404',
@@ -614,7 +794,7 @@ async function attachSession(selectedSessionId, currentSessionId) {
   }
 
   if (result.Item.terminationPending?.BOOL === true) {
-    return chooserResponse({
+    return chooserResponse(authSession, {
       currentSessionId,
       errorMessage: 'Termination is pending for that MicroVM. Wait or retry termination.',
       status: '409',
@@ -624,14 +804,14 @@ async function attachSession(selectedSessionId, currentSessionId) {
     const microvmId = result.Item.microvmId.S;
     const state = await getMicrovmState(microvmId);
     if (state === 'TERMINATED' || state === 'TERMINATING') {
-      return chooserResponse({
+      return chooserResponse(authSession, {
         currentSessionId,
         errorMessage: 'That MicroVM has terminated and cannot be resumed.',
         status: '410',
       });
     }
     if (state === 'SUSPENDING') {
-      return chooserResponse({
+      return chooserResponse(authSession, {
         currentSessionId,
         errorMessage: 'That MicroVM is still suspending. Wait a few seconds and try again.',
         status: '409',
@@ -644,7 +824,7 @@ async function attachSession(selectedSessionId, currentSessionId) {
     return sessionAttachedResponse(selectedSessionId, state === 'SUSPENDED');
   } catch (error) {
     console.error('Could not attach existing MicroVM session', error?.name);
-    return chooserResponse({
+    return chooserResponse(authSession, {
       currentSessionId,
       errorMessage: 'Could not connect to that MicroVM. Retry or choose another session.',
       status: '502',
@@ -756,9 +936,13 @@ async function loadRequestState(accessCookie, sessionId) {
         )
       : undefined,
   ]);
-  // DynamoDB TTL deletes lazily, so an expired row must be rejected here.
-  const expiresAt = Number(auth.Item?.expiresAt?.N ?? 0);
-  const authSession = expiresAt > Date.now() ? { sub: auth.Item.sub?.S ?? '' } : null;
+  // DynamoDB TTL deletes lazily, so an expired row must be rejected here. Rows
+  // from before roles existed carry none and must sign in again.
+  const { expiresAt, sub, role, email } = auth.Item ?? {};
+  const authSession =
+    Number(expiresAt?.N ?? 0) > Date.now() && sub?.S && ROLES.includes(role?.S)
+      ? { sub: sub.S, role: role.S, email: email?.S ?? '' }
+      : null;
   return { authSession, sessionItem: session?.Item };
 }
 
@@ -872,6 +1056,10 @@ async function handleAuthCallback(request, siteOrigin) {
   if (typeof claims.nonce !== 'string' || !secureEqual(claims.nonce, pending.nonce.S)) {
     return authFailureResponse('401', 'The identity token did not belong to this sign-in.');
   }
+  const role = roleFromGroups(claims['cognito:groups']);
+  if (!role) {
+    return authFailureResponse('403', 'This account is not allowed to use the Cloud IDE. Ask the administrator.');
+  }
 
   const accessCookie = randomToken();
   const now = Date.now();
@@ -882,6 +1070,8 @@ async function handleAuthCallback(request, siteOrigin) {
       Item: {
         id: { S: authSessionKey(accessCookie) },
         sub: { S: claims.sub },
+        role: { S: role },
+        email: { S: typeof claims.email === 'string' ? claims.email : '' },
         createdAt: { N: String(now) },
         expiresAt: { N: String(expiresAt) },
         ttl: { N: String(Math.ceil(expiresAt / 1000)) },
@@ -890,6 +1080,14 @@ async function handleAuthCallback(request, siteOrigin) {
     }),
   );
   return signedInResponse(accessCookie);
+}
+
+/** A user in both groups is an admin; a user in neither may not sign in. */
+function roleFromGroups(groups) {
+  if (!Array.isArray(groups)) return null;
+  if (groups.includes(cfg.ADMIN_GROUP)) return 'admin';
+  if (groups.includes(cfg.GUEST_GROUP)) return 'guest';
+  return null;
 }
 
 async function exchangeAuthorizationCode(client, code, verifier, redirectUri) {
@@ -1123,6 +1321,7 @@ function signOutForm() {
 }
 
 function sessionSelectionResponse({
+  role,
   sessions,
   untracked = [],
   currentSessionId = '',
@@ -1135,7 +1334,7 @@ function sessionSelectionResponse({
   const sessionCards = sessions.length
     ? sessions
         .map((session) => {
-          const isCurrent = session.sessionId === currentSessionId;
+          const isCurrent = session.owned && session.sessionId === currentSessionId;
           const isSuspended = session.state === 'SUSPENDED' || session.paused;
           const actionLabel = isSuspended ? 'Resume and connect' : 'Connect';
           const created = session.createdAt
@@ -1144,6 +1343,19 @@ function sessionSelectionResponse({
           const lifetime = session.expiresAt
             ? ` · Ends ${new Date(session.expiresAt).toISOString()} (${formatRemaining(session.expiresAt - now)})`
             : '';
+          // Only the owner connects; an admin may still terminate others' sessions.
+          let connect = '';
+          if (session.terminationPending) {
+            connect = '<p class="current-label">Termination pending; do not reconnect.</p>';
+          } else if (session.owned) {
+            connect = [
+              '<form method="post" action="/session/select">',
+              '<input type="hidden" name="action" value="attach">',
+              `<input type="hidden" name="sessionId" value="${escapeHtml(session.sessionId)}">`,
+              `<button class="primary" type="submit">${actionLabel}</button>`,
+              '</form>',
+            ].join('');
+          }
           return [
             `<article class="session${isCurrent ? ' current' : ''}">`,
             '<div class="session-heading">',
@@ -1151,16 +1363,9 @@ function sessionSelectionResponse({
             `<span class="state ${escapeHtml(String(session.state).toLowerCase())}">${escapeHtml(session.state)}</span>`,
             '</div>',
             `<p>${escapeHtml(session.sizeLabel || 'Unknown size')} · Image ${escapeHtml(session.imageVersion || 'unknown')} · ${escapeHtml(created)}${escapeHtml(lifetime)}</p>`,
+            session.ownerLabel ? `<p>Owner: ${escapeHtml(session.ownerLabel)}</p>` : '',
             isCurrent ? '<p class="current-label">Currently selected in this browser</p>' : '',
-            session.terminationPending
-              ? '<p class="current-label">Termination pending; do not reconnect.</p>'
-              : [
-                  '<form method="post" action="/session/select">',
-                  '<input type="hidden" name="action" value="attach">',
-                  `<input type="hidden" name="sessionId" value="${escapeHtml(session.sessionId)}">`,
-                  `<button class="primary" type="submit">${actionLabel}</button>`,
-                  '</form>',
-                ].join(''),
+            connect,
             '<form method="post" action="/session/select">',
             '<input type="hidden" name="action" value="terminate-confirm">',
             `<input type="hidden" name="sessionId" value="${escapeHtml(session.sessionId)}">`,
@@ -1233,10 +1438,10 @@ function sessionSelectionResponse({
       '<input type="hidden" name="action" value="new">',
       `<input type="hidden" name="requestId" value="${escapeHtml(requestId)}">`,
       '<fieldset class="sizes"><legend>MicroVM size</legend>',
-      ...cfg.IMAGES.map((image) =>
+      ...imagesFor(role).map((image, index) =>
         [
           `<label><input type="radio" name="size" value="${escapeHtml(image.id)}"`,
-          image === DEFAULT_IMAGE ? ' checked' : '',
+          index === 0 ? ' checked' : '',
           ` required>${escapeHtml(image.label)}</label>`,
         ].join(''),
       ),
@@ -1549,5 +1754,4 @@ exports.__test = {
   sessionAttachedResponse,
   sessionControlResponse,
   sessionSelectionResponse,
-  startSession,
 };

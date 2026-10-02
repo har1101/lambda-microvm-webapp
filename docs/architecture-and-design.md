@@ -80,7 +80,7 @@
 | Lambda@Edge | CloudFrontのリクエスト・レスポンスに割り込んで動くLambda。このシステムではorigin-requestとorigin-responseの2つを使う |
 | セッション | ブラウザと1台のMicroVMの対応関係。DynamoDBの1レコードで表す |
 | access Cookie | `omp-cloud-ide-auth`。ログイン済みであることを示す不透明なランダム値のCookie。DynamoDBにはそのSHA-256ハッシュだけを保存する |
-| Cognito User Pool | `omp-cloud-ide`。利用者(1人)のID・パスワード・TOTPを管理するAmazon Cognitoのディレクトリ。サインイン画面はCognitoのManaged Loginを使う |
+| Cognito User Pool | `omp-cloud-ide`。利用者(管理者とゲスト)のID・パスワード・TOTPを管理するAmazon Cognitoのディレクトリ。グループ`admins`・`guests`で役割を決める。サインイン画面はCognitoのManaged Loginを使う |
 | oauth Cookie | `omp-cloud-ide-oauth`。サインイン開始から`/auth/callback`までの間だけstate値を持つ短命Cookie |
 | session Cookie | `mvm-session`。どのセッション(MicroVM)へ接続するかを示すCookie。中身はDynamoDBのキーになるUUID |
 | paused | DynamoDBのフラグ。利用者が明示的にSuspendした状態を表し、trueの間はLambda@Edgeがエディタの通信を止める |
@@ -236,8 +236,8 @@ DynamoDBとCognito(User Pool・SSM Parameter)をEdge側(`us-east-1`)に置いた
 ### 4.8 Cognito Managed LoginとEdge側セッションで利用者認証する
 
 - 決めたこと: 利用者認証はAmazon Cognito User PoolのManaged Login(メールアドレス、パスワード、TOTP MFA必須)に任せる。Lambda@EdgeはOIDCのauthorization code grant(PKCE、state、nonce)でID tokenを受け取り、`aws-jwt-verify`で検証したらtokenを捨て、自前の不透明なaccess Cookieを発行する。Cookieのハッシュだけを8時間の期限付きでDynamoDBに置く。
-- 理由: 以前はSecrets Managerの自動生成パスワードとHMAC署名付きCookieを使っていたが、MFA、ログイン試行回数の制限、サーバー側で取り消せるログアウトがなかった。Cognitoはパスワード保管、TOTP、ロックアウトを提供し、利用者1人ならEssentialsの無料枠(10,000 MAU)に収まる。tokenをブラウザへ渡さずEdge側セッションにすると、Cookieを失効させる手段(行の削除)がサーバー側に残り、token更新の処理も要らない。
-- 受け入れたこと: 通常のリクエストごとに認証行のDynamoDB読み取りが増える(session行と並列に読むので往復は増えない)。Lambda@Edgeは環境変数を使えないため、生成されたPool/Client IDはSSM Parameterから、client secretは`DescribeUserPoolClient`から実行時に取得する(5分キャッシュ)。セッションはCognitoの`sub`に紐づけておらず、全MicroVMが共有の`personal/`認証状態を復元するため、2人目の利用者を追加する前に利用者ごとのセッション所有とS3 prefix・実行Roleの分離が必要になる。
+- 理由: 以前はSecrets Managerの自動生成パスワードとHMAC署名付きCookieを使っていたが、MFA、ログイン試行回数の制限、サーバー側で取り消せるログアウトがなかった。Cognitoはパスワード保管、TOTP、ロックアウトを提供し、少人数ならEssentialsの無料枠(10,000 MAU)に収まる。tokenをブラウザへ渡さずEdge側セッションにすると、Cookieを失効させる手段(行の削除)がサーバー側に残り、token更新の処理も要らない。
+- 受け入れたこと: 通常のリクエストごとに認証行のDynamoDB読み取りが増える(session行と並列に読むので往復は増えない)。Lambda@Edgeは環境変数を使えないため、生成されたPool/Client IDはSSM Parameterから、client secretは`DescribeUserPoolClient`から実行時に取得する(5分キャッシュ)。サインイン後はCognitoへ問い合わせ直さないため、Cognitoで利用者を無効化・削除しても、既存の認証行は期限(最大8時間)まで有効なままになる(4.11節)。
 
 ### 4.9 通常のGitHubにGitHub CLIのOAuthで接続する
 
@@ -250,6 +250,19 @@ DynamoDBとCognito(User Pool・SSM Parameter)をEdge側(`us-east-1`)に置いた
 - 理由: `RunMicrovm`にはメモリやディスクを指定するパラメータがなく、`minimumMemoryInMiB`はImage versionごとに固定される。ディスク上限もベースラインで決まる(2GBまでは8GB、4GBは16GB、8GBは32GB)。1つのImageのversionを使い分ける方法では、CloudFormationの1回の更新で1versionしか作れず、サイズごとに中身がずれる。Imageを分ければ、1回のdeployで全サイズが同じコードになる。
 - 受け入れたこと: コードを変えたdeployでは3つのImageを並行してbuildする。4GBはベースライン料金が2倍、8GBは4倍になる。
 
+### 4.11 管理者とゲストをCognitoグループで分ける
+
+- 決めたこと: 利用者は管理者が`admin-create-user`で作る(自己サインアップは無効のまま)。Cognitoは一時パスワード(7日有効)を招待メールで送り、初回サインインで新しいパスワードとTOTPを登録させる。役割はCDKが作るCognitoグループで決める。サインイン時にID tokenの`cognito:groups`を読み、`admins`なら管理者、`guests`ならゲスト(両方なら管理者)とし、どちらにも属さない利用者は認証行もCookieも作らずに拒否する。役割とメールアドレスは認証行に保存する。
+  - 管理者: 共有の`personal/`認証状態を復元・保存する(Execution Role `omp-cloud-ide-microvm-execution`)。全サイズを起動でき、台数の制限はない。選択画面には全員のセッションと「Untracked MicroVMs」を表示する。他人のセッションには所有者を表示し、Terminateだけを許す(接続・制御・Suspend・Resume・proxyは不可)。
+  - ゲスト: Execution Role `omp-cloud-ide-microvm-guest`(S3・KMSの権限なし、Log Groupへの書き込みだけ)でMicroVMを起動し、`runHookPayload`に`authState:false`を渡す。lifecycle.pyは復元も保存もせず、status barに`認証保存なし`を表示する。サイズは2GB・4GBだけ(`lib/config.ts`の`sizes[].roles`)。同時に持てるMicroVMは稼働中・Suspend中を合わせて1台までで、DynamoDBの`slot#<sub>`行で管理する。選択画面には自分のセッションだけを表示する。
+  - セッション行には`ownerSub`・`ownerEmail`・`ownerRole`を書き、セッション単位の全route(エディタ通信、制御、Suspend、Resume、接続)で所有者を確認する。他人のセッションを指すsession Cookieは、セッションなしとして扱う。所有者を記録する前に作られた行(`ownerSub`なし)は管理者のものとする。
+- 理由:
+  - `RunMicrovm`にはタグやsession tagを渡すパラメータがなく、渡せるのは`executionRoleArn`だけである。そのため、1つのRoleを`${aws:PrincipalTag/...}`で利用者ごとのS3 prefixに絞るABACは使えない。利用者ごとのRoleを作るとゲストを追加するたびにdeployが要る。分離の単位を「認証状態を持つ管理者」と「何も持たないゲスト」の2種類に絞れば、Roleは2つで済む。ゲストにOAuth状態を残さないのは意図した制限で、ゲストは毎回自分でサインインし直す。
+  - 管理者に他人のセッションへの接続を許すと、ゲストが書いたコードや`/proxy/<port>/`のアプリが、管理者のブラウザで同じoriginのまま動く。同一originのアプリは制御routeを叩けるので(12.2節)、管理者にはTerminateだけを許して、ゲストのコードを管理者のブラウザへ持ち込まない。
+  - ゲストの台数を1台に絞るのは費用の上限を決めるためである。`slot#<sub>`行は`RunMicrovm`の前に条件付きPutで取り、取れなければ409で断る。保持者のセッション行がない、保持者のMicroVMが`TERMINATED`かNotFound、または保持者が期限切れの起動予約である場合は、古い保持者を条件にした更新で引き継ぐ。TTL切れを待たずに済む。
+  - パスワードレスのメールOTPサインイン(Cognito Essentialsのchoice-based sign-in)も検討したが、MFA必須のUser Poolでは使えず、Cognito組み込みのメール送信でも使えないため自前のSESとsandbox解除が必要になる。招待メールの一時パスワードなら、MFA必須のまま組み込みのメール送信で済む。
+- 受け入れたこと: Cognito組み込みのメール送信はUser Poolあたり1日50通まで。配布URLは管理者が別に伝える。ゲストの削除はCognitoで無効化・削除し、選択画面からMicroVMを終了する手順になるが、Edgeのサインインは期限(最大8時間)まで残るので、すぐ止めるには認証表(`omp-cloud-ide-auth-sessions`)から該当`sub`の行を消す。役割を持たない旧形式の認証行はサインアウト扱いになるため、このdeployの後は全員がサインインし直す。
+
 ## 5. AWSリソース
 
 ### 5.1 `OmpCloudIdeMicrovmStack`(ap-northeast-1)
@@ -261,7 +274,8 @@ DynamoDBとCognito(User Pool・SSM Parameter)をEdge側(`us-east-1`)に置いた
 | CloudWatch Log Group | `/aws/lambda-microvms/<Image名>`(Imageごと) | 保持1週間、削除保護。Image buildと検証用MicroVMの出力だけが入る | 残す(RETAIN) |
 | S3 Asset | `artifact/base-image`をzip化 | Image buildの入力 | cdkdが管理 |
 | IAM Role(Build) | `omp-cloud-ide-microvm-build` | Assetの読み取り、各Log Groupへの書き込み | 削除 |
-| IAM Role(Execution) | `omp-cloud-ide-microvm-execution` | S3の`personal/*`、KMS、各Log Group | 削除 |
+| IAM Role(Execution) | `omp-cloud-ide-microvm-execution` | 管理者のMicroVM用。S3の`personal/*`、KMS、各Log Group | 削除 |
+| IAM Role(Guest Execution) | `omp-cloud-ide-microvm-guest` | ゲストのMicroVM用。各Log Groupへの書き込みだけ(S3・KMSなし) | 削除 |
 | MicroVM Image | `omp-cloud-ide`、`omp-cloud-ide-4gb`、`omp-cloud-ide-8gb` | ARM64、ベース`al2023-1`、最小メモリはそれぞれ2048/4096/8192MiB、hook port 9000。中身は共通(4.10節) | 削除 |
 
 MicroVM ImageにはCDKのL2 Constructがまだないため、`cdk.CfnResource`で`AWS::Lambda::MicrovmImage`を直接定義している(`lib/lambda-microvm-stack.ts`)。2GBのImageとLog Groupは、サイズを選べるようにする前からある論理ID(`MicrovmImage`、`MicrovmLogGroup`)をそのまま使い、置き換えではなく更新でdeployされるようにしている。
@@ -270,7 +284,8 @@ MicroVM ImageにはCDKのL2 Constructがまだないため、`cdk.CfnResource`�
 
 | リソース | 名前 | 主な設定 | 削除時 |
 | --- | --- | --- | --- |
-| Cognito User Pool | `omp-cloud-ide` | Essentials、自己サインアップ無効、メールでサインイン、TOTP MFA必須(SMSなし)、パスワード14文字以上(大文字・小文字・数字)、復旧はメールのみ、削除保護 | 残す(RETAIN) |
+| Cognito User Pool | `omp-cloud-ide` | Essentials、自己サインアップ無効(管理者が`admin-create-user`で招待)、メールでサインイン、TOTP MFA必須(SMSなし)、パスワード14文字以上(大文字・小文字・数字)、復旧はメールのみ、削除保護 | 残す(RETAIN) |
+| Cognito User Pool Group | `admins`、`guests` | 役割を決める(4.11節)。どちらにも属さない利用者はサインインを拒否する | 削除 |
 | Cognito Domain・Managed Login Branding | `omp-cloud-ide-<account>.auth.us-east-1.amazoncognito.com` | Managed Login v2、Cognito既定のスタイル | 削除 |
 | Cognito App client | `omp-cloud-ide-edge` | client secretあり、authorization code grantのみ、scope `openid`・`email`、callback `/auth/callback`、logout `/auth/signed-out`、ID/access token 5分、refresh token 60分(いずれも最小値) | 削除 |
 | SSM Parameter | `/omp-cloud-ide/cognito` | String。`{userPoolId, clientId}` | 削除 |
@@ -453,7 +468,7 @@ callbackで302ではなく200のHTMLを返す理由: 302で返すとCognitoか�
 | 値 | 32バイトの乱数(base64url) | state |
 | 寿命 | 8時間(`Max-Age=28800`) | 10分(`Max-Age=600`) |
 | 属性 | `Path=/; Secure; HttpOnly; SameSite=Strict` | `Path=/auth/callback; Secure; HttpOnly; SameSite=Lax` |
-| サーバー側 | `sess#<base64url(SHA-256(値))>`行(sub、createdAt、expiresAt) | `login#<state>`行(nonce、PKCE verifier、expiresAt) |
+| サーバー側 | `sess#<base64url(SHA-256(値))>`行(sub、role、email、createdAt、expiresAt)。`role`のない旧形式の行はサインアウト扱い | `login#<state>`行(nonce、PKCE verifier、expiresAt) |
 
 oauth Cookieは、Cognitoからのトップレベルのリダイレクトでcallbackへ届く必要があるため`SameSite=Lax`にしている。
 
@@ -537,8 +552,13 @@ default-src 'none'; style-src 'unsafe-inline'; form-action 'self' https://<Cogni
 | `createdAt` | Number | 作成時刻(ミリ秒) |
 | `paused` | Boolean | 利用者が明示的にSuspendした状態か |
 | `ttl` | Number | DynamoDBのTTL(秒)。作成時刻 + 8時間 + 1時間 |
+| `ownerSub` | String | 起動した利用者のCognito `sub`。ない行(旧形式)は管理者のもの |
+| `ownerEmail` | String | 起動した利用者のメールアドレス(選択画面の表示用) |
+| `ownerRole` | String | 起動時の役割(`admin`または`guest`) |
 
-session Cookie(`mvm-session`)はこのレコードを指すUUIDだけを持つ。endpointとtokenはサーバー側に置いたままになる。
+ゲストの台数制限には、同じ表に`sessionId = slot#<sub>`の行を置く。`holder`に保持しているセッションID、`ttl`にセッション行と同じ期限を持つ。`microvmId`がないので、一覧のScanでは無視される。起動失敗時、保持者のMicroVMが`TERMINATED`・NotFoundと分かって行を消すとき、終了を確認したときに、`holder`一致を条件に削除する。
+
+session Cookie(`mvm-session`)はこのレコードを指すUUIDだけを持つ。endpointとtokenはサーバー側に置いたままになる。session Cookieが指す行の所有者がサインイン中の利用者でなければ、セッションなしとして扱う。
 
 ### 8.2 MicroVMの状態とLambda@Edgeの挙動
 
@@ -606,9 +626,9 @@ sequenceDiagram
 1. DynamoDBを`Limit: 25`で全ページScanする。`sessionId`、`microvmId`、`paused`、`terminationPending`、`createdAt`、`ttl`だけを取得し、endpointとtokenは読まない。
 2. 各レコードについて`GetMicrovm`を並列に呼ぶ。
 3. `TERMINATED`またはNotFoundなら対象ID一致を条件に行を削除し、`TERMINATING`や照会失敗は表示から外す。
-4. `createdAt`の新しい順に並べる。
-5. MicroVMごとに接続と確認付きTerminateのフォームを置く。`terminationPending=true`なら接続フォームは出さない。終了予定時刻と残り時間も表示する。
-6. 対象Imageの`ListMicrovms`を全ページ照会し、セッション行のない稼働中VMを「Untracked MicroVMs」へ表示する(画面内の終了ボタンはない)。
+4. 管理者には全員の行を、ゲストには`ownerSub`が自分の行だけを残す(`ownerSub`のない旧形式の行は管理者だけに見える)。`createdAt`の新しい順に並べる。
+5. MicroVMごとに接続と確認付きTerminateのフォームを置く。`terminationPending=true`なら接続フォームは出さない。終了予定時刻と残り時間も表示する。管理者が見る他人のセッションには所有者を表示し、Terminateのフォームだけを置く。
+6. 管理者にだけ、対象Imageの`ListMicrovms`を全ページ照会し、セッション行のない稼働中VMを「Untracked MicroVMs」へ表示する(画面内の終了ボタンはない)。
 
 全ページを読むが、候補数が増えると並列`GetMicrovm`とEdgeの30秒timeoutが課題になる。新しい順はScanに保証されず、表示時に並べ直している。
 
@@ -989,7 +1009,7 @@ lifecycle ruleにはprefixを付けず、Bucket全体を対象にしている。
 | `lambda:GetMicrovm`、`SuspendMicrovm`、`ResumeMicrovm`、`TerminateMicrovm` | 全サイズのImage ARNと、アカウント内の`microvm:*` | 状態によって評価対象が変わるため両方を許可する |
 | `lambda:ListMicrovms` | `*` | APIがresource-level認可を提供しない。呼び出しではImageごとに絞る |
 | `lambda:PassNetworkConnector` | `ALL_INGRESS`と`INTERNET_EGRESS`のconnector ARN | |
-| `iam:PassRole` | Execution Role ARN | `iam:PassedToService`条件は実際の呼び出しと合わず失敗したため付けていない |
+| `iam:PassRole` | Execution Role ARNとGuest Execution Role ARN | 起動する利用者の役割で使い分ける。`iam:PassedToService`条件は実際の呼び出しと合わず失敗したため付けていない |
 | DynamoDB `GetItem`、`PutItem`、`Scan`、`UpdateItem`、`DeleteItem` | セッション表 | 削除は対象MicroVM ID一致が条件 |
 | DynamoDB `GetItem`、`PutItem`、`DeleteItem` | 認証セッション表 | |
 | `ssm:GetParameter` | `/omp-cloud-ide/cognito` | Pool/Client IDの取得 |
@@ -1003,6 +1023,8 @@ origin-response用のRoleは、CloudWatch Logsへの書き込みだけを持つ�
 - S3: 認証状態Bucketの`personal/*`に対する読み書き・削除と、Bucket単位の参照
 - KMS: 上記のためのEncrypt、Decrypt、GenerateDataKey、ReEncrypt、DescribeKey
 - CloudWatch Logs: 専用Log Groupへの書き込み
+
+これは管理者のMicroVMのRoleである。ゲストのMicroVMは`omp-cloud-ide-microvm-guest`で動き、CloudWatch Logsへの書き込みだけを持つ(S3・KMSなし)。Trust Policyは同じである。
 
 OMPはシェルを実行できるので、Execution Roleの権限はOMPからも使える。そのため、開発対象のAWS環境への権限はこのRoleに与えない。
 
@@ -1020,7 +1042,10 @@ Build RoleとExecution Roleは、`lambda.amazonaws.com`に対して`sts:AssumeRo
 ### 12.1 守っているもの
 
 - AWSのホストや他のMicroVMからの分離(MicroVMによるVM単位の分離)
-- 未ログインの利用者によるMicroVMの起動と接続
+- 未ログインの利用者、どのグループにも属さない利用者によるMicroVMの起動と接続
+- 利用者間のセッション分離。セッション単位のrouteは所有者だけが使える。管理者も他人のMicroVMには接続できず、終了だけができる
+- ゲストからの共有認証状態の読み書き(ゲストのRoleにS3・KMSの権限がなく、lifecycle.pyも`authState:false`で復元・保存しない)
+- ゲストの費用(サイズは2GB・4GB、同時に1台まで)
 - ブラウザへのproxy tokenとMicroVM endpointの露出
 - rootでの実行(UID 1000で動かす)
 - 広いAWS権限(Execution Roleは認証状態の保存に必要な分だけ)
@@ -1032,14 +1057,15 @@ Build RoleとExecution Roleは、`lambda.amazonaws.com`に対して`sts:AssumeRo
 - 同じMicroVM内で動く信頼できないコードからのsecretの保護。cloneしたコード、依存パッケージのinstall script、VS Code拡張、OMPはすべて同じUID 1000で動き、`agent.db`、`hosts.yml`、Execution Roleの資格情報を読める。`INTERNET_EGRESS`で外部へ送ることもできる。
 - 同一originの開発アプリからの状態変更。IDE、`/proxy/<port>/`の開発アプリ、ログイン、選択画面、制御画面は同じCloudFrontのoriginにある。`SameSite=Strict`は外部サイトからのCSRFを防ぐが、同じoriginで動くアプリからのPOSTは防がない。
 - Edge専用Cookieのorigin転送は防いでいるが、同じCloudFront originの開発アプリは制御routeへリクエストできる。MicroVM内の同一UIDのコードから認証ファイルも読める。
-- 複数利用者の分離。セッションはCognitoの`sub`に紐づかず、全MicroVMが共有の`personal/`認証状態を復元する(単一利用者前提)
+- 1人の利用者の中での同一originの分離。自分の`/proxy/<port>/`アプリは自分の制御routeを操作できる。利用者間では所有者確認で防いでいる。
+- Cognito側の取り消し。Edgeはサインイン後にCognitoを再確認しないので、無効化・削除した利用者やグループから外した利用者も、認証行の期限(最大8時間)までは使える。すぐ止めるには認証表から該当`sub`の行を消す。
 - WAFによるレート制限(Cognitoのロックアウト以外にはない)
 
 ### 12.3 前提
 
-以上から、このシステムは「利用者本人、OMPとLLM provider、cloneするリポジトリとその依存スクリプト、`/proxy/<port>/`で動かすアプリをすべて信頼する」単一ユーザー環境として設計している。code-serverのWorkspace Trustは無効、OMPの承認モードは`yolo`なので、素性のわからないリポジトリを安全に動かすsandboxとしては使えない。
+以上から、このシステムは「各利用者が、自分のMicroVMで動くOMPとLLM provider、cloneするリポジトリとその依存スクリプト、`/proxy/<port>/`で動かすアプリを信頼する」環境として設計している。利用者間はセッション所有とExecution Roleで分けているが、1台のMicroVMの中は分けていない。code-serverのWorkspace Trustは無効、OMPの承認モードは`yolo`なので、素性のわからないリポジトリを安全に動かすsandboxとしては使えない。管理者のMicroVMで素性のわからないリポジトリを動かすと、共有の`personal/`認証状態が読まれる。
 
-強い分離が必要になった場合の候補は、control用とIDE用のホスト名の分離、認証情報を持たないSession/Imageの分離、egressのallowlist化である。
+強い分離が必要になった場合の候補は、control用とIDE用のホスト名の分離、egressのallowlist化である。認証情報を持たないMicroVMはゲストのRoleとして実装済みである。
 
 ## 13. IaCとデプロイ
 
@@ -1189,7 +1215,7 @@ Lambda@Edgeやセッション処理を変えたときは、デプロイ後に「
 | 永続化 | 複数MicroVMのETag競合は検出するが自動で統合しない |
 | 永続化 | `/resume` hookが何も確認しない |
 | セキュリティ | 同一originの開発アプリから制御画面を操作できる |
-| セキュリティ | WAFがない(試行制限はCognitoのロックアウトのみ)。利用者ごとのセッション所有・S3 prefix・実行Roleの分離がない |
+| セキュリティ | WAFがない(試行制限はCognitoのロックアウトのみ)。Cognitoで無効化した利用者のEdgeサインインを取り消さない(最大8時間残る) |
 | セキュリティ | `dnf`パッケージ、VS Code拡張、npmのtransitive dependency、ベースイメージはchecksum/digestを固定していない |
 | 運用 | origin-responseが開発アプリ自身の502/504も選択画面へ戻す |
 | 運用 | CI/CD、アラーム、ダッシュボードがない。Lambda@Edgeのログが各リージョンに分散する |

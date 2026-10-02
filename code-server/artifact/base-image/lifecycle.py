@@ -295,6 +295,21 @@ def load_status() -> dict:
     return status if isinstance(status, dict) else {}
 
 
+def auth_persistence_enabled() -> bool:
+    """Whether the /run payload enabled auth persistence (admin VMs only).
+
+    Read from SESSION_FILE on every use so the periodic thread and the separate
+    `persist-auth-state` process honor it. Fail-safe: no record (snapshot phase
+    before /run, or a payload without `authState: true`) means disabled, so a
+    guest VM never asks IMDS/S3 and never uploads build-time files.
+    """
+    try:
+        session = json.loads(SESSION_FILE.read_text())
+    except (OSError, ValueError):
+        return False
+    return isinstance(session, dict) and session.get("authState") is True
+
+
 def write_json_atomic(path: Path, value: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile("w", dir=path.parent, delete=False) as tmp:
@@ -317,6 +332,11 @@ def restore_state(deadline: Deadline) -> None:
     not upload it, so an unauthenticated local file never overwrites good state in
     S3. `persist-auth-state` (after logging in again) lifts the block.
     """
+    if not auth_persistence_enabled():
+        with sync_lock(deadline):
+            write_json_atomic(STATUS_FILE, {"persistence": "disabled", "lastTrigger": "run"})
+        log("auth persistence is disabled for this MicroVM; restore skipped")
+        return
     if not BUCKET:
         log("AUTH_STATE_BUCKET is unset; restore skipped")
         return
@@ -367,6 +387,7 @@ def restore_state(deadline: Deadline) -> None:
         write_json_atomic(
             STATUS_FILE,
             {
+                "persistence": "enabled",
                 "files": files,
                 "lastTrigger": "run",
                 "lastAttemptAt": attempted_at,
@@ -440,7 +461,7 @@ def persist_state(
     "overwrite" unconditionally replaces S3 with this VM's files.
     Returns {key: outcome}; outcomes other than uploaded/unchanged/absent are failures.
     """
-    if not BUCKET:
+    if not BUCKET or not auth_persistence_enabled():
         return {}
 
     with sync_lock(deadline if wait_for_lock else None):
@@ -474,6 +495,7 @@ def persist_state(
         failed = sorted(key for key, outcome in results.items() if outcome not in {"uploaded", "unchanged", "absent"})
         attempted_at = now_ms()
         status.update(
+            persistence="enabled",
             lastTrigger=trigger,
             lastAttemptAt=attempted_at,
             failed=failed,
@@ -491,18 +513,20 @@ def persist_state(
 
 
 def record_session(body: bytes) -> None:
-    """Write the MicroVM lifetime deadline and control page URL read by the IDE status bar.
+    """Write the MicroVM lifetime deadline, control page URL and auth-persistence decision.
 
     Lambda wraps RunMicrovm's runHookPayload string as
     {"microvmId": ..., "runHookPayload": "..."}; the Edge puts expiresAt
-    (epoch ms) and controlUrl inside that string. The VM itself cannot query
-    GetMicrovm, and the image is not tied to one CloudFront domain.
+    (epoch ms), controlUrl and authState inside that string. The VM itself cannot
+    query GetMicrovm, and the image is not tied to one CloudFront domain.
+    A payload that cannot be recorded leaves auth persistence disabled.
     """
     try:
         envelope = json.loads(body)
         payload = json.loads(envelope.get("runHookPayload") or "{}")
         expires_at = payload.get("expiresAt")
         control_url = payload.get("controlUrl")
+        auth_state = payload.get("authState") is True
     except (json.JSONDecodeError, AttributeError, TypeError):
         log("run hook body did not contain a JSON runHookPayload")
         return
@@ -510,7 +534,7 @@ def record_session(body: bytes) -> None:
         log("run hook payload has no expiresAt; session deadline unknown")
         return
 
-    session = {"microvmId": str(envelope.get("microvmId", "")), "expiresAt": expires_at}
+    session = {"microvmId": str(envelope.get("microvmId", "")), "expiresAt": expires_at, "authState": auth_state}
     if isinstance(control_url, str) and control_url.startswith("https://"):
         session["controlUrl"] = control_url
     else:
@@ -520,7 +544,7 @@ def record_session(body: bytes) -> None:
     except OSError as error:
         log(f"could not record session deadline: {type(error).__name__}")
         return
-    log("recorded session deadline")
+    log(f"recorded session deadline; auth persistence {'enabled' if auth_state else 'disabled'}")
 
 
 def code_server_ready() -> bool:
@@ -606,6 +630,9 @@ class HookHandler(BaseHTTPRequestHandler):
 
 def manual_sync(overwrite: bool = False) -> int:
     """`persist-auth-state [--overwrite]`: save changed files and report per-file results."""
+    if not auth_persistence_enabled():
+        print("Auth state saving is disabled for this MicroVM (guest session); nothing was saved.")
+        return 0
     if not BUCKET:
         print("AUTH_STATE_BUCKET is unset; nothing was saved.", file=sys.stderr)
         return 1

@@ -8,7 +8,7 @@
 
 ## 1. 現在の到達点
 
-通常GitHubの個人リポジトリから、AWS上へ手動デプロイして利用できる単一ユーザー向けオンデマンドCloud IDEとして動作している。
+通常GitHubの個人リポジトリから、AWS上へ手動デプロイして利用できるオンデマンドCloud IDEとして動作している。管理者(共有の認証状態を使う本人)と、管理者が招待するゲスト(認証状態なし、2GB・4GB、同時1台)の2役割に対応した(2026-10-02にdeployし、deployed E2Eで確認。招待メールと実ゲストのManaged Loginは未確認)。
 
 利用の基本フローは次のとおり。
 
@@ -69,11 +69,12 @@ OMPとGitHubの認証状態はKMS暗号化されたS3へ保存される。ワー
 | セッションCookie | 実装・検証済み | UUID参照、Secure/HttpOnly/SameSite=Strict |
 | SecretsのImage/Git混入防止 | 実装済み | Cognito client secret・OAuth tokenはImageに入れない |
 | 非root実行 | 実装・検証済み | UID/GID 1000の`vscode` |
-| MicroVM実行Role最小化 | 実装・検証済み | 認証状態S3/bucket、KMS、ログに限定 |
+| MicroVM実行Role最小化 | 実装・検証済み | 管理者用は認証状態S3/bucket、KMS、ログに限定。ゲスト用`omp-cloud-ide-microvm-guest`はログだけ(IAM simulatorで`personal/omp/agent.db`のGet/Putがゲストは`implicitDeny`、管理者は`allowed`) |
 | Edge Role最小化 | 実装・検証済み | 対象Image、Role、Table、SSM Parameter、User Pool等に限定 |
 | セキュリティヘッダー | 実装・検証済み | CSP、HSTS、nosniff、no-referrer等 |
 | MFA | 実装・検証済み | CognitoのTOTP必須(SMSなし) |
-| ユーザー別認証・分離 | 部分実装 | Cognitoで利用者を識別するが単一利用者前提。sessionの`ownerSub`による所有者限定、利用者別S3 prefix・実行Roleはない |
+| ユーザー別認証・分離 | 実装・検証済み(Cognito経由のゲストサインインは単体テストのみ) | Cognitoグループ`admins`/`guests`で役割を決め、どちらにも属さない利用者はサインインを拒否する。利用者は管理者が`admin-create-user`で招待する。セッション行の`ownerSub`で一覧・接続・制御を所有者に限定し、ゲストは別の実行Role(S3・KMSなし)と`authState:false`で共有認証状態を持たない。利用者別のS3 prefixはない(ゲストは認証状態を保存しない)。deployed E2Eは認証行を直接書くため、ID tokenの`cognito:groups`から役割を決める部分は単体テストでだけ確認している |
+| Cognito側の失効の反映 | 未実装 | Edgeはサインイン後にCognitoを再確認しない。無効化・削除した利用者も認証行の期限(最大8時間)まで使える |
 | ログイン試行ロック | 実装済み | Cognito組み込みのロックアウト(5回失敗後に指数的に待機、最大約15分) |
 | ログアウトUI | 実装・検証済み | 選択画面・制御画面の「Sign out」。Edgeセッション行を削除し、Cognitoセッションも終了 |
 | 状態変更request分離 | 未実装 | proxyアプリとcontrolが同一origin。SameSiteだけでは同一originコードを防げない |
@@ -96,10 +97,11 @@ OMPとGitHubの認証状態はKMS暗号化されたS3へ保存される。ワー
 | token自動更新 | 実装済み | 1時間token、15分前更新。更新失敗時、旧tokenが失効済みなら503で止める |
 | セッションTerminate UI | 実装・検証済み | 追跡中の行だけ選択画面・制御画面からID再入力で終了。曖昧な失敗は遮断を維持し、終了確認後に対象DDB行を削除 |
 | セッション名・用途ラベル | 未実装 | MicroVM ID、サイズ、作成時刻のみ |
-| 一覧ページング | 実装済み | DDB Scanと`ListMicrovms`を全ページ照合。個人用のため件数上限・bounded concurrencyはない |
+| 一覧ページング | 実装済み | DDB Scanと`ListMicrovms`(管理者のみ)を全ページ照合。少人数前提のため件数上限・bounded concurrencyはない |
 | 一覧の負荷制御 | 未実装 | 全候補を並列`GetMicrovm`、bounded concurrency/retry/cacheなし |
 | stale DDB行の即時削除 | 部分実装 | 一覧確認時にTERMINATED/NotFound行を対象ID一致で削除。TERMINATING中は保持 |
-| 複数ユーザーの所有者分離 | 未実装 | 認証済み利用者は全候補を見られる単一ユーザー設計 |
+| 複数ユーザーの所有者分離 | 実装・検証済み | 管理者は全セッションを見て終了できるが、他人のセッションには接続できない。ゲストは自分のセッションだけ。`ownerSub`のない旧行は管理者のもの。Untracked MicroVMsは管理者だけに表示。deployed E2Eで、ゲストから管理者VMが見えない・接続できない・偽造Cookieでも届かないこと、管理者がゲストVMに接続できないことを確認 |
+| ゲストの台数・サイズ制限 | 実装・検証済み | 2GB・4GBのみ。稼働中・Suspend中を合わせて1台までを`slot#<sub>`行で管理し、超過は409。保持者が消えた枠は条件付き更新で引き継ぐ。deployed E2Eで8GBの400、2台目の409(VMは増えない)、終了後の枠解放を確認 |
 
 ### 2.4 OMPと開発ツール
 
@@ -270,7 +272,7 @@ status bar(Suspendボタンのクリック、Git状態表示)の画面上の確�
 
 | 元設計 | 現在 | 理由 |
 | --- | --- | --- |
-| 常駐OMP Auth Broker | S3へ`agent.db`を保存 | 単一利用者では常駐サーバーが過剰 |
+| 常駐OMP Auth Broker | S3へ`agent.db`を保存 | 共有の認証状態を使うのは管理者1人で、常駐サーバーが過剰(ゲストは認証状態を持たない) |
 | Auth Broker用EC2 | 不採用 | 常時費用・運用対象を増やさない |
 | GitHub Enterprise | 通常`github.com` | 実要件に合わせた |
 | PATまたは外部Secret | `gh auth login --web` OAuth | PATを使わない要件 |
@@ -392,11 +394,12 @@ Lambda@Edgeのログは実行リージョンへ分散し得るため、中央集
 
 #### 5.6 E2Eスクリプトをリポジトリへ正式実装する(実装済み 2026-09-29)
 
-`code-server/scripts/e2e.mjs`(`npm run e2e`)として実装し、実環境で24項目の成功を確認した。
+`code-server/scripts/e2e.mjs`(`npm run e2e`)として実装した。管理者とゲストの2つの流れへ拡張した版で、2026-10-02に実環境で52項目の成功を確認した。
 
-- 未認証の302/401、`/auth/login`からCognitoへのPKCE付きredirectを確認する。Cognito Managed LoginのTOTPは人手が必要なため、その先は一時的なEdgeサインイン行(`sub=e2e-test`、1時間)をDynamoDBへ直接書いて代替し、終了時に削除する
-- chooserが全サイズを表示し既定の2GBが選択済みであることを確認する。新規MicroVMは既定以外の4GB(`omp-cloud-ide-4gb`)で1台だけ起動し、そのImageで起動したことを確かめる(既定へのfallbackや既定以外のImageへのIAM漏れを検出するため)。code-server readiness、`/vscode-remote-resource`経由でVM内の`session.json`(microvmId・期限・control URL)と`auth-sync.json`(`restoreFailed=[]`、復元ファイルのSHA-256)を確認する
-- 明示Suspend直後に通常通信が`/session/control`へ302されること、`SUSPENDED`到達、Resume後に同じVMへ戻ること、誤ったID入力の拒否、Terminate後の`TERMINATED`と行削除を確認する
+- 未認証の302/401、`/auth/login`からCognitoへのPKCE付きredirectを確認する。Cognito Managed LoginのTOTPは人手が必要なため、その先は実行ごとの一時的なEdgeサインイン行(管理者`e2e-admin-<runId>`とゲスト`e2e-guest-<runId>`、`role`・`email`付き)をDynamoDBへ直接書いて代替し、終了時に削除する
+- 管理者のchooserが全サイズを表示し既定の2GBが選択済みであることを確認する。管理者は既定以外の4GB(`omp-cloud-ide-4gb`)で1台起動し、そのImageと管理者用実行Roleで起動したこと、行に所有者が記録されたことを確かめる。code-server readiness、`/vscode-remote-resource`経由でVM内の`session.json`(microvmId・期限・control URL)と`auth-sync.json`(認証保存が有効、`restoreFailed=[]`、復元ファイルのSHA-256)を確認する
+- ゲストのchooserに管理者のMicroVMが出ないこと、ゲスト用サイズだけが出ること、管理者セッションへのattachと偽造したsession Cookieが拒否されること、8GBの起動が400になることを確認する。ゲストは自分のMicroVMをゲスト用実行Roleで起動し、認証保存が無効で管理者のOMP認証が復元されていないこと、2台目が409で拒否されMicroVMが増えないことを確認する。管理者の一覧には所有者付きでゲストのMicroVMが出るがattachは拒否されること、ゲストのTerminate後に`slot#<sub>`が解放されることを確認する
+- 管理者のMicroVMで、明示Suspend直後に通常通信が`/session/control`へ302されること、`SUSPENDED`到達、Resume後に同じVMへ戻ること、誤ったID入力の拒否、Terminate後の`TERMINATED`と行削除を確認する
 - 実行前の生存MicroVMを保護対象としてsnapshotし、終了時に全て生存していることを確認する。cleanupはフォームUUIDから辿れる今回作成したIDだけを対象にし、保護対象は決して終了しない。`TERMINATED`を確認できなければsession行を残す
 - `artifact/edge/config.json`はJestのsynthでも架空accountの値に書き換わるため、実行accountと一致しなければ中止する(`npm run synth`で再生成)
 
@@ -414,10 +417,16 @@ Lambda@Edgeのログは実行リージョンへ分散し得るため、中央集
 
 Cognito Managed LoginとEdge側セッションへ移行し、MFA(TOTP)、利用者識別(`sub`)、サーバー側のセッション失効(ログアウト)、ログイン試行のロックアウトを得た。
 
-2人目の利用者を追加する前に、次が残っている。現在のImageは共有の`personal/`認証状態(GitHub・LLMの資格情報)をすべてのMicroVMへ復元するため、これらなしに利用者を増やしてはいけない。
+2人目以降の利用者のために、管理者・ゲストの役割を実装した(2026-10-02にdeployし、deployed E2Eで確認。設計は`architecture-and-design.md`の4.11節)。
 
-- session tableへ`ownerSub`を持たせ、一覧・接続・制御を所有者に限定する
-- 利用者別のS3 prefixと実行Role
+- Cognitoグループ`admins`/`guests`で役割を決め、どちらにも属さない利用者はサインインを拒否する。利用者は管理者が`admin-create-user`で招待し、招待メールの一時パスワードで初回サインインしてTOTPを登録する
+- session tableへ`ownerSub`・`ownerEmail`・`ownerRole`を持たせ、一覧・接続・制御を所有者に限定する。管理者は他人のセッションを終了だけできる
+- 利用者別のS3 prefixと実行Roleの代わりに、認証状態を持たないゲスト用実行Roleを1つ置く。`RunMicrovm`はタグやsession tagを受け取らないため、1つのRoleを利用者ごとに絞るABACはできず、利用者別Roleは利用者ごとのdeployを要する
+
+残っていること:
+
+- Cognitoで無効化・削除した利用者のEdgeサインインを取り消す。今は認証行の期限(最大8時間)まで残るため、すぐ止めるには認証表の行を手で消す。候補は、Cognitoの`AdminGetUser`による定期的な再確認や、利用者無効化時に該当`sub`の認証行を消す運用スクリプト
+- ゲストにも認証状態を残したくなった場合の、ゲスト別の永続化。Role 1つではゲスト同士を分けられないため、ゲストごとの実行RoleとS3 prefix(またはMicroVMの外の仲介)が要る
 
 #### 5.7.1 control/auth originとIDE/proxy originを分離する
 
@@ -513,9 +522,9 @@ versionを上げるときは`CHROME_VERSION`とzipのSHA-256を同時に更新�
 
 #### 5.10 DynamoDB Scanをやめる
 
-現在は全ページScanしているが、個人用途に限定される。改善案:
+現在は全ページScanしており、少人数の利用に限定される(ゲストへの絞り込みはScan後に`ownerSub`で行う)。改善案:
 
-- `ownerId`と`updatedAt`を持つGSI
+- `ownerSub`と`updatedAt`を持つGSI
 - `Query`によるユーザー別・新しい順取得
 - bounded concurrency、retry/backoff、partial failure表示
 - 一覧cacheまたは状態の非同期集約でN+1 API callを削減
