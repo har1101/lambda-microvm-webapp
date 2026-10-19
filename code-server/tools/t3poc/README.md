@@ -30,3 +30,17 @@ Logins (inside the VM, from T3; all stored only in /dev/shm):
 - GitHub: T3 terminal → `gh-token-login` (fine-grained PAT, one repo, Contents + Pull requests write, shortest expiry).
 
 Only `~/.t3poc/state.json` (MicroVM id + endpoint, no secrets) is written on the Mac.
+
+## Deploying the t3poc stack (operator)
+
+t3poc never uses the account's shared cdkd buckets. Its cdkd state/assets live in
+`t3poc-cdkd-state-<account>` and `t3poc-cdkd-assets-<account>-ap-northeast-1`
+(`npm run t3poc:bootstrap`, once). Always deploy through the scripts, which select them;
+`T3_POC_ONLY=1` refuses to synthesize with any other `CDKD_STATE_BUCKET`:
+
+```bash
+cd code-server
+npm run t3poc:diff      # must show changes to T3pocMicrovmStack only
+npm run t3poc:deploy
+npm run t3poc:destroy   # teardown
+```

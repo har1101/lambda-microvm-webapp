@@ -14,6 +14,20 @@ const T3_POC_ONLY = process.env.T3_POC_ONLY === '1';
 // A T3-only PoC deploys as separate stacks/resources (prefix t3-poc) so it never
 // touches an existing OMP Cloud IDE deployment in the same account.
 export const NAME_PREFIX = T3_POC_ONLY ? 't3poc' : 'omp-cloud-ide';
+// The T3 PoC keeps its cdkd state/assets in dedicated t3poc-* buckets, never in
+// the account's shared cdkd buckets. cdkd runs the app with its environment, so
+// refuse to synthesize the PoC unless the dedicated state bucket is selected
+// (use `npm run t3poc:*`, which sets CDKD_STATE_BUCKET).
+export const T3POC_STATE_BUCKET = `t3poc-cdkd-state-${ACCOUNT}`;
+if (
+  T3_POC_ONLY &&
+  process.env.T3POC_SKIP_BUCKET_GUARD !== '1' &&
+  process.env.CDKD_STATE_BUCKET !== T3POC_STATE_BUCKET
+) {
+  throw new Error(
+    `T3_POC_ONLY requires CDKD_STATE_BUCKET=${T3POC_STATE_BUCKET}; use npm run t3poc:diff / t3poc:deploy`,
+  );
+}
 const T3_MAX_DURATION_SEC = Number(process.env.T3_MAX_DURATION_SEC ?? 28800);
 if (!Number.isInteger(T3_MAX_DURATION_SEC) || T3_MAX_DURATION_SEC < 900 || T3_MAX_DURATION_SEC > 28800) {
   throw new Error('T3_MAX_DURATION_SEC must be an integer between 900 and 28800');
