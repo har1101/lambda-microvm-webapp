@@ -15,6 +15,9 @@ export function authRowCount(bundle) {
 export function shouldReplace(previous, next) {
   if (!next) return false;
   if (authRowCount(previous) > 0 && authRowCount(next) === 0) return false;
+  const hasMaterial = (bundle) =>
+    authRowCount(bundle) > 0 || (bundle?.secrets?.length ?? 0) > 0 || Boolean(bundle?.environment_id);
+  if (hasMaterial(previous) && !hasMaterial(next)) return false;
   return true;
 }
 
@@ -93,11 +96,22 @@ export function register(api) {
     if (has) return;
     if (runtime.deps.mintPairing) await runtime.deps.mintPairing(runtime);
   });
-  api.hooks.beforeSwap.push((runtime) => snapshot(runtime));
+  // The last successful Keychain bundle remains usable for re-pairing.
+  // Snapshot failure must not block WIP/history preservation or termination.
+  const snapshotBeforeExit = async (runtime) => {
+    try {
+      const result = await snapshot(runtime);
+      if (result?.aborted) runtime.log('pairing snapshot failed; retaining the previous Keychain bundle');
+    } catch {
+      runtime.log('pairing snapshot failed; retaining the previous Keychain bundle');
+    }
+  };
+  api.hooks.beforeSwap.push(snapshotBeforeExit);
+  api.hooks.beforeStop.push(snapshotBeforeExit);
   api.hooks.onTick.push(async (runtime) => {
     if (runtime.session.vmState !== 'RUNNING') return;
     if (runtime.now() - (runtime.flags.pairingSnapshotAt ?? 0) < 60_000) return;
     runtime.flags.pairingSnapshotAt = runtime.now();
-    await snapshot(runtime);
+    await runtime.exclusive(() => snapshot(runtime));
   });
 }

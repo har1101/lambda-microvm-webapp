@@ -19,6 +19,47 @@ test('keychain stand-in keeps bytes in memory', async () => {
 });
 
 test('pairing secrets stay out of the history archive', () => {
-  const result = spawnSync('python3', ['vm_history_test.py'], { encoding: 'utf8' });
+  const result = spawnSync('python3.14', ['vm_history_test.py'], { encoding: 'utf8' });
   assert.equal(result.status, 0, result.stdout + result.stderr);
+});
+
+test('secrets-only bundle is not overwritten by an empty VM', () => {
+  assert.equal(shouldReplace({ secrets: [{ path: 'server.bin' }] }, { auth_tables: [], secrets: [] }), false);
+  assert.equal(shouldReplace({ environment_id: 'existing' }, {}), false);
+});
+
+test('fresh server secret cannot overwrite authenticated pairing sessions', () => {
+  assert.equal(
+    shouldReplace(
+      { auth_tables: [{ rows: [['active']] }], secrets: [{ path: 'old' }] },
+      { auth_tables: [], secrets: [{ path: 'fresh' }] },
+    ),
+    false,
+  );
+});
+
+test('pairing snapshot failure is a warning after WIP and does not block safe termination', async () => {
+  const { createRuntime, stop } = await import('./t3poc.mjs');
+  const { register } = await import('./ext-30-pairing.mjs');
+  const order = [];
+  const api = createRuntime({
+    readState: () => ({ microvmId: 'old', endpoint: 'old.example' }),
+    writeState() {},
+    log() {},
+    getMicrovm: async () => ({ state: 'RUNNING' }),
+    removeState: async () => {},
+    shell: async () => {
+      order.push('pairing');
+      throw Error('snapshot unavailable');
+    },
+    terminate: async () => {
+      order.push('terminate');
+    },
+  });
+  register(api);
+  api.wipPush = async () => {
+    order.push('wip');
+  };
+  await stop(api);
+  assert.deepEqual(order, ['wip', 'pairing', 'terminate']);
 });
