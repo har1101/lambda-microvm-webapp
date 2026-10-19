@@ -17,6 +17,7 @@ export const ORG = 'ai-native-factory';
 export const REPO = 't3poc-sandbox';
 export const KEYCHAIN_SERVICE = 't3poc-ghapp';
 export const REFRESH_EVERY_MS = 50 * 60 * 1000;
+export const GIT_DEFAULTS = `git config --global push.autoSetupRemote true && git config --global credential.https://${GH_HOST}.helper /usr/local/bin/git-credential-shm`;
 const API = `https://api.${GH_HOST}`;
 const PORT = 47831;
 
@@ -76,7 +77,7 @@ finally:
     if os.path.exists(tmp): os.unlink(tmp)
 `;
   const quote = (value) => `'${value.replaceAll("'", "'\\''")}'`;
-  const command = `${VM_PYTHON} -c ${quote(program)} && GH_HOST=${GH_HOST} GH_TOKEN=$(cat /dev/shm/gh-token) gh api /repos/${ORG}/${REPO} -q .full_name | sed s/^/T3RES:/`;
+  const command = `${VM_PYTHON} -c ${quote(program)} && ${GIT_DEFAULTS} && GH_HOST=${GH_HOST} GH_TOKEN=$(cat /dev/shm/gh-token) gh api /repos/${ORG}/${REPO} -q .full_name | sed s/^/T3RES:/`;
   return ` stty -echo; read -r T; printf '%s\\n' "$T" | su -s /bin/sh vscode -c ${quote(command)}; unset T; stty echo; echo T3POC_SHELL_DONE`;
 }
 
