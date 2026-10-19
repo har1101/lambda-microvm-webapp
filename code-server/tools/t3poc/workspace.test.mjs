@@ -27,6 +27,108 @@ test('history upload uses the t3poc bucket and the t3poc KMS alias', () => {
 });
 
 test('vm history exclusion list', () => {
-  const history = spawnSync('python3', ['vm_history_test.py'], { encoding: 'utf8' });
+  const history = spawnSync('python3.14', ['vm_history_test.py'], { encoding: 'utf8' });
   assert.equal(history.status, 0, history.stdout + history.stderr);
+});
+
+test('WIP error and traversal names are fail-closed', async () => {
+  const { pushWip, WIP_PROGRAM } = await import('./workspace.mjs');
+  await assert.rejects(pushWip({ deps: { shell: async () => 'T3POC_SHELL_DONE' }, log() {} }), /refusing/);
+  for (const repo of ['org/..', '../repo', 'org/.']) assert.throws(() => parseRepos(repo));
+  const { spawnSync } = await import('node:child_process');
+  const program = `import runpy; runpy.run_path=lambda p:{'run_once':lambda kind:{'results':{'repo':'error: push denied'}}}\n${WIP_PROGRAM}`;
+  const result = spawnSync('python3.14', ['-c', program], { encoding: 'utf8' });
+  assert.equal(result.status, 1);
+  assert.equal(result.stdout.includes('T3POC_WIP_OK'), false);
+  assert.match(cloneScript(['org/repo']), /su -s \/bin\/sh vscode/);
+});
+
+test('stop resumes suspended VM but never terminates on WIP or history failure', async (context) => {
+  const { createRuntime, stop } = await import('./t3poc.mjs');
+  const extension = await import('./ext-70-workspace.mjs').catch((error) => {
+    if (error.code === 'ERR_MODULE_NOT_FOUND') return null;
+    throw error;
+  });
+  if (!extension) return context.skip('stop extension is provided by PR #8');
+  const { register } = extension;
+  for (const failed of ['wip', 'history']) {
+    const calls = [];
+    const api = createRuntime({
+      now: () => 0,
+      log() {},
+      readState: () => ({ microvmId: 'vm', endpoint: 'vm.example' }),
+      writeState() {},
+      getMicrovm: async () => ({ state: 'SUSPENDED' }),
+      resume: async () => calls.push('resume'),
+      waitUntil: async () => {},
+      terminate: async () => calls.push('terminate'),
+      shell: async () => (failed === 'wip' ? 'T3POC_SHELL_DONE' : 'T3POC_WIP_OK\nT3POC_SHELL_DONE'),
+    });
+    register(api);
+    api.backupHistory = async () => ({ aborted: true, reason: 'dummy separation failure' });
+    await assert.rejects(stop(api));
+    assert.deepEqual(calls, ['resume']);
+  }
+});
+
+test('backup separation failure does not upload and restarts the old T3', async () => {
+  const { backupHistory } = await import('./t3-history.mjs');
+  const { START_T3, STOP_T3 } = await import('./vm-shell.mjs');
+  const calls = [];
+  const result = await backupHistory({
+    log() {},
+    deps: {
+      shell: async ({ script }) => {
+        if (script === STOP_T3) {
+          calls.push('stop');
+          return 'T3POC_T3_STOPPED';
+        }
+        if (script === START_T3) {
+          calls.push('start');
+          return 'T3POC_T3_STARTED';
+        }
+        calls.push('emit');
+        return 'T3POC_BACKUP_ABORT credential marker';
+      },
+      s3Put: async () => calls.push('upload'),
+    },
+  });
+  assert.equal(result.aborted, true);
+  assert.deepEqual(calls, ['stop', 'emit', 'start']);
+});
+
+test('S3 write failure restarts old T3 and does not report backup success', async () => {
+  const { backupHistory } = await import('./t3-history.mjs');
+  const { START_T3, STOP_T3 } = await import('./vm-shell.mjs');
+  const { spawnSync } = await import('node:child_process');
+  const tar = spawnSync('python3.14', [
+    '-c',
+    'import io,tarfile,sys; b=io.BytesIO(); t=tarfile.open(fileobj=b,mode="w"); t.close(); sys.stdout.buffer.write(b.getvalue())',
+  ]).stdout;
+  const calls = [];
+  await assert.rejects(
+    backupHistory({
+      log() {},
+      deps: {
+        shell: async ({ script }) => {
+          if (script === STOP_T3) {
+            calls.push('stop');
+            return 'T3POC_T3_STOPPED';
+          }
+          if (script === START_T3) {
+            calls.push('start');
+            return 'T3POC_T3_STARTED';
+          }
+          return `T3POC_HISTORY_B64\n${tar.toString('base64')}\nT3POC_HISTORY_END\n`;
+        },
+        accountId: async () => '123456789012',
+        s3Put: async () => {
+          calls.push('upload');
+          throw Error('Put denied');
+        },
+      },
+    }),
+    /Put denied/,
+  );
+  assert.deepEqual(calls, ['stop', 'upload', 'start']);
 });

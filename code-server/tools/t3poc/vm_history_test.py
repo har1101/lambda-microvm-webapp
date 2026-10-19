@@ -141,8 +141,99 @@ class ExclusionTest(unittest.TestCase):
             self.assertFalse(vm_history.path_excluded(rel), rel)
 
 
+class RegressionTest(ExclusionTest):
+    def test_cli_root_cannot_be_redirected_to_disk(self):
+        import os
+        from unittest.mock import patch
+        with patch.dict(os.environ, {'T3POC_SCAN_ROOT': str(self.tmp / 'disk')}), patch.object(vm_history, '_emit') as emit:
+            vm_history.main(['vm_history.py','emit'])
+            emit.assert_called_once_with(Path('/dev/shm'))
+
+    def test_host_python314_provides_sqlite_deserialize(self):
+        import sys
+        self.assertGreaterEqual(sys.version_info[:2], (3, 14))
+        self.assertTrue(hasattr(sqlite3.Connection, 'deserialize'))
+
+    def test_root_log_is_not_history(self):
+        (self.root / 't3-serve.log').write_text('normal startup')
+        blob, _ = vm_history.build_split(self.root, self.scratch)
+        self.assertNotIn('t3-serve.log', _tar_names(blob))
+
+    def test_installation_token_in_history_aborts(self):
+        (self.root / 't3/userdata/messages.json').write_text('{"body":"ghs_DUMMY_FOR_REVIEW"}')
+        with self.assertRaises(vm_history.HistoryNotSeparable):
+            vm_history.build_split(self.root, self.scratch)
+
+    def test_preserves_indexes_triggers_views_and_metadata(self):
+        con = sqlite3.connect(self.root / 't3/userdata/statev2.sqlite')
+        con.executescript("CREATE UNIQUE INDEX thread_id ON projection_threads(id); CREATE VIEW titles AS SELECT title FROM projection_threads; CREATE TRIGGER thread_title AFTER INSERT ON projection_threads BEGIN UPDATE projection_threads SET title=upper(new.title) WHERE id=new.id; END; PRAGMA user_version=42; PRAGMA application_id=7;")
+        con.close()
+        blob, _ = vm_history.build_split(self.root, self.scratch)
+        target = self.tmp / 'restored'
+        vm_history.restore_history(target, blob)
+        con = sqlite3.connect(target / 't3/userdata/statev2.sqlite')
+        self.assertEqual(con.execute('PRAGMA user_version').fetchone()[0],42)
+        self.assertEqual(con.execute('PRAGMA application_id').fetchone()[0],7)
+        self.assertEqual(con.execute("SELECT count(*) FROM sqlite_master WHERE name IN ('thread_id','titles','thread_title')").fetchone()[0],3)
+        con.close()
+
+    def test_restore_rejects_existing_parent_and_file_symlinks(self):
+        blob, bundle = vm_history.build_split(self.root, self.scratch)
+        target = self.tmp / 'restore-root'; target.mkdir()
+        outside = self.tmp / 'disk'; outside.mkdir()
+        (target / 't3').symlink_to(outside, target_is_directory=True)
+        with self.assertRaises((OSError, ValueError)):
+            vm_history.restore_history(target, blob)
+        with self.assertRaises((OSError, ValueError)):
+            vm_history.apply_pairing(target, bundle)
+        self.assertEqual(list(outside.iterdir()), [])
+        (target / 't3').unlink(); (target / 't3/userdata').mkdir(parents=True)
+        sentinel=outside/'sentinel'; sentinel.write_bytes(b'unchanged')
+        (target/'t3/userdata/settings.json').symlink_to(sentinel)
+        with self.assertRaises((OSError,ValueError)):
+            vm_history.restore_history(target,blob)
+        self.assertEqual(sentinel.read_bytes(),b'unchanged')
+
+    def test_secure_write_assigns_guest_ownership_on_descriptor(self):
+        import os
+        from unittest.mock import patch
+        import vm_fs
+        with patch.object(vm_fs, 'guest_owner', return_value=(os.getuid(),os.getgid())), patch.object(vm_fs.os,'fchown', wraps=os.fchown) as change:
+            vm_fs.secure_write(self.root,'t3/userdata/check.bin',b'dummy')
+            self.assertGreaterEqual(change.call_count,1)
+        self.assertEqual((self.root/'t3/userdata/check.bin').stat().st_mode & 0o777,0o600)
+
+
+    def test_unrelated_login_symlinks_are_ignored(self):
+        (self.root / "claude" / "linked").symlink_to(self.root / "t3/userdata/environment-id")
+        vm_history.build_split(self.root, self.scratch)
+        vm_history.pairing_only(self.root)
+
+
+    def test_autoincrement_highwater_survives_history_separation(self):
+        src = self.root / "t3/userdata/sequence.sqlite"
+        con = sqlite3.connect(src)
+        con.execute('CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, value TEXT)')
+        con.execute("INSERT INTO events VALUES (100, 'removed')")
+        con.execute('DELETE FROM events')
+        con.commit(); con.close()
+        dest = self.tmp / "sequence-copy.sqlite"
+        vm_history.sanitize_sqlite(src, dest)
+        con = sqlite3.connect(dest)
+        con.execute("INSERT INTO events(value) VALUES ('next')")
+        self.assertEqual(con.execute('SELECT id FROM events').fetchone()[0], 101)
+        con.close()
+
+
+    def test_t3_history_symlink_is_rejected(self):
+        (self.root / "t3/userdata/linked").symlink_to(self.root / "t3/userdata/environment-id")
+        with self.assertRaises(vm_history.HistoryNotSeparable):
+            vm_history.build_split(self.root, self.scratch)
+
+
 def json_tables(pairing: dict) -> str:
     return str(pairing["auth_tables"])
+
 
 
 if __name__ == "__main__":
