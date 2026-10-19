@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { RESOURCE_START, register } from './ext-15-resources.mjs';
+import { RESOURCE_START, register, resourceScript } from './ext-15-resources.mjs';
 import { START_T3 } from './vm-shell.mjs';
 
 function fixture() {
@@ -72,4 +72,28 @@ test('RAM monitor logs only numeric usage and threshold warnings once a minute',
   await api.hooks.onTick[0](api);
   await api.hooks.onTick[0](api);
   assert.deepEqual(messages, ['RAM WARNING used=60 total=64 free=4 worktrees=9']);
+});
+
+test('catalog policy is verified before stopping T3, and failure preserves the running server', async () => {
+  const { api, calls } = fixture();
+  await api.hooks.onVmReady[0](api);
+  assert.equal(calls[0].script, resourceScript({ catalog: true }));
+  const requests = [];
+  const runtime = {
+    deps: {
+      shell: async (request) => {
+        requests.push(request);
+        return 'T3POC_SHELL_DONE';
+      },
+    },
+    hooks: { prepareDisk: [], onVmReady: [], onTick: [] },
+    session: { microvmId: 'fixture' },
+    flags: {},
+    now: () => 0,
+    log() {},
+  };
+  register(runtime);
+  await assert.rejects(runtime.hooks.onVmReady[0](runtime), /catalog policy failed/);
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].script, resourceScript({ catalog: true }));
 });

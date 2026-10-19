@@ -1,6 +1,8 @@
 """Metadata-only RAM checks; no auth, filenames, or file contents are emitted."""
 import os
 import stat
+import subprocess
+import pwd
 from pathlib import Path
 
 MIB = 1024 * 1024
@@ -56,3 +58,45 @@ def clean_logs(root):
         if not stat.S_ISREG(meta.st_mode) or meta.st_nlink != 1:
             raise ValueError('unsafe runtime log')
         path.unlink()
+
+
+# https://learn.chatgpt.com/docs/config-file/config-reference: features.remote_plugin
+def disable_remote_catalog(root):
+    """Disable the optional large catalog in RAM; never read or remove auth/history."""
+    codex = root / 'codex'
+    if root.is_symlink() or codex.is_symlink():
+        raise ValueError('unsafe Codex configuration directory')
+    created = not codex.exists()
+    codex.mkdir(mode=0o700, exist_ok=True)
+    owner = pwd.getpwnam('vscode') if root == Path('/dev/shm') else None
+    fd = os.open(codex, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        if created and owner:
+            os.fchown(fd, owner.pw_uid, owner.pw_gid)
+        try:
+            config = os.open('config.toml', os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
+        except FileNotFoundError:
+            config = None
+        if config is not None:
+            try:
+                meta = os.fstat(config)
+                if not stat.S_ISREG(meta.st_mode) or meta.st_nlink != 1:
+                    raise ValueError('unsafe Codex configuration file')
+            finally:
+                os.close(config)
+    finally:
+        os.close(fd)
+    env = dict(os.environ, CODEX_HOME=str(codex))
+    identity = {'user': owner.pw_uid, 'group': owner.pw_gid} if owner else {}
+    try:
+        disabled = subprocess.run(['codex', 'features', 'disable', 'remote_plugin'],
+                                  cwd=codex, env=env, capture_output=True, timeout=30, **identity)
+        if disabled.returncode:
+            raise ValueError()
+        checked = subprocess.run(['codex', 'features', 'list'], cwd=codex, env=env,
+                                 capture_output=True, timeout=30, **identity)
+        rows = [line.split() for line in checked.stdout.decode().splitlines()]
+        if checked.returncode or not any(row[0] == 'remote_plugin' and row[-1] == 'false' for row in rows if row):
+            raise ValueError()
+    except Exception:
+        raise ValueError('Codex remote catalog policy could not be verified') from None
