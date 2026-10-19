@@ -1,77 +1,201 @@
-// t3poc GitHub App: short-lived (1h) installation tokens scoped to ai-native-factory/t3poc-sandbox only.
+// t3poc GitHub App: 1-hour installation tokens for one repo.
+// The private key stays in the macOS keychain (service t3poc-ghapp).
 // Usage: AWS_PROFILE=fukuchi node ghapp.mjs setup|push|refresh|status
-import http from 'node:http'; import crypto from 'node:crypto'; import fs from 'node:fs'; import os from 'node:os';
-import { execFileSync, spawnSync } from 'node:child_process';
-const HOST = 'ai-native-factory-ltd.ghe.com', API = `https://api.${HOST}`, ORG = 'ai-native-factory', REPO = 't3poc-sandbox';
-const SVC = 't3poc-ghapp', PORT = 47831;
-const kcSet = (acct, val) => { // via `security -i` stdin so the secret never appears in argv / on disk
-  const b64 = Buffer.from(val).toString('base64');
-  const r = spawnSync('security', ['-i'], { input: `add-generic-password -U -s ${SVC} -a ${acct} -w ${b64}\n` });
-  if (r.status !== 0) throw new Error('keychain write failed: ' + r.stderr);
-};
-const kcGet = (acct) => Buffer.from(execFileSync('security', ['find-generic-password', '-s', SVC, '-a', acct, '-w']).toString().trim(), 'base64').toString();
-const gh = async (method, path, token, body, scheme = 'Bearer') => {
-  const r = await fetch(API + path, { method, headers: { Accept: 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28', 'User-Agent': 't3poc', ...(token ? { Authorization: `${scheme} ${token}` } : {}), ...(body ? { 'Content-Type': 'application/json' } : {}) }, body: body ? JSON.stringify(body) : undefined });
-  const j = await r.json().catch(() => ({})); if (!r.ok) throw new Error(`${method} ${path} -> ${r.status} ${j.message || ''}`); return j;
-};
-const b64u = (x) => Buffer.from(typeof x === 'string' ? x : JSON.stringify(x)).toString('base64url');
-const jwt = () => { const id = kcGet('app-id'), pem = kcGet('pem'), now = Math.floor(Date.now() / 1000);
+
+import { execFileSync } from 'node:child_process';
+import crypto from 'node:crypto';
+import fs from 'node:fs';
+import http from 'node:http';
+import os from 'node:os';
+import path from 'node:path';
+import { pathToFileURL } from 'node:url';
+import { macKeychain } from './keychain.mjs';
+import { VM_PYTHON } from './vm-shell.mjs';
+
+export const GH_HOST = 'ai-native-factory-ltd.ghe.com';
+export const ORG = 'ai-native-factory';
+export const REPO = 't3poc-sandbox';
+export const KEYCHAIN_SERVICE = 't3poc-ghapp';
+export const REFRESH_EVERY_MS = 50 * 60 * 1000;
+export const GIT_DEFAULTS = `git config --global push.autoSetupRemote true && git config --global credential.https://${GH_HOST}.helper /usr/local/bin/git-credential-shm`;
+const API = `https://api.${GH_HOST}`;
+const PORT = 47831;
+
+const b64u = (value) => Buffer.from(typeof value === 'string' ? value : JSON.stringify(value)).toString('base64url');
+
+async function gh(method, apiPath, token, body, scheme = 'Bearer', fetchImpl = fetch) {
+  const response = await fetchImpl(`${API}${apiPath}`, {
+    method,
+    headers: {
+      Accept: 'application/vnd.github+json',
+      'X-GitHub-Api-Version': '2022-11-28',
+      'User-Agent': 't3poc',
+      ...(token ? { Authorization: `${scheme} ${token}` } : {}),
+      ...(body ? { 'Content-Type': 'application/json' } : {}),
+    },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(`${method} ${apiPath} -> ${response.status} ${payload.message || ''}`);
+  return payload;
+}
+
+async function appJwt(keychain) {
+  const id = Buffer.from(await keychain.get('app-id')).toString('utf8');
+  const pem = Buffer.from(await keychain.get('pem')).toString('utf8');
+  const now = Math.floor(Date.now() / 1000);
   const data = `${b64u({ alg: 'RS256', typ: 'JWT' })}.${b64u({ iat: now - 60, exp: now + 540, iss: id })}`;
-  return `${data}.${crypto.sign('RSA-SHA256', Buffer.from(data), pem).toString('base64url')}`; };
+  return `${data}.${crypto.sign('RSA-SHA256', Buffer.from(data), pem).toString('base64url')}`;
+}
+
+export async function mintInstallationToken(deps = {}) {
+  const keychain = deps.keychain ?? macKeychain(KEYCHAIN_SERVICE);
+  const fetchImpl = deps.fetchImpl ?? fetch;
+  const token = await appJwt(keychain);
+  const installation = await gh('GET', `/repos/${ORG}/${REPO}/installation`, token, undefined, 'Bearer', fetchImpl);
+  return gh(
+    'POST',
+    `/app/installations/${installation.id}/access_tokens`,
+    token,
+    { repositories: [REPO], permissions: { contents: 'write', pull_requests: 'write' } },
+    'Bearer',
+    fetchImpl,
+  );
+}
+
+/** Shell script that reads a base64 token from stdin. The token is not in this string. */
+export function pushScript() {
+  const program = `import base64, os, sys, tempfile
+value = base64.b64decode(sys.stdin.buffer.readline().strip(), validate=True)
+fd, tmp = tempfile.mkstemp(prefix=".t3poc-gh-", dir="/dev/shm")
+try:
+    with os.fdopen(fd, "wb") as out:
+        os.fchmod(out.fileno(), 0o600)
+        out.write(value)
+    os.replace(tmp, "/dev/shm/gh-token")
+finally:
+    if os.path.exists(tmp): os.unlink(tmp)
+`;
+  const quote = (value) => `'${value.replaceAll("'", "'\\''")}'`;
+  const command = `${VM_PYTHON} -c ${quote(program)} && ${GIT_DEFAULTS} && GH_HOST=${GH_HOST} GH_TOKEN=$(cat /dev/shm/gh-token) gh api /repos/${ORG}/${REPO} -q .full_name | sed s/^/T3RES:/`;
+  return ` stty -echo; read -r T; printf '%s\\n' "$T" | su -s /bin/sh vscode -c ${quote(command)}; unset T; stty echo; echo T3POC_SHELL_DONE`;
+}
+
+export async function pushToVm({ shell, mint, log = () => {} }) {
+  const minted = await mint();
+  if (!/^[A-Za-z0-9_.-]{20,}$/.test(minted.token)) throw new Error('unexpected token format');
+  const script = pushScript();
+  if (script.includes(minted.token)) throw new Error('token leaked into the shell script');
+  const out = await shell({ script, stdin: Buffer.from(minted.token).toString('base64') });
+  const ok = out.includes(`T3RES:${ORG}/${REPO}`);
+  log(ok ? `gh token updated (expires ${minted.expires_at}, repo ${REPO} only)` : 'gh token push failed');
+  if (!ok) throw new Error('gh token push failed');
+  return { expiresAt: minted.expires_at };
+}
 
 async function setup() {
+  const keychain = macKeychain(KEYCHAIN_SERVICE);
   const state = crypto.randomBytes(16).toString('hex');
-  const manifest = { name: `t3poc-sandbox-${crypto.randomBytes(2).toString('hex')}`, url: `https://${HOST}/${ORG}/${REPO}`,
-    hook_attributes: { url: `https://${HOST}/${ORG}/${REPO}`, active: false }, redirect_url: `http://127.0.0.1:${PORT}/callback`,
-    public: false, default_permissions: { contents: 'write', pull_requests: 'write', metadata: 'read' }, default_events: [] };
-  const esc = (s) => s.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
+  const manifest = {
+    name: `t3poc-sandbox-${crypto.randomBytes(2).toString('hex')}`,
+    url: `https://${GH_HOST}/${ORG}/${REPO}`,
+    hook_attributes: { url: `https://${GH_HOST}/${ORG}/${REPO}`, active: false },
+    redirect_url: `http://127.0.0.1:${PORT}/callback`,
+    public: false,
+    default_permissions: { contents: 'write', pull_requests: 'write', metadata: 'read' },
+    default_events: [],
+  };
+  const esc = (value) => value.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
   await new Promise((resolve, reject) => {
-    const srv = http.createServer(async (req, res) => {
-      const u = new URL(req.url, `http://127.0.0.1:${PORT}`);
-      if (u.pathname === '/') { res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-        return res.end(`<form id=f method=post action="https://${HOST}/organizations/${ORG}/settings/apps/new?state=${state}"><input type=hidden name=manifest value="${esc(JSON.stringify(manifest))}"></form><script>f.submit()</script>`); }
-      if (u.pathname !== '/callback') { res.writeHead(404); return res.end(); }
-      try {
-        if (u.searchParams.get('state') !== state) throw new Error('state mismatch');
-        const app = await gh('POST', `/app-manifests/${encodeURIComponent(u.searchParams.get('code'))}/conversions`);
-        kcSet('pem', app.pem); kcSet('app-id', String(app.id)); kcSet('slug', app.slug);
-        const inst = `https://${HOST}/apps/${app.slug}/installations/new`;
-        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' }); res.end(`App 作成完了 (id ${app.id})。秘密鍵はキーチェーンに保存しました。このタブは閉じてOK。`);
-        console.log(`App 作成: ${app.slug} (id ${app.id})。秘密鍵は Keychain(${SVC}) のみに保存。\nインストール画面: ${inst}`);
-        execFileSync('open', [inst]); srv.close(); resolve();
-      } catch (e) { res.writeHead(500); res.end(String(e.message)); srv.close(); reject(e); }
-    }).listen(PORT, '127.0.0.1', () => { console.log('ブラウザで App 作成画面を開きます…'); execFileSync('open', [`http://127.0.0.1:${PORT}/`]); });
+    const server = http
+      .createServer(async (req, res) => {
+        const url = new URL(req.url, `http://127.0.0.1:${PORT}`);
+        if (url.pathname === '/') {
+          res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+          res.end(
+            `<form id=f method=post action="https://${GH_HOST}/organizations/${ORG}/settings/apps/new?state=${state}"><input type=hidden name=manifest value="${esc(JSON.stringify(manifest))}"></form><script>f.submit()</script>`,
+          );
+          return;
+        }
+        if (url.pathname !== '/callback') {
+          res.writeHead(404);
+          res.end();
+          return;
+        }
+        try {
+          if (url.searchParams.get('state') !== state) throw new Error('state mismatch');
+          const app = await gh(
+            'POST',
+            `/app-manifests/${encodeURIComponent(url.searchParams.get('code'))}/conversions`,
+          );
+          keychain.set('pem', app.pem);
+          keychain.set('app-id', String(app.id));
+          keychain.set('slug', app.slug);
+          const install = `https://${GH_HOST}/apps/${app.slug}/installations/new`;
+          res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+          res.end(`App 作成完了 (id ${app.id})。秘密鍵はキーチェーンに保存しました。このタブは閉じてOK。`);
+          console.log(`App 作成: ${app.slug} (id ${app.id})。秘密鍵は Keychain(${KEYCHAIN_SERVICE}) のみに保存。`);
+          console.log(`インストール画面: ${install}`);
+          execFileSync('open', [install]);
+          server.close();
+          resolve();
+        } catch (error) {
+          res.writeHead(500);
+          res.end(String(error.message));
+          server.close();
+          reject(error);
+        }
+      })
+      .listen(PORT, '127.0.0.1', () => {
+        console.log('ブラウザで App 作成画面を開きます…');
+        execFileSync('open', [`http://127.0.0.1:${PORT}/`]);
+      });
   });
 }
 
-async function mint() {
-  const inst = await gh('GET', `/repos/${ORG}/${REPO}/installation`, jwt());
-  return gh('POST', `/app/installations/${inst.id}/access_tokens`, jwt(), { repositories: [REPO], permissions: { contents: 'write', pull_requests: 'write' } });
-}
-
 async function push() {
-  const M = await import('@aws-sdk/client-lambda-microvms'); const { WebSocket } = await import('ws');
-  const t = await mint(); if (!/^[A-Za-z0-9_.-]{20,}$/.test(t.token)) throw new Error('unexpected token format');
-  const st = JSON.parse(fs.readFileSync(os.homedir() + '/.t3poc/state.json', 'utf8'));
-  const c = new M.LambdaMicrovmsClient({ region: 'ap-northeast-1' });
-  const r = await c.send(new M.CreateMicrovmShellAuthTokenCommand({ microvmIdentifier: st.microvmId, expirationInMinutes: 5 }));
-  const ws = new WebSocket(`wss://${st.endpoint}/shell`, [`lambda-microvms.authentication.${r.authToken['X-aws-proxy-auth']}`, 'lambda-microvms', 'lambda-microvms.port.8022']);
-  let out = ''; ws.on('message', (d) => { out += d.toString(); });
-  const b64 = Buffer.from(t.token).toString('base64');
-  await new Promise((res, rej) => { ws.on('open', res); ws.on('error', rej); });
-  // stty -echo + leading space: token is read from stdin (base64), never in argv/history/echo
-  ws.send(` stty -echo; read -r T; su - vscode -c 'umask 077; base64 -d > /dev/shm/gh-token.tmp && mv /dev/shm/gh-token.tmp /dev/shm/gh-token; GH_HOST=${HOST} GH_TOKEN=$(cat /dev/shm/gh-token) gh api /repos/${ORG}/${REPO} -q .full_name | sed s/^/T3R""ES:/' <<< "$T"; unset T; stty echo; history -c; echo T3D""ONE\n`);
-  setTimeout(() => ws.send(b64 + '\n'), 500);
-  const deadline = Date.now() + 20000; while (!/T3DONE\r?\n/.test(out) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 300));
-  ws.close(); if (process.env.T3DEBUG) console.log(out.split(b64).join("<redacted>").replace(/\x1b\[[0-9;?]*[a-zA-Z]/g,""));
-  const ok = out.includes(`T3RES:${ORG}/${REPO}`);
-  console.log(ok ? `OK: VM /dev/shm/gh-token を更新 (有効期限 ${new Date(t.expires_at).toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' })} JST, ${REPO} のみ)` : 'NG: 書き込み/確認に失敗');
-  if (!ok) process.exitCode = 1; return ok;
+  const { shellExec } = await import('./vm-shell.mjs');
+  const { WebSocket } = await import('ws');
+  const state = JSON.parse(fs.readFileSync(path.join(os.homedir(), '.t3poc', 'state.json'), 'utf8'));
+  const { CreateMicrovmShellAuthTokenCommand, LambdaMicrovmsClient } = await import('@aws-sdk/client-lambda-microvms');
+  const client = new LambdaMicrovmsClient({ region: 'ap-northeast-1' });
+  const minted = await client.send(
+    new CreateMicrovmShellAuthTokenCommand({ microvmIdentifier: state.microvmId, expirationInMinutes: 5 }),
+  );
+  await pushToVm({
+    mint: () => mintInstallationToken(),
+    shell: (input) =>
+      shellExec({
+        endpoint: state.endpoint,
+        token: minted.authToken['X-aws-proxy-auth'],
+        WebSocket,
+        ...input,
+      }),
+  });
 }
 
-const cmd = process.argv[2];
-if (cmd === 'setup') await setup();
-else if (cmd === 'push') await push();
-else if (cmd === 'refresh') { for (;;) { try { await push(); } catch (e) { console.error(new Date().toISOString(), e.message); } await new Promise((r) => setTimeout(r, 50 * 60 * 1000)); } }
-else if (cmd === 'status') { const t = await mint(); console.log('mint OK, expires', t.expires_at, Object.keys(t.permissions)); /* token discarded */ }
-else { console.log('usage: AWS_PROFILE=fukuchi node ghapp.mjs setup|push|refresh|status'); process.exitCode = 1; }
+async function main() {
+  const cmd = process.argv[2];
+  if (cmd === 'setup') await setup();
+  else if (cmd === 'push') await push();
+  else if (cmd === 'refresh') {
+    throw new Error('Standalone refresh is disabled; use `t3poc relay` for suspend-aware refresh and retries.');
+  } else if (cmd === 'status') {
+    const minted = await mintInstallationToken();
+    console.log('mint OK, expires', minted.expires_at, Object.keys(minted.permissions));
+  } else {
+    console.log('usage: AWS_PROFILE=fukuchi node ghapp.mjs setup|push|refresh|status');
+    process.exitCode = 1;
+  }
+}
+
+const invoked =
+  process.argv[1] &&
+  fs.existsSync(process.argv[1]) &&
+  import.meta.url === pathToFileURL(fs.realpathSync(process.argv[1])).href;
+if (invoked) {
+  main().catch((error) => {
+    console.error(error.message);
+    process.exitCode = 1;
+  });
+}
