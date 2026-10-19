@@ -26,6 +26,22 @@ test('existing image remains identical to the base; only PoC adds pinned Python 
   expect(assembled).toContain('/usr/local/bin/python3.14');
   expect(assembled.match(/user.name haruki-fukuchi/g)).toHaveLength(1);
   expect(assembled).toContain('COPY lifecycle.py');
+  expect(fs.readFileSync(path.join(out, 'autopush.py'), 'utf8')).toBe(
+    fs.readFileSync(path.join(overlayDir, 'autopush.py'), 'utf8'),
+  );
+  expect(fs.readFileSync(path.join(out, 'start-cloud-ide.sh'), 'utf8')).toContain(
+    '/usr/local/bin/python3.14 /opt/cloud-ide/autopush.py &',
+  );
+  expect(fs.readFileSync(path.join(out, 'start-cloud-ide.sh'), 'utf8')).toContain(
+    '/usr/local/bin/python3.14 /opt/cloud-ide/lifecycle.py &',
+  );
+  expect(fs.readFileSync(path.join(baseDir, 'autopush.py'), 'utf8')).toBe(
+    execFileSync('git', ['show', '8ec2787:code-server/artifact/base-image/autopush.py'], {
+      cwd: root,
+      encoding: 'utf8',
+    }),
+  );
+
   expect(fs.readFileSync(path.join(baseDir, 'Dockerfile'), 'utf8')).toBe(base);
 });
 

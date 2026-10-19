@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import { transferBudgetMs, transferScript } from './shell-transfer.mjs';
 
 export const SHELL_DONE = 'T3POC_SHELL_DONE';
 export const VM_PYTHON = '/usr/local/bin/python3.14';
@@ -58,6 +59,8 @@ export function pythonInvocation(source, command, payload, dest) {
 
 export async function shellExec({ endpoint, token, script, stdin, WebSocket, timeoutMs = 90_000 }) {
   if (!endpoint || !token) throw new Error('shell requires an endpoint and token');
+  const large = Buffer.byteLength(script) > 16 * 1024;
+  const transferBudget = large ? transferBudgetMs(script, stdin) : 0;
   const ws = new WebSocket(`wss://${endpoint}/shell`, [
     `lambda-microvms.authentication.${token}`,
     'lambda-microvms',
@@ -68,6 +71,9 @@ export async function shellExec({ endpoint, token, script, stdin, WebSocket, tim
   let inputTimer;
   ws.on('message', (data) => {
     out += data.toString();
+  });
+  ws.on('close', () => {
+    failure = new Error('MicroVM shell closed before completion');
   });
   ws.on('error', () => {
     failure = new Error('MicroVM shell transport failed');
@@ -83,9 +89,33 @@ export async function shellExec({ endpoint, token, script, stdin, WebSocket, tim
       }),
     ]);
     clearTimeout(inputTimer);
-    ws.send(`stty -echo >/dev/null 2>&1 || true\n${script}\n`);
-    if (stdin) inputTimer = setTimeout(() => ws.send(`${stdin}\n`), 400);
-    const deadline = Date.now() + timeoutMs;
+    const deadline = Date.now() + timeoutMs + transferBudget;
+    if (large) {
+      const waitFor = async (pattern, prefix) => {
+        while (!pattern.test(out)) {
+          if (out.includes(`${prefix}ABORT`)) throw new Error('MicroVM script receipt rejected');
+          if (failure) throw failure;
+          if (Date.now() >= deadline) throw new Error('MicroVM script transfer timed out');
+          await new Promise((resolve) => setTimeout(resolve, 5));
+        }
+      };
+      const send = (value) =>
+        new Promise((resolve, reject) => {
+          const timer = setTimeout(
+            () => reject(new Error('MicroVM shell send timed out')),
+            Math.max(1, deadline - Date.now()),
+          );
+          ws.send(value, (error) => {
+            clearTimeout(timer);
+            if (error) reject(new Error('MicroVM shell send failed'));
+            else resolve();
+          });
+        });
+      await transferScript({ script, stdin, python: VM_PYTHON, waitFor, send });
+    } else {
+      ws.send(`stty -echo >/dev/null 2>&1 || true\n${script}\n`);
+      if (stdin) inputTimer = setTimeout(() => ws.send(`${stdin}\n`), 400);
+    }
     while (!new RegExp(`(?:^|[\\r\\n])${SHELL_DONE}(?:\\r?\\n|$)`).test(out) && Date.now() < deadline) {
       if (failure) throw failure;
       await new Promise((resolve) => setTimeout(resolve, 50));
