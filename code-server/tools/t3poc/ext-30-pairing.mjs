@@ -2,10 +2,13 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { pythonInvocation, STOP_T3 } from './vm-shell.mjs';
+import { withWorktrees } from './worktree-code.mjs';
 
 export const PAIRING_SERVICE = 't3poc-pairing';
 export const PAIRING_ACCOUNT = 'bundle';
-const PY = fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), 'vm_history.py'), 'utf8');
+const PY = withWorktrees(
+  fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), 'vm_history.py'), 'utf8'),
+);
 
 export function authRowCount(bundle) {
   if (!bundle?.auth_tables) return 0;
