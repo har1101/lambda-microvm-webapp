@@ -1,0 +1,149 @@
+"""Exclusion list: history archives must not contain pairing secrets or credentials."""
+
+from __future__ import annotations
+
+import base64
+import io
+import sqlite3
+import tarfile
+import tempfile
+import unittest
+from pathlib import Path
+
+import vm_history
+
+
+def _tar_names(blob: bytes) -> list[str]:
+    with tarfile.open(fileobj=io.BytesIO(blob), mode="r:") as archive:
+        return archive.getnames()
+
+
+def _tar_sqlite_tables(blob: bytes, name: str) -> list[str]:
+    with tarfile.open(fileobj=io.BytesIO(blob), mode="r:") as archive:
+        raw = archive.extractfile(name).read()
+    tmp = Path(tempfile.mkdtemp()) / "db"
+    tmp.write_bytes(raw)
+    con = sqlite3.connect(tmp)
+    try:
+        return [row[0] for row in con.execute("SELECT name FROM sqlite_master WHERE type='table'")]
+    finally:
+        con.close()
+
+
+class ExclusionTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+        self.root = self.tmp / "shm"
+        self.scratch = self.tmp / "scratch"
+        self.root.mkdir()
+        (self.root / "t3/userdata/secrets").mkdir(parents=True)
+        (self.root / "t3/userdata/secrets/server.bin").write_bytes(b"SECRETBIN-server")
+        (self.root / "claude").mkdir()
+        (self.root / "claude/credentials.json").write_text('{"refresh_token":"should-not-upload"}')
+        (self.root / "codex").mkdir()
+        (self.root / "codex/auth.json").write_text('{"access_token":"nope"}')
+        (self.root / "gh-token").write_text("github_pat_should_not_upload")
+        (self.root / "t3/userdata").mkdir(parents=True, exist_ok=True)
+        (self.root / "t3/userdata/environment-id").write_text("env-123")
+        db = self.root / "t3/userdata/statev2.sqlite"
+        con = sqlite3.connect(db)
+        con.execute("CREATE TABLE projection_threads (id TEXT, title TEXT)")
+        con.execute("INSERT INTO projection_threads VALUES ('t1', 'hello')")
+        con.execute(
+            "CREATE TABLE auth_sessions (session_id TEXT, credential TEXT, expires_at TEXT)"
+        )
+        con.execute("INSERT INTO auth_sessions VALUES ('sess', 'PAIRING-SECRET', '2099')")
+        con.execute("CREATE TABLE auth_pairing_links (id TEXT, credential TEXT)")
+        con.execute("INSERT INTO auth_pairing_links VALUES ('p1', 'ONE-TIME-TOKEN')")
+        con.commit()
+        con.close()
+        (self.root / "t3/userdata/settings.json").write_text('{"theme":"dark"}\n')
+
+    def test_exclusion_list_drops_secrets_and_keeps_threads(self) -> None:
+        blob, pairing = vm_history.build_split(self.root, self.scratch)
+        names = _tar_names(blob)
+        self.assertIn("t3/userdata/statev2.sqlite", names)
+        self.assertIn("t3/userdata/settings.json", names)
+        self.assertIn("t3/userdata/environment-id", names)
+        for banned in (
+            "t3/userdata/secrets/server.bin",
+            "claude/credentials.json",
+            "codex/auth.json",
+            "gh-token",
+        ):
+            self.assertNotIn(banned, names)
+        raw = blob
+        self.assertNotIn(b"SECRETBIN-server", raw)
+        self.assertNotIn(b"PAIRING-SECRET", raw)
+        self.assertNotIn(b"ONE-TIME-TOKEN", raw)
+        self.assertNotIn(b"github_pat_should_not_upload", raw)
+        self.assertNotIn(b"should-not-upload", raw)
+        tables = _tar_sqlite_tables(blob, "t3/userdata/statev2.sqlite")
+        self.assertIn("projection_threads", tables)
+        self.assertNotIn("auth_sessions", tables)
+        self.assertNotIn("auth_pairing_links", tables)
+        dumped = json_tables(pairing)
+        self.assertIn("PAIRING-SECRET", dumped)
+        self.assertIn("ONE-TIME-TOKEN", dumped)
+        self.assertEqual(pairing["secrets"][0]["path"], "t3/userdata/secrets/server.bin")
+        vm_history.check_tar(blob)
+
+    def test_secret_column_outside_auth_tables_aborts(self) -> None:
+        db = self.root / "t3/userdata/statev2.sqlite"
+        con = sqlite3.connect(db)
+        con.execute("CREATE TABLE projection_provider (id TEXT, refresh_token TEXT)")
+        con.execute("INSERT INTO projection_provider VALUES ('p', 'rt')")
+        con.commit()
+        con.close()
+        with self.assertRaises(vm_history.HistoryNotSeparable):
+            vm_history.build_split(self.root, self.scratch)
+
+    def test_credential_marker_in_a_history_file_aborts(self) -> None:
+        (self.root / "t3/userdata/notes.txt").write_text('see "refresh_token" pasted in a transcript')
+        with self.assertRaises(vm_history.HistoryNotSeparable):
+            vm_history.build_split(self.root, self.scratch)
+
+    def test_restore_rejects_an_archive_that_smuggles_secrets(self) -> None:
+        blob, _pairing = vm_history.build_split(self.root, self.scratch)
+        smuggled = io.BytesIO()
+        with tarfile.open(fileobj=io.BytesIO(blob), mode="r:") as src, tarfile.open(
+            fileobj=smuggled, mode="w"
+        ) as dst:
+            for member in src.getmembers():
+                dst.addfile(member, src.extractfile(member))
+            payload = b"SECRETBIN-smuggled"
+            info = tarfile.TarInfo("t3/userdata/secrets/extra.bin")
+            info.size = len(payload)
+            dst.addfile(info, io.BytesIO(payload))
+        with self.assertRaises(vm_history.HistoryNotSeparable):
+            vm_history.restore_history(self.root, smuggled.getvalue())
+
+    def test_apply_pairing_rejects_paths_outside_secrets(self) -> None:
+        with self.assertRaises(vm_history.HistoryNotSeparable):
+            vm_history.apply_pairing(
+                self.root,
+                {"secrets": [{"path": "t3/userdata/statev2.sqlite", "b64": base64.b64encode(b"x").decode()}]},
+            )
+
+    def test_explicit_path_rules(self) -> None:
+        for rel in (
+            "claude/a",
+            "codex/auth.json",
+            "gh-token",
+            "t3/userdata/secrets/server.bin",
+            "t3/userdata/clerk-tokens.json",
+            "t3/userdata/hosts.yml",
+            "t3/userdata/statev2.sqlite-wal",
+            "../etc/passwd",
+        ):
+            self.assertTrue(vm_history.path_excluded(rel), rel)
+        for rel in ("t3/userdata/statev2.sqlite", "t3/userdata/settings.json", "t3/userdata/environment-id"):
+            self.assertFalse(vm_history.path_excluded(rel), rel)
+
+
+def json_tables(pairing: dict) -> str:
+    return str(pairing["auth_tables"])
+
+
+if __name__ == "__main__":
+    unittest.main()
