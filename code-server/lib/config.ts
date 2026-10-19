@@ -76,6 +76,8 @@ export const config = {
   // `roles` lists the Cognito roles (see edge.groups) allowed to start the size.
   sizes: T3_POC_ONLY ? [T3_SIZE] : [...IDE_SIZES, T3_SIZE],
   t3: { idleSec: 28800, maxDurationSec: T3_MAX_DURATION_SEC },
+  // T3-only PoC: no CloudFront/Cognito/Edge stack; the Mac runs `tools/t3poc`.
+  deployEdge: !T3_POC_ONLY,
   imageDescription: 'Personal OMP cloud IDE on Lambda MicroVM',
   baseImageArn: `arn:aws:lambda:${MICROVM_REGION}:aws:microvm-image:al2023-1`,
   baseImageVersion: '1',

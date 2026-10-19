@@ -1472,15 +1472,28 @@ describe('OMP Cloud IDE infrastructure', () => {
     expect(JSON.parse(String(run?.input.runHookPayload)).authState).toBe(false);
   });
 
-  test('T3 PoC: front proxy routes /ide and /healthz to code-server, the rest to t3', () => {
-    const front = require('../artifact/base-image/t3-front.cjs') as {
-      route: (url: string) => { target: { host: string; port: number }; path: string; redirect?: string };
+  test('T3 PoC: in-VM shim restores the client loopback Host for T3 DPoP/Origin checks', () => {
+    const shim = require('../artifact/base-image/t3-shim.cjs') as {
+      rewriteHeaders: (raw: string[]) => [string, string][];
     };
-    expect(front.route('/healthz')).toEqual({ target: { host: '127.0.0.1', port: 8081 }, path: '/healthz' });
-    expect(front.route('/ide/static/x.js').path).toBe('/static/x.js');
-    expect(front.route('/ide')).toEqual({ redirect: '/ide/' });
-    expect(front.route('/assets/index.js').target.port).toBe(3773);
-    expect(front.route('/ws').target.port).toBe(3773);
+    const out = shim.rewriteHeaders([
+      'Host',
+      'mvm-1.lambda-microvm.ap-northeast-1.on.aws',
+      'X-T3poc-Host',
+      '127.0.0.1:8787',
+      'X-aws-proxy-auth',
+      'secret',
+      'Origin',
+      'http://127.0.0.1:8787',
+    ]);
+    expect(out).toEqual([
+      ['Host', '127.0.0.1:8787'],
+      ['Origin', 'http://127.0.0.1:8787'],
+    ]);
+    // A non-loopback X-T3poc-Host is ignored (the endpoint Host stays).
+    expect(shim.rewriteHeaders(['Host', 'mvm-1.example', 'X-T3poc-Host', 'evil.example:443'])).toEqual([
+      ['Host', 'mvm-1.example'],
+    ]);
   });
 
   test('T3 PoC: autopush never pushes main and skips without a token (test/autopush_test.py)', () => {
