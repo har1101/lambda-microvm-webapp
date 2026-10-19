@@ -95,7 +95,10 @@ export const config = {
   imageDescription: 'Personal OMP cloud IDE on Lambda MicroVM',
   baseImageArn: `arn:aws:lambda:${MICROVM_REGION}:aws:microvm-image:al2023-1`,
   baseImageVersion: '1',
-  artifactDir: 'artifact/base-image',
+  // OmpCloudIde stacks always build from the shared base image. T3_POC_ONLY
+  // assembles a private overlay including Python 3.14. The shared base and its
+  // asset hashing remain byte-for-byte unchanged for all existing stacks.
+  artifactDir: T3_POC_ONLY ? 'artifact/t3poc-image' : 'artifact/base-image',
   authState: {
     bucketName: `${NAME_PREFIX}-auth-${ACCOUNT}-${MICROVM_REGION}`,
     prefix: 'personal',
