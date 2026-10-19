@@ -96,8 +96,8 @@ export const config = {
   baseImageArn: `arn:aws:lambda:${MICROVM_REGION}:aws:microvm-image:al2023-1`,
   baseImageVersion: '1',
   // OmpCloudIde stacks always build from the shared base image. T3_POC_ONLY
-  // assembles artifact/t3poc-image (that base plus the t3poc-only git identity
-  // and GH_HOST/GH_TOKEN bashrc lines) and never points OmpCloudIde at it.
+  // assembles a private overlay including Python 3.14. The shared base and its
+  // asset hashing remain byte-for-byte unchanged for all existing stacks.
   artifactDir: T3_POC_ONLY ? 'artifact/t3poc-image' : 'artifact/base-image',
   authState: {
     bucketName: `${NAME_PREFIX}-auth-${ACCOUNT}-${MICROVM_REGION}`,

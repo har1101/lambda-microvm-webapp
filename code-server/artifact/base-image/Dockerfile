@@ -177,4 +177,10 @@ EXPOSE 8080 9000
 
 USER vscode
 
+# t3poc: commit identity + gh for *.ghe.com (gh needs GH_TOKEN, not GH_ENTERPRISE_TOKEN; token is RAM-only in /dev/shm)
+RUN git config --global user.name haruki-fukuchi \
+    && git config --global user.email haruki-fukuchi@nec.com \
+    && printf '%s\n' 'export GH_HOST=ai-native-factory-ltd.ghe.com' \
+      'if [ -s /dev/shm/gh-token ]; then export GH_TOKEN="$(cat /dev/shm/gh-token)"; fi' >> ${HOME}/.bashrc
+
 CMD ["/usr/local/bin/start-cloud-ide"]

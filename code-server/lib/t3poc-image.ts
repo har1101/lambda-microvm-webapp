@@ -1,28 +1,39 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import type { AssetProps } from 'aws-cdk-lib/aws-s3-assets';
+import { AssetHashType, DockerImage } from 'aws-cdk-lib/core';
 
 const CMD = 'CMD ["/usr/local/bin/start-cloud-ide"]';
 
-/** Copy the shared base image and append the t3poc-only git identity / GH_HOST snippet. */
+/** Keep the shared image untouched; only the PoC copy receives this overlay. */
 export function assembleT3pocImage(baseDir: string, overlayDir: string, outputDir: string): void {
   fs.cpSync(baseDir, outputDir, {
     recursive: true,
     filter: (src) => path.basename(src) !== '__pycache__' && !src.endsWith('.pyc'),
   });
-  const snippetPath = path.join(overlayDir, 'git-identity.dockerfile');
-  const snippet = fs.readFileSync(snippetPath, 'utf8').trim();
-  if (!snippet.includes('git config --global user.name haruki-fukuchi')) {
-    throw new Error(`t3poc overlay ${snippetPath} is missing the git identity`);
-  }
-  if (!snippet.includes('export GH_HOST=ai-native-factory-ltd.ghe.com')) {
-    throw new Error(`t3poc overlay ${snippetPath} is missing GH_HOST`);
-  }
+  const snippet = fs.readFileSync(path.join(overlayDir, 'python.dockerfile'), 'utf8').trim();
   const dockerfilePath = path.join(outputDir, 'Dockerfile');
   const base = fs.readFileSync(dockerfilePath, 'utf8');
-  if (base.includes('user.name haruki-fukuchi') || base.includes('GH_HOST=ai-native-factory-ltd.ghe.com')) {
-    throw new Error('shared base-image Dockerfile still contains t3poc git identity / GH_HOST');
-  }
   if (!base.includes(CMD)) throw new Error('base Dockerfile is missing its CMD');
-  const normalized = base.endsWith('\n') ? base : `${base}\n`;
-  fs.writeFileSync(dockerfilePath, normalized.replace(CMD, `${snippet}\n\n${CMD}`));
+  fs.writeFileSync(
+    dockerfilePath,
+    base.replace(CMD, () => `${snippet}\n\n${CMD}`),
+  );
+}
+
+export function t3pocAssetOptions(baseDir: string, overlayDir: string): AssetProps {
+  return {
+    path: overlayDir,
+    // baseDir is outside path: hash the complete generated context, not just the overlay.
+    assetHashType: AssetHashType.OUTPUT,
+    bundling: {
+      image: DockerImage.fromRegistry('public.ecr.aws/docker/library/node:22-bookworm-slim'),
+      local: {
+        tryBundle(outputDir: string) {
+          assembleT3pocImage(baseDir, overlayDir, outputDir);
+          return true;
+        },
+      },
+    },
+  };
 }

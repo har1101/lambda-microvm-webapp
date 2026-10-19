@@ -24,7 +24,7 @@ import {
   ingressConnectorArn,
   NAME_PREFIX,
 } from './config';
-import { assembleT3pocImage } from './t3poc-image';
+import { t3pocAssetOptions } from './t3poc-image';
 
 const microvmSourceArn = `arn:aws:lambda:${config.microvmRegion}:${config.account}:microvm-image:*` as const;
 const microvmInstanceArn = `arn:aws:lambda:${config.microvmRegion}:${config.account}:microvm:*` as const;
@@ -83,25 +83,11 @@ export class OmpCloudIdeMicrovmStack extends cdk.Stack {
     const codeArtifact = new s3assets.Asset(this, 'CodeArtifact', {
       path: path.join(__dirname, '..', artifactDir),
       exclude: ['**/__pycache__/**', '**/*.pyc'],
-      // OmpCloudIde (artifact/base-image) is staged as-is. The t3poc stack
-      // bundles a private context: shared files plus the t3poc-only Dockerfile
-      // snippet. tryBundle runs locally so synth does not build or push an image.
       ...(t3pocImage
-        ? {
-            bundling: {
-              image: cdk.DockerImage.fromRegistry('public.ecr.aws/docker/library/node:22-bookworm-slim'),
-              local: {
-                tryBundle(outputDir: string) {
-                  assembleT3pocImage(
-                    path.join(__dirname, '..', 'artifact', 'base-image'),
-                    path.join(__dirname, '..', 'artifact', 't3poc-image'),
-                    outputDir,
-                  );
-                  return true;
-                },
-              },
-            },
-          }
+        ? t3pocAssetOptions(
+            path.join(__dirname, '..', 'artifact', 'base-image'),
+            path.join(__dirname, '..', 'artifact', 't3poc-image'),
+          )
         : {}),
     });
 
