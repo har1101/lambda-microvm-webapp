@@ -3,9 +3,10 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { LOCAL_PYTHON, pythonInvocation, START_T3, STOP_T3 } from './vm-shell.mjs';
+import { withWorktrees } from './worktree-code.mjs';
 
 const PY_PATH = path.join(path.dirname(fileURLToPath(import.meta.url)), 'vm_history.py');
-const PY = fs.readFileSync(PY_PATH, 'utf8');
+const PY = withWorktrees(fs.readFileSync(PY_PATH, 'utf8'));
 
 export function historyLocation(account) {
   if (!/^\d{12}$/.test(String(account))) throw new Error('bad account id');

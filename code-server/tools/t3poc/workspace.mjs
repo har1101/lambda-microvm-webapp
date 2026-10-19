@@ -1,4 +1,6 @@
-import { VM_PYTHON } from './vm-shell.mjs';
+import { pythonInvocation, START_T3, STOP_T3, VM_PYTHON } from './vm-shell.mjs';
+
+import { withWorktrees } from './worktree-code.mjs';
 
 export const DEFAULT_REPOS = ['ai-native-factory/t3poc-sandbox'];
 const REPO_RE = /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/;
@@ -69,6 +71,32 @@ export async function cloneRepos(api) {
   const repos = parseRepos(api.deps.repos ?? process.env.T3POC_REPOS);
   const out = await api.deps.shell({ script: cloneScript(repos) });
   if (!/^T3POC_CLONE_OK\r?$/m.test(out)) throw new Error('workspace clone failed');
+  const probe = await api.deps.shell({
+    script: pythonInvocation(
+      "from pathlib import Path\nprint('T3POC_WORKTREES_PENDING' if any(Path('/dev/shm/t3/worktree-state').glob('*/*.json')) else 'T3POC_WORKTREES_NONE')",
+      'restore',
+    ),
+  });
+  if (/^T3POC_WORKTREES_NONE\r?$/m.test(probe)) {
+    api.log('workspace clone finished');
+    return { ok: true };
+  }
+  if (!/^T3POC_WORKTREES_PENDING\r?$/m.test(probe)) throw new Error('thread worktree inventory failed');
+  // Only a fresh restore needs to change git registrations. Reattaching a
+  // relay with no pending snapshots must leave the running T3 process alone.
+  const stopped = await api.deps.shell({ script: STOP_T3 });
+  if (!stopped.includes('T3POC_T3_STOPPED')) throw new Error('T3 did not stop for workspace restoration');
+  let failure;
+  try {
+    const source = withWorktrees('from vm_worktrees import main\nmain()', { history: true });
+    const restored = await api.deps.shell({ script: pythonInvocation(source, 'restore') });
+    if (!/^T3POC_WORKTREES_OK\r?$/m.test(restored)) throw new Error('thread worktree restore failed');
+  } catch (error) {
+    failure = error;
+  }
+  const started = await api.deps.shell({ script: START_T3 });
+  if (!started.includes('T3POC_T3_STARTED')) throw new Error('T3 restart failed after workspace restoration');
+  if (failure) throw failure;
   api.log('workspace clone finished');
   return { ok: true };
 }
