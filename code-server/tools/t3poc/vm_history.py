@@ -223,7 +223,7 @@ def pairing_only(root: Path) -> dict:
             secrets.append({"path": rel, "b64": base64.b64encode(path.read_bytes()).decode()})
             continue
         if rel == "t3/userdata/environment-id":
-            environment_id = path.read_text()
+            environment_id = path.read_bytes().decode("utf-8")
             continue
         if path.name.endswith(".sqlite") and not path_excluded(rel):
             con = sqlite3.connect(path)
@@ -256,7 +256,7 @@ def build_split(root: Path, scratch: Path) -> tuple[bytes, dict]:
         if path_excluded(rel):
             continue
         if rel == "t3/userdata/environment-id":
-            environment_id = path.read_text()
+            environment_id = path.read_bytes().decode("utf-8")
             pairing["environment_id"] = environment_id
             scan_bytes(environment_id.encode(), rel)
             entries.append((rel, environment_id.encode()))
@@ -319,6 +319,14 @@ def _assert_sqlite_has_no_auth(blob: bytes, where: str) -> None:
 
 
 def apply_pairing(root: Path, pairing: dict) -> None:
+    environment_id = pairing.get("environment_id")
+    # T3 writes an ID followed by a newline. Preserve its exact file bytes,
+    # accepting only the canonical ID and at most one LF/CRLF terminator.
+    if environment_id is not None and (
+        not isinstance(environment_id, str)
+        or not re.fullmatch(r"[A-Za-z0-9._:-]{1,200}(?:\r?\n)?", environment_id)
+    ):
+        raise HistoryNotSeparable("environment-id rejected")
     for item in pairing.get("secrets") or []:
         rel = item.get("path", "")
         if not is_pairing_secret(rel):
@@ -364,10 +372,7 @@ def apply_pairing(root: Path, pairing: dict) -> None:
             secure_write(root, 't3/userdata/statev2.sqlite', con.serialize())
         finally:
             con.close()
-    environment_id = pairing.get("environment_id")
     if environment_id is not None:
-        if not re.fullmatch(r"[A-Za-z0-9._:-]{1,200}", environment_id):
-            raise HistoryNotSeparable("environment-id rejected")
         secure_write(root, 't3/userdata/environment-id', environment_id.encode())
 
 

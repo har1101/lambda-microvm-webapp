@@ -142,6 +142,29 @@ class ExclusionTest(unittest.TestCase):
 
 
 class RegressionTest(ExclusionTest):
+    def test_real_environment_id_line_ending_roundtrips_with_pairing_and_history(self):
+        for ending in ("", "\n", "\r\n"):
+            original = ("env-123" + ending).encode()
+            (self.root / "t3/userdata/environment-id").write_bytes(original)
+            history, pairing = vm_history.build_split(self.root, self.scratch)
+            self.assertEqual(vm_history.pairing_only(self.root)["environment_id"].encode(), original)
+            restored = self.tmp / ("restored-" + str(len(ending)))
+            vm_history.restore_history(restored, history)
+            vm_history.apply_pairing(restored, pairing)
+            self.assertEqual((restored / "t3/userdata/environment-id").read_bytes(), original)
+            con = sqlite3.connect(restored / "t3/userdata/statev2.sqlite")
+            try:
+                self.assertEqual(con.execute("SELECT title FROM projection_threads").fetchone()[0], "hello")
+                self.assertEqual(con.execute("SELECT count(*) FROM auth_sessions").fetchone()[0], 1)
+            finally: con.close()
+
+    def test_bad_environment_id_rejects_before_any_secret_is_written(self):
+        for invalid in ("", "env\nother", "env\n\n", "env ", "../escape", "x" * 201, [], 17):
+            target = self.tmp / "invalid-restored"
+            with self.assertRaises(vm_history.HistoryNotSeparable):
+                vm_history.apply_pairing(target, {"environment_id": invalid, "secrets": [{"path": "t3/userdata/secrets/server.bin", "b64": "eA=="}]})
+            self.assertFalse(target.exists())
+
     def test_cli_root_cannot_be_redirected_to_disk(self):
         import os
         from unittest.mock import patch
