@@ -240,29 +240,34 @@ async function startSession(owner, requestId, siteOrigin, image) {
 
   // Measured before RunMicrovm, so this is never later than the service-side
   // startedAt + maximumDurationInSeconds that actually terminates the MicroVM.
-  const expiresAt = Date.now() + cfg.MAX_DURATION_SEC * 1000;
+  // T3 task VMs (PoC) never get the shared sign-in state: guest role (no
+  // S3/KMS) and authState=false, regardless of the caller's role.
+  const isT3 = image.kind === 't3';
+  const persistAuth = isAdmin && !isT3;
+  const maxDurationSec = isT3 ? cfg.T3_MAX_DURATION_SEC : cfg.MAX_DURATION_SEC;
+  const expiresAt = Date.now() + maxDurationSec * 1000;
   let run;
   try {
     run = await mvm.send(
       new RunMicrovmCommand({
         imageIdentifier: image.arn,
         // Guests get a role without access to the shared sign-in state.
-        executionRoleArn: isAdmin ? cfg.EXECUTION_ROLE_ARN : cfg.GUEST_EXECUTION_ROLE_ARN,
+        executionRoleArn: persistAuth ? cfg.EXECUTION_ROLE_ARN : cfg.GUEST_EXECUTION_ROLE_ARN,
         ingressNetworkConnectors: [cfg.INGRESS],
         egressNetworkConnectors: [cfg.EGRESS],
         idlePolicy: {
           autoResumeEnabled: true,
-          maxIdleDurationSeconds: cfg.IDLE_SEC,
+          maxIdleDurationSeconds: isT3 ? cfg.T3_IDLE_SEC : cfg.IDLE_SEC,
           suspendedDurationSeconds: cfg.SUSPENDED_SEC,
         },
-        maximumDurationInSeconds: cfg.MAX_DURATION_SEC,
+        maximumDurationInSeconds: maxDurationSec,
         // The image is shared by every distribution, so the IDE learns the
         // control page URL from the origin that started it, not from a build-time constant.
         runHookPayload: JSON.stringify({
           sessionId: id,
           expiresAt,
           controlUrl: `${siteOrigin}/session/control`,
-          authState: isAdmin,
+          authState: persistAuth,
         }),
       }),
     );
