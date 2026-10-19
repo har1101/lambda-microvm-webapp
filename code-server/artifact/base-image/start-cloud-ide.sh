@@ -30,5 +30,6 @@ export GIT_CONFIG_KEY_1=credential.https://ai-native-factory-ltd.ghe.com.helper 
 
 t3 serve --host 127.0.0.1 --port 3773 --no-browser /home/vscode/workspace &
 python3 /opt/cloud-ide/autopush.py &
-node /opt/cloud-ide/t3-front.cjs &
-exec code-server --bind-addr 127.0.0.1:8081 "${CODE_SERVER_ARGS[@]}"
+# No code-server in T3 task VMs: the Mac connects with T3 Desktop through
+# `t3poc relay`; logins happen in T3's own terminal / Settings → Providers.
+exec node /opt/cloud-ide/t3-shim.cjs

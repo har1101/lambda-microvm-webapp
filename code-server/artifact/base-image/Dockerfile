@@ -155,7 +155,7 @@ COPY lifecycle.py /opt/cloud-ide/lifecycle.py
 COPY start-cloud-ide.sh /usr/local/bin/start-cloud-ide
 COPY persist-auth-state /usr/local/bin/persist-auth-state
 COPY autopush.py /opt/cloud-ide/autopush.py
-COPY t3-front.cjs /opt/cloud-ide/t3-front.cjs
+COPY t3-shim.cjs /opt/cloud-ide/t3-shim.cjs
 COPY git-credential-shm /usr/local/bin/git-credential-shm
 COPY gh-token-login /usr/local/bin/gh-token-login
 
