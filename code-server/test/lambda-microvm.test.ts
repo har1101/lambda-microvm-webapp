@@ -427,6 +427,7 @@ describe('OMP Cloud IDE infrastructure', () => {
       { logicalId: 'MicrovmImage', name: 'omp-cloud-ide', memory: 2048 },
       { logicalId: 'MicrovmImage4gb', name: 'omp-cloud-ide-4gb', memory: 4096 },
       { logicalId: 'MicrovmImage8gb', name: 'omp-cloud-ide-8gb', memory: 8192 },
+      { logicalId: 'MicrovmImaget32gb', name: 't3-task', memory: 2048 },
     ]);
     expect(new Set(images.map((image) => image.artifact)).size).toBe(1);
 
@@ -501,6 +502,7 @@ describe('OMP Cloud IDE infrastructure', () => {
               'arn:aws:lambda:ap-northeast-1:123456789012:microvm-image:omp-cloud-ide',
               'arn:aws:lambda:ap-northeast-1:123456789012:microvm-image:omp-cloud-ide-4gb',
               'arn:aws:lambda:ap-northeast-1:123456789012:microvm-image:omp-cloud-ide-8gb',
+              'arn:aws:lambda:ap-northeast-1:123456789012:microvm-image:t3-task',
             ],
           }),
           Match.objectLike({
@@ -510,6 +512,7 @@ describe('OMP Cloud IDE infrastructure', () => {
               'arn:aws:lambda:ap-northeast-1:123456789012:microvm-image:omp-cloud-ide',
               'arn:aws:lambda:ap-northeast-1:123456789012:microvm-image:omp-cloud-ide-4gb',
               'arn:aws:lambda:ap-northeast-1:123456789012:microvm-image:omp-cloud-ide-8gb',
+              'arn:aws:lambda:ap-northeast-1:123456789012:microvm-image:t3-task',
             ],
           }),
           Match.objectLike({
@@ -524,6 +527,7 @@ describe('OMP Cloud IDE infrastructure', () => {
               'arn:aws:lambda:ap-northeast-1:123456789012:microvm-image:omp-cloud-ide',
               'arn:aws:lambda:ap-northeast-1:123456789012:microvm-image:omp-cloud-ide-4gb',
               'arn:aws:lambda:ap-northeast-1:123456789012:microvm-image:omp-cloud-ide-8gb',
+              'arn:aws:lambda:ap-northeast-1:123456789012:microvm-image:t3-task',
               'arn:aws:lambda:ap-northeast-1:123456789012:microvm:*',
             ],
           }),
@@ -1454,6 +1458,35 @@ describe('OMP Cloud IDE infrastructure', () => {
         expect((await forward()).headers.cookie).toBeUndefined();
       },
     );
+  });
+
+  test('T3 PoC: admin T3 VMs get the guest role, authState=false, long idle and the T3 lifetime', async () => {
+    const table = sessionTableMock();
+    const { calls } = await withAwsMocks({ ...table.overrides, GetMicrovmCommand: runningMicrovm }, async () => {
+      expect((await selectPost({ action: 'new', size: 't3-2gb' })).status).toBe('200');
+    });
+    const run = calls.find((c) => c.name === 'RunMicrovmCommand');
+    expect(run?.input.imageIdentifier).toBe('arn:aws:lambda:ap-northeast-1:123456789012:microvm-image:t3-task');
+    expect(run?.input.executionRoleArn).toBe(edgeConfig().GUEST_EXECUTION_ROLE_ARN);
+    expect((run?.input.idlePolicy as { maxIdleDurationSeconds: number }).maxIdleDurationSeconds).toBe(28800);
+    expect(JSON.parse(String(run?.input.runHookPayload)).authState).toBe(false);
+  });
+
+  test('T3 PoC: front proxy routes /ide and /healthz to code-server, the rest to t3', () => {
+    const front = require('../artifact/base-image/t3-front.cjs') as {
+      route: (url: string) => { target: { host: string; port: number }; path: string; redirect?: string };
+    };
+    expect(front.route('/healthz')).toEqual({ target: { host: '127.0.0.1', port: 8081 }, path: '/healthz' });
+    expect(front.route('/ide/static/x.js').path).toBe('/static/x.js');
+    expect(front.route('/ide')).toEqual({ redirect: '/ide/' });
+    expect(front.route('/assets/index.js').target.port).toBe(3773);
+    expect(front.route('/ws').target.port).toBe(3773);
+  });
+
+  test('T3 PoC: autopush never pushes main and skips without a token (test/autopush_test.py)', () => {
+    const result = spawnSync('python3', [path.join(__dirname, 'autopush_test.py')], { encoding: 'utf8' });
+    expect(`${result.stderr}`).toMatch(/\nOK\s*$/);
+    expect(result.status).toBe(0);
   });
 
   test('lifecycle.py persistence and run hook behave as specified (test/lifecycle_test.py)', () => {

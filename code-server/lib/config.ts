@@ -7,6 +7,60 @@ if (!ACCOUNT) {
 const MICROVM_REGION = 'ap-northeast-1';
 const EDGE_REGION = 'us-east-1';
 
+// T3 PoC: a T3 task image (t3 serve + Claude Code + Codex, RAM-only logins).
+// T3_POC_ONLY=1 deploys only the T3 image (one image build, minimal cost).
+// T3_MAX_DURATION_SEC shortens T3 VM lifetime for the expiry test (default 8h).
+const T3_POC_ONLY = process.env.T3_POC_ONLY === '1';
+const T3_MAX_DURATION_SEC = Number(process.env.T3_MAX_DURATION_SEC ?? 28800);
+if (!Number.isInteger(T3_MAX_DURATION_SEC) || T3_MAX_DURATION_SEC < 900 || T3_MAX_DURATION_SEC > 28800) {
+  throw new Error('T3_MAX_DURATION_SEC must be an integer between 900 and 28800');
+}
+
+type Size = {
+  id: string;
+  imageName: string;
+  minimumMemoryInMiB: number;
+  label: string;
+  roles: readonly ('admin' | 'guest')[];
+  kind: 'ide' | 't3';
+};
+
+const IDE_SIZES: Size[] = [
+  {
+    id: '2gb',
+    imageName: 'omp-cloud-ide',
+    minimumMemoryInMiB: 2048,
+    label: '2 GB / 1 vCPU (peak 8 GB / 4 vCPU), disk 8 GB',
+    roles: ['admin', 'guest'],
+    kind: 'ide',
+  },
+  {
+    id: '4gb',
+    imageName: 'omp-cloud-ide-4gb',
+    minimumMemoryInMiB: 4096,
+    label: '4 GB / 2 vCPU (peak 16 GB / 8 vCPU), disk 16 GB, 2x baseline cost',
+    roles: ['admin', 'guest'],
+    kind: 'ide',
+  },
+  {
+    id: '8gb',
+    imageName: 'omp-cloud-ide-8gb',
+    minimumMemoryInMiB: 8192,
+    label: '8 GB / 4 vCPU (peak 32 GB / 16 vCPU), disk 32 GB, 4x baseline cost',
+    roles: ['admin'],
+    kind: 'ide',
+  },
+];
+
+const T3_SIZE: Size = {
+  id: 't3-2gb',
+  imageName: 't3-task',
+  minimumMemoryInMiB: 2048,
+  label: 'T3 task (PoC): t3 serve + Claude Code + Codex, logins in RAM only, 2 GB / 1 vCPU',
+  roles: ['admin'],
+  kind: 't3',
+};
+
 export const config = {
   account: ACCOUNT,
   microvmRegion: MICROVM_REGION,
@@ -17,29 +71,8 @@ export const config = {
   // disk scales with it (https://docs.aws.amazon.com/lambda/latest/dg/microvms-images.html#microvms-images-sizing).
   // The first entry is the chooser default. Every image builds from the same artifact.
   // `roles` lists the Cognito roles (see edge.groups) allowed to start the size.
-  sizes: [
-    {
-      id: '2gb',
-      imageName: 'omp-cloud-ide',
-      minimumMemoryInMiB: 2048,
-      label: '2 GB / 1 vCPU (peak 8 GB / 4 vCPU), disk 8 GB',
-      roles: ['admin', 'guest'],
-    },
-    {
-      id: '4gb',
-      imageName: 'omp-cloud-ide-4gb',
-      minimumMemoryInMiB: 4096,
-      label: '4 GB / 2 vCPU (peak 16 GB / 8 vCPU), disk 16 GB, 2x baseline cost',
-      roles: ['admin', 'guest'],
-    },
-    {
-      id: '8gb',
-      imageName: 'omp-cloud-ide-8gb',
-      minimumMemoryInMiB: 8192,
-      label: '8 GB / 4 vCPU (peak 32 GB / 16 vCPU), disk 32 GB, 4x baseline cost',
-      roles: ['admin'],
-    },
-  ],
+  sizes: T3_POC_ONLY ? [T3_SIZE] : [...IDE_SIZES, T3_SIZE],
+  t3: { idleSec: 28800, maxDurationSec: T3_MAX_DURATION_SEC },
   imageDescription: 'Personal OMP cloud IDE on Lambda MicroVM',
   baseImageArn: `arn:aws:lambda:${MICROVM_REGION}:aws:microvm-image:al2023-1`,
   baseImageVersion: '1',

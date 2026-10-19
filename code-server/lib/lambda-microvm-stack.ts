@@ -109,7 +109,7 @@ export class OmpCloudIdeMicrovmStack extends cdk.Stack {
     for (const size of config.sizes) {
       // The 2gb image predates selectable sizes. Keeping its logical IDs updates
       // the existing image and log group in place instead of replacing them.
-      const idSuffix = size.id === '2gb' ? '' : size.id;
+      const idSuffix = size.id === '2gb' ? '' : size.id.replace(/[^A-Za-z0-9]/g, '');
       const logGroup = new logs.LogGroup(this, `MicrovmLogGroup${idSuffix}`, {
         logGroupName: `/aws/lambda-microvms/${size.imageName}`,
         retention: logs.RetentionDays.ONE_WEEK,
@@ -138,6 +138,7 @@ export class OmpCloudIdeMicrovmStack extends cdk.Stack {
             { Key: 'AUTH_STATE_PREFIX', Value: config.authState.prefix },
             { Key: 'AUTH_SYNC_INTERVAL_SECONDS', Value: String(config.authState.syncIntervalSeconds) },
             { Key: 'PI_CODING_AGENT_DIR', Value: '/home/vscode/.omp/agent' },
+            { Key: 'CLOUD_IDE_KIND', Value: size.kind },
           ],
           Hooks: {
             Port: 9000,
@@ -349,6 +350,7 @@ export class OmpCloudIdeEdgeStack extends cdk.Stack {
         arn: imageArn(size.imageName),
         label: size.label,
         roles: size.roles,
+        kind: size.kind,
       })),
       EXECUTION_ROLE_ARN: executionRoleArn,
       GUEST_EXECUTION_ROLE_ARN: guestExecutionRoleArn,
@@ -372,6 +374,8 @@ export class OmpCloudIdeEdgeStack extends cdk.Stack {
       MAX_DURATION_SEC: config.edge.maxDurationSec,
       IDLE_SEC: config.edge.idleSec,
       SUSPENDED_SEC: config.edge.suspendedSec,
+      T3_IDLE_SEC: config.t3.idleSec,
+      T3_MAX_DURATION_SEC: config.t3.maxDurationSec,
     });
 
     const edgeFn = new lambda.Function(this, 'EdgeFunction', {
