@@ -26,6 +26,11 @@ SECRET_NAME_PARTS = ("token", "secret", "credential", "password")
 EXCLUDED_FILE_NAMES = {"clerk-tokens.json", "hosts.yml"}
 AUTH_TABLE_RE = re.compile(r"^(auth_.*|.*secret.*|.*credential.*)$", re.I)
 SECRET_COLUMN_RE = re.compile(r"token|secret|credential|password|private_key|cookie", re.I)
+# T3 0.1.0 always creates these nullable columns, even with no webhooks.
+# Preserve their schema only while every value is NULL. Configured webhook
+# credentials still fail closed before SELECT * can load them into history.
+NULL_ONLY_SECRET_COLUMNS = {"scheduled_tasks": frozenset({"webhook_token", "webhook_secret"})}
+
 MARKERS = (
     b'"refresh_token"',
     b'"access_token"',
@@ -101,6 +106,20 @@ def _is_auth_table(name: str) -> bool:
     return AUTH_TABLE_RE.match(name) is not None
 
 
+def assert_secret_columns_empty(con: sqlite3.Connection, table: str) -> None:
+    for info in con.execute(f"PRAGMA table_info({qident(table)})"):
+        column = info[1]
+        if not SECRET_COLUMN_RE.search(column):
+            continue
+        default_is_null = info[4] is None or str(info[4]).strip().upper() == "NULL"
+        allowed = column in NULL_ONLY_SECRET_COLUMNS.get(table, ()) and not info[3] and default_is_null
+        if allowed and con.execute(
+            f"SELECT 1 FROM {qident(table)} WHERE {qident(column)} IS NOT NULL LIMIT 1"
+        ).fetchone() is None:
+            continue
+        raise HistoryNotSeparable(f"sqlite table {table} column {column} cannot be separated from secrets")
+
+
 def export_auth_table(con: sqlite3.Connection, table: str) -> dict:
     if not _is_auth_table(table):
         raise HistoryNotSeparable(f"refusing to export non-auth table {table}")
@@ -127,18 +146,15 @@ def sanitize_sqlite(src: Path, dest: Path) -> list[dict]:
     src_con = sqlite3.connect(src)
     try:
         src_con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        # Validate and copy one read snapshot, even if another process writes.
+        src_con.execute("BEGIN")
         auth: list[dict] = []
         keep: list[str] = []
         for table in _tables(src_con):
             if _is_auth_table(table):
                 auth.append(export_auth_table(src_con, table))
                 continue
-            columns = [row[1] for row in src_con.execute(f"PRAGMA table_info({qident(table)})")]
-            for column in columns:
-                if SECRET_COLUMN_RE.search(column):
-                    raise HistoryNotSeparable(
-                        f"sqlite table {table} column {column} looks like a secret and is not an auth table"
-                    )
+            assert_secret_columns_empty(src_con, table)
             for rec in src_con.execute(f"SELECT * FROM {qident(table)}"):
                 for value in rec:
                     if isinstance(value, str):
@@ -297,10 +313,7 @@ def _assert_sqlite_has_no_auth(blob: bytes, where: str) -> None:
         for table in _tables(con):
             if _is_auth_table(table):
                 raise HistoryNotSeparable(f"{where} still contains auth table {table}")
-            columns = [row[1] for row in con.execute(f"PRAGMA table_info({qident(table)})")]
-            for column in columns:
-                if SECRET_COLUMN_RE.search(column):
-                    raise HistoryNotSeparable(f"{where} table {table} column {column} looks like a secret")
+            assert_secret_columns_empty(con, table)
     finally:
         con.close()
 
