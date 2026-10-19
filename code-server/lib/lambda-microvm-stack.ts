@@ -22,6 +22,7 @@ import {
   imageArn,
   imageArns,
   ingressConnectorArn,
+  NAME_PREFIX,
 } from './config';
 
 const microvmSourceArn = `arn:aws:lambda:${config.microvmRegion}:${config.account}:microvm-image:*` as const;
@@ -50,7 +51,7 @@ export class OmpCloudIdeMicrovmStack extends cdk.Stack {
     super(scope, id, props);
 
     const authKey = new kms.Key(this, 'AuthStateKey', {
-      alias: 'alias/omp-cloud-ide-auth-state',
+      alias: `alias/${NAME_PREFIX}-auth-state`,
       description: 'Encrypts persisted OMP and GitHub OAuth state',
       enableKeyRotation: true,
       removalPolicy: cdk.RemovalPolicy.RETAIN,
@@ -82,7 +83,7 @@ export class OmpCloudIdeMicrovmStack extends cdk.Stack {
     });
 
     const buildRole = new iam.Role(this, 'MicrovmBuildRole', {
-      roleName: 'omp-cloud-ide-microvm-build',
+      roleName: `${NAME_PREFIX}-microvm-build`,
       assumedBy: new iam.ServicePrincipal('lambda.amazonaws.com'),
       description: 'Build-only role for the OMP Lambda MicroVM image',
     });
@@ -90,7 +91,7 @@ export class OmpCloudIdeMicrovmStack extends cdk.Stack {
     codeArtifact.grantRead(buildRole);
 
     const executionRole = new iam.Role(this, 'MicrovmExecutionRole', {
-      roleName: 'omp-cloud-ide-microvm-execution',
+      roleName: `${NAME_PREFIX}-microvm-execution`,
       assumedBy: new iam.ServicePrincipal('lambda.amazonaws.com'),
       description: 'Runtime role scoped to encrypted Cloud IDE auth state',
     });
@@ -100,7 +101,7 @@ export class OmpCloudIdeMicrovmStack extends cdk.Stack {
     // Guests run with this role instead: no S3 or KMS access, so their MicroVMs
     // can neither restore nor overwrite the admin's OAuth state.
     const guestExecutionRole = new iam.Role(this, 'MicrovmGuestExecutionRole', {
-      roleName: 'omp-cloud-ide-microvm-guest',
+      roleName: `${NAME_PREFIX}-microvm-guest`,
       assumedBy: new iam.ServicePrincipal('lambda.amazonaws.com'),
       description: 'Runtime role for guest MicroVMs; log writes only',
     });
@@ -195,7 +196,7 @@ export class OmpCloudIdeEdgeStack extends cdk.Stack {
     // guests sign in with a password alone; a user whose TOTP is enabled
     // (admin-set-user-mfa-preference) is still challenged for it.
     const userPool = new cognito.UserPool(this, 'UserPool', {
-      userPoolName: 'omp-cloud-ide',
+      userPoolName: NAME_PREFIX,
       featurePlan: cognito.FeaturePlan.ESSENTIALS,
       selfSignUpEnabled: false,
       signInAliases: { email: true },
@@ -437,7 +438,7 @@ export class OmpCloudIdeEdgeStack extends cdk.Stack {
     edgeResponseVersion.applyRemovalPolicy(cdk.RemovalPolicy.RETAIN);
 
     const responseHeadersPolicy = new cloudfront.ResponseHeadersPolicy(this, 'ResponseHeadersPolicy', {
-      responseHeadersPolicyName: 'omp-cloud-ide-security-headers',
+      responseHeadersPolicyName: `${NAME_PREFIX}-security-headers`,
       securityHeadersBehavior: {
         contentSecurityPolicy: {
           contentSecurityPolicy:
@@ -499,7 +500,7 @@ export class OmpCloudIdeEdgeStack extends cdk.Stack {
 
     const distributionUrl = `https://${distribution.distributionDomainName}`;
     const userPoolClient = userPool.addClient('WebClient', {
-      userPoolClientName: 'omp-cloud-ide-edge',
+      userPoolClientName: `${NAME_PREFIX}-edge`,
       // Confidential client: Lambda@Edge exchanges the code server-side.
       generateSecret: true,
       // Only the Managed Login authorization-code flow; no direct password APIs.

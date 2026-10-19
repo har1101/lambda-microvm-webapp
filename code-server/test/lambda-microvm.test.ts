@@ -427,7 +427,7 @@ describe('OMP Cloud IDE infrastructure', () => {
       { logicalId: 'MicrovmImage', name: 'omp-cloud-ide', memory: 2048 },
       { logicalId: 'MicrovmImage4gb', name: 'omp-cloud-ide-4gb', memory: 4096 },
       { logicalId: 'MicrovmImage8gb', name: 'omp-cloud-ide-8gb', memory: 8192 },
-      { logicalId: 'MicrovmImaget32gb', name: 't3-task', memory: 2048 },
+      { logicalId: 'MicrovmImaget32gb', name: 't3poc-task', memory: 2048 },
     ]);
     expect(new Set(images.map((image) => image.artifact)).size).toBe(1);
 
@@ -502,7 +502,7 @@ describe('OMP Cloud IDE infrastructure', () => {
               'arn:aws:lambda:ap-northeast-1:123456789012:microvm-image:omp-cloud-ide',
               'arn:aws:lambda:ap-northeast-1:123456789012:microvm-image:omp-cloud-ide-4gb',
               'arn:aws:lambda:ap-northeast-1:123456789012:microvm-image:omp-cloud-ide-8gb',
-              'arn:aws:lambda:ap-northeast-1:123456789012:microvm-image:t3-task',
+              'arn:aws:lambda:ap-northeast-1:123456789012:microvm-image:t3poc-task',
             ],
           }),
           Match.objectLike({
@@ -512,7 +512,7 @@ describe('OMP Cloud IDE infrastructure', () => {
               'arn:aws:lambda:ap-northeast-1:123456789012:microvm-image:omp-cloud-ide',
               'arn:aws:lambda:ap-northeast-1:123456789012:microvm-image:omp-cloud-ide-4gb',
               'arn:aws:lambda:ap-northeast-1:123456789012:microvm-image:omp-cloud-ide-8gb',
-              'arn:aws:lambda:ap-northeast-1:123456789012:microvm-image:t3-task',
+              'arn:aws:lambda:ap-northeast-1:123456789012:microvm-image:t3poc-task',
             ],
           }),
           Match.objectLike({
@@ -527,7 +527,7 @@ describe('OMP Cloud IDE infrastructure', () => {
               'arn:aws:lambda:ap-northeast-1:123456789012:microvm-image:omp-cloud-ide',
               'arn:aws:lambda:ap-northeast-1:123456789012:microvm-image:omp-cloud-ide-4gb',
               'arn:aws:lambda:ap-northeast-1:123456789012:microvm-image:omp-cloud-ide-8gb',
-              'arn:aws:lambda:ap-northeast-1:123456789012:microvm-image:t3-task',
+              'arn:aws:lambda:ap-northeast-1:123456789012:microvm-image:t3poc-task',
               'arn:aws:lambda:ap-northeast-1:123456789012:microvm:*',
             ],
           }),
@@ -1466,7 +1466,7 @@ describe('OMP Cloud IDE infrastructure', () => {
       expect((await selectPost({ action: 'new', size: 't3-2gb' })).status).toBe('200');
     });
     const run = calls.find((c) => c.name === 'RunMicrovmCommand');
-    expect(run?.input.imageIdentifier).toBe('arn:aws:lambda:ap-northeast-1:123456789012:microvm-image:t3-task');
+    expect(run?.input.imageIdentifier).toBe('arn:aws:lambda:ap-northeast-1:123456789012:microvm-image:t3poc-task');
     expect(run?.input.executionRoleArn).toBe(edgeConfig().GUEST_EXECUTION_ROLE_ARN);
     expect((run?.input.idlePolicy as { maxIdleDurationSeconds: number }).maxIdleDurationSeconds).toBe(28800);
     expect(JSON.parse(String(run?.input.runHookPayload)).authState).toBe(false);

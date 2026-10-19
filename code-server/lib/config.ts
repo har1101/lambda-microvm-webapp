@@ -11,6 +11,9 @@ const EDGE_REGION = 'us-east-1';
 // T3_POC_ONLY=1 deploys only the T3 image (one image build, minimal cost).
 // T3_MAX_DURATION_SEC shortens T3 VM lifetime for the expiry test (default 8h).
 const T3_POC_ONLY = process.env.T3_POC_ONLY === '1';
+// A T3-only PoC deploys as separate stacks/resources (prefix t3-poc) so it never
+// touches an existing OMP Cloud IDE deployment in the same account.
+export const NAME_PREFIX = T3_POC_ONLY ? 't3poc' : 'omp-cloud-ide';
 const T3_MAX_DURATION_SEC = Number(process.env.T3_MAX_DURATION_SEC ?? 28800);
 if (!Number.isInteger(T3_MAX_DURATION_SEC) || T3_MAX_DURATION_SEC < 900 || T3_MAX_DURATION_SEC > 28800) {
   throw new Error('T3_MAX_DURATION_SEC must be an integer between 900 and 28800');
@@ -54,7 +57,7 @@ const IDE_SIZES: Size[] = [
 
 const T3_SIZE: Size = {
   id: 't3-2gb',
-  imageName: 't3-task',
+  imageName: 't3poc-task',
   minimumMemoryInMiB: 2048,
   label: 'T3 task (PoC): t3 serve + Claude Code + Codex, logins in RAM only, 2 GB / 1 vCPU',
   roles: ['admin'],
@@ -65,8 +68,8 @@ export const config = {
   account: ACCOUNT,
   microvmRegion: MICROVM_REGION,
   edgeRegion: EDGE_REGION,
-  microvmStackName: 'OmpCloudIdeMicrovmStack',
-  edgeStackName: 'OmpCloudIdeEdgeStack',
+  microvmStackName: T3_POC_ONLY ? 'T3pocMicrovmStack' : 'OmpCloudIdeMicrovmStack',
+  edgeStackName: T3_POC_ONLY ? 'T3pocEdgeStack' : 'OmpCloudIdeEdgeStack',
   // One MicroVM image per baseline size: RunMicrovm cannot override memory, and
   // disk scales with it (https://docs.aws.amazon.com/lambda/latest/dg/microvms-images.html#microvms-images-sizing).
   // The first entry is the chooser default. Every image builds from the same artifact.
@@ -78,22 +81,22 @@ export const config = {
   baseImageVersion: '1',
   artifactDir: 'artifact/base-image',
   authState: {
-    bucketName: `omp-cloud-ide-auth-${ACCOUNT}-${MICROVM_REGION}`,
+    bucketName: `${NAME_PREFIX}-auth-${ACCOUNT}-${MICROVM_REGION}`,
     prefix: 'personal',
     syncIntervalSeconds: 300,
     noncurrentVersionRetentionDays: 30,
     noncurrentVersionsToRetain: 10,
   },
   edge: {
-    tableName: 'omp-cloud-ide-sessions',
-    authTableName: 'omp-cloud-ide-auth-sessions',
+    tableName: `${NAME_PREFIX}-sessions`,
+    authTableName: `${NAME_PREFIX}-auth-sessions`,
     // Cognito group per role. Users in neither group cannot sign in. Admins get
     // the shared OAuth state and see every session; guests get neither.
     groups: { admin: 'admins', guest: 'guests' },
     // Lambda@Edge cannot read stack outputs or environment variables, so the
     // generated User Pool/Client IDs are published under this stable name.
-    cognitoParameterName: '/omp-cloud-ide/cognito',
-    cognitoDomainPrefix: `omp-cloud-ide-${ACCOUNT}`,
+    cognitoParameterName: `/${NAME_PREFIX}/cognito`,
+    cognitoDomainPrefix: `${NAME_PREFIX}-${ACCOUNT}`,
     accessCookieName: 'omp-cloud-ide-auth',
     accessCookieMaxAgeSec: 28800,
     oauthCookieName: 'omp-cloud-ide-oauth',
@@ -110,8 +113,8 @@ export const imageArn = (imageName: string) =>
   `arn:aws:lambda:${config.microvmRegion}:${config.account}:microvm-image:${imageName}` as const;
 export const imageArns = config.sizes.map((size) => imageArn(size.imageName));
 // Admins: shared OAuth state in S3. Guests: no S3/KMS access at all.
-export const executionRoleArn = `arn:aws:iam::${config.account}:role/omp-cloud-ide-microvm-execution` as const;
-export const guestExecutionRoleArn = `arn:aws:iam::${config.account}:role/omp-cloud-ide-microvm-guest` as const;
+export const executionRoleArn = `arn:aws:iam::${config.account}:role/${NAME_PREFIX}-microvm-execution` as const;
+export const guestExecutionRoleArn = `arn:aws:iam::${config.account}:role/${NAME_PREFIX}-microvm-guest` as const;
 
 export const ingressConnectorArn = (region: string) =>
   `arn:aws:lambda:${region}:aws:network-connector:aws-network-connector:ALL_INGRESS`;
