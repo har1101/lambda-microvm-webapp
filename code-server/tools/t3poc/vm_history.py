@@ -141,13 +141,37 @@ def export_auth_table(con: sqlite3.Connection, table: str) -> dict:
     return {"name": table, "create": create[0], "columns": columns, "rows": exported}
 
 
+def readonly_snapshot(src: Path) -> sqlite3.Connection:
+    # Read the live WAL through SQLite, without requesting a writer/checkpoint
+    # lock. Callers keep BEGIN open through schema validation and row export.
+    con = sqlite3.connect(src.resolve().as_uri() + "?mode=ro", uri=True, timeout=1.0)
+    con.execute("BEGIN")
+    return con
+
+
+def runtime_owner_only(src: Path, rel: str) -> bool:
+    if rel != "t3/userdata/server-owner.sqlite":
+        return False
+    # T3 holds this empty coordination DB EXCLUSIVE for the server lifetime.
+    # Inspect only its committed schema without taking that lock. Never ignore
+    # an uncheckpointed WAL/journal: it might contain an auth schema or rows.
+    for suffix in ("-wal", "-journal"):
+        journal = Path(str(src) + suffix)
+        if journal.exists() and journal.stat().st_size:
+            raise HistoryNotSeparable("owner database has an uncheckpointed journal")
+    con = sqlite3.connect(src.resolve().as_uri() + "?mode=ro&immutable=1", uri=True)
+    try:
+        if any(_is_auth_table(table) for table in _tables(con)):
+            raise HistoryNotSeparable("owner database unexpectedly contains auth tables")
+    finally:
+        con.close()
+    return True
+
+
 def sanitize_sqlite(src: Path, dest: Path) -> list[dict]:
     """Copy non-auth tables to `dest`. Return auth-table payloads for the keychain."""
-    src_con = sqlite3.connect(src)
+    src_con = readonly_snapshot(src)
     try:
-        src_con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        # Validate and copy one read snapshot, even if another process writes.
-        src_con.execute("BEGIN")
         auth: list[dict] = []
         keep: list[str] = []
         for table in _tables(src_con):
@@ -226,9 +250,10 @@ def pairing_only(root: Path) -> dict:
             environment_id = path.read_bytes().decode("utf-8")
             continue
         if path.name.endswith(".sqlite") and not path_excluded(rel):
-            con = sqlite3.connect(path)
+            if runtime_owner_only(path, rel):
+                continue
+            con = readonly_snapshot(path)
             try:
-                con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
                 for table in _tables(con):
                     if _is_auth_table(table):
                         auth_tables.append(export_auth_table(con, table))
@@ -262,6 +287,8 @@ def build_split(root: Path, scratch: Path) -> tuple[bytes, dict]:
             entries.append((rel, environment_id.encode()))
             continue
         if path.name.endswith(".sqlite"):
+            if runtime_owner_only(path, rel):
+                continue
             dest = scratch / (rel.replace("/", "_") + ".sanitized")
             pairing["auth_tables"].extend(sanitize_sqlite(path, dest))
             blob = dest.read_bytes()

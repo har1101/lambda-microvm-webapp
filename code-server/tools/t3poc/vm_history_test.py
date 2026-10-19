@@ -142,6 +142,79 @@ class ExclusionTest(unittest.TestCase):
 
 
 class RegressionTest(ExclusionTest):
+    def test_exclusive_empty_owner_does_not_block_pairing_or_history_emit(self):
+        import contextlib
+        from unittest.mock import patch
+        owner = self.root / 't3/userdata/server-owner.sqlite'
+        lock = sqlite3.connect(owner)
+        lock.execute('VACUUM')
+        lock.execute('PRAGMA locking_mode=EXCLUSIVE')
+        lock.execute('BEGIN EXCLUSIVE')
+        try:
+            bundle = vm_history.pairing_only(self.root)
+            self.assertIn('PAIRING-SECRET', json_tables(bundle))
+            blob, bundle = vm_history.build_split(self.root, self.scratch)
+            self.assertNotIn('t3/userdata/server-owner.sqlite', _tar_names(blob))
+            self.assertIn('PAIRING-SECRET', json_tables(bundle))
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                vm_history._emit(self.root)
+            self.assertIn('T3POC_HISTORY_END', output.getvalue())
+            self.assertIn('T3POC_PAIRING_END', output.getvalue())
+            self.assertNotIn('T3POC_BACKUP_ABORT', output.getvalue())
+        finally:
+            lock.close()
+
+    def test_owner_with_auth_tables_or_uncheckpointed_journal_fails_closed(self):
+        owner = self.root / 't3/userdata/server-owner.sqlite'
+        con = sqlite3.connect(owner)
+        con.execute('CREATE TABLE auth_sessions (credential TEXT)')
+        con.commit(); con.close()
+        for operation in (lambda: vm_history.pairing_only(self.root),
+                          lambda: vm_history.build_split(self.root, self.scratch)):
+            with self.assertRaises(vm_history.HistoryNotSeparable):
+                operation()
+        owner.unlink()
+        con = sqlite3.connect(owner); con.execute('VACUUM'); con.close()
+        Path(str(owner) + '-wal').write_bytes(b'uncheckpointed')
+        with self.assertRaises(vm_history.HistoryNotSeparable):
+            vm_history.pairing_only(self.root)
+
+    def test_wal_auth_rows_export_without_checkpoint_even_with_active_reader(self):
+        db = self.root / 't3/userdata/statev2.sqlite'
+        writer = sqlite3.connect(db)
+        writer.execute('PRAGMA journal_mode=WAL')
+        reader = sqlite3.connect(db)
+        reader.execute('BEGIN')
+        reader.execute('SELECT * FROM auth_sessions').fetchall()
+        writer.execute("INSERT INTO auth_sessions VALUES ('fresh', 'FRESH-PAIRING', '2099')")
+        writer.commit()
+        try:
+            self.assertIn('FRESH-PAIRING', json_tables(vm_history.pairing_only(self.root)))
+            _, bundle = vm_history.build_split(self.root, self.scratch)
+            self.assertIn('FRESH-PAIRING', json_tables(bundle))
+        finally:
+            reader.close(); writer.close()
+
+    def test_locked_auth_database_aborts_without_partial_emit(self):
+        import contextlib
+        from unittest.mock import patch
+        db = self.root / 't3/userdata/statev2.sqlite'
+        lock = sqlite3.connect(db)
+        lock.execute('BEGIN EXCLUSIVE')
+        try:
+            with self.assertRaises(sqlite3.OperationalError):
+                vm_history.pairing_only(self.root)
+            output = io.StringIO()
+            with patch.object(vm_history, 'Path', return_value=self.root), contextlib.redirect_stdout(output):
+                status = vm_history.main(['vm_history.py', 'emit'])
+            self.assertEqual(status, 2)
+            self.assertIn('T3POC_BACKUP_ABORT', output.getvalue())
+            self.assertNotIn('T3POC_PAIRING_B64', output.getvalue())
+            self.assertNotIn('T3POC_HISTORY_B64', output.getvalue())
+        finally:
+            lock.close()
+
     def test_real_environment_id_line_ending_roundtrips_with_pairing_and_history(self):
         for ending in ("", "\n", "\r\n"):
             original = ("env-123" + ending).encode()
