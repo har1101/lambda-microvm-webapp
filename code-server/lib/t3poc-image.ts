@@ -11,6 +11,18 @@ export function assembleT3pocImage(baseDir: string, overlayDir: string, outputDi
     recursive: true,
     filter: (src) => path.basename(src) !== '__pycache__' && !src.endsWith('.pyc'),
   });
+  const wip = path.join(overlayDir, 'autopush.py');
+  if (fs.existsSync(wip)) {
+    fs.copyFileSync(wip, path.join(outputDir, 'autopush.py'));
+    const startup = path.join(outputDir, 'start-cloud-ide.sh');
+    fs.writeFileSync(
+      startup,
+      fs
+        .readFileSync(startup, 'utf8')
+        .replace('python3 /opt/cloud-ide/autopush.py &', '/usr/local/bin/python3.14 /opt/cloud-ide/autopush.py &')
+        .replace('python3 /opt/cloud-ide/lifecycle.py &', '/usr/local/bin/python3.14 /opt/cloud-ide/lifecycle.py &'),
+    );
+  }
   const snippet = fs.readFileSync(path.join(overlayDir, 'python.dockerfile'), 'utf8').trim();
   const dockerfilePath = path.join(outputDir, 'Dockerfile');
   const base = fs.readFileSync(dockerfilePath, 'utf8');
