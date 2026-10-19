@@ -231,6 +231,79 @@ class RegressionTest(ExclusionTest):
             vm_history.build_split(self.root, self.scratch)
 
 
+    def _scheduled_tasks(self, token=None, secret=None):
+        con = sqlite3.connect(self.root / 't3/userdata/statev2.sqlite')
+        con.execute('CREATE TABLE scheduled_tasks (id TEXT PRIMARY KEY, prompt TEXT, webhook_token TEXT, webhook_secret TEXT)')
+        con.execute('INSERT INTO scheduled_tasks VALUES (?, ?, ?, ?)', ('task', 'synthetic task', token, secret))
+        con.commit(); con.close()
+
+    def test_nullable_webhook_schema_preserves_threads_without_secrets(self):
+        self._scheduled_tasks()
+        blob, pairing = vm_history.build_split(self.root, self.scratch)
+        vm_history.check_tar(blob)
+        with tarfile.open(fileobj=io.BytesIO(blob)) as archive:
+            data = archive.extractfile('t3/userdata/statev2.sqlite').read()
+        con = sqlite3.connect(':memory:'); con.deserialize(data)
+        self.assertGreater(con.execute('SELECT count(*) FROM projection_threads').fetchone()[0], 0)
+        self.assertEqual(con.execute('SELECT webhook_token, webhook_secret FROM scheduled_tasks').fetchone(), (None,None))
+        con.close()
+
+    def test_configured_webhook_token_blocks_history_even_without_known_markers(self):
+        self._scheduled_tasks(token='dummy-opaque-webhook')
+        with self.assertRaises(vm_history.HistoryNotSeparable):
+            vm_history.build_split(self.root, self.scratch)
+
+    def test_configured_webhook_secret_blocks_history_even_without_known_markers(self):
+        self._scheduled_tasks(secret='dummy-opaque-signing-key')
+        with self.assertRaises(vm_history.HistoryNotSeparable):
+            vm_history.build_split(self.root, self.scratch)
+
+    def test_incoming_archive_with_webhook_secret_is_rejected(self):
+        self._scheduled_tasks(secret='dummy-opaque-signing-key')
+        buffer = io.BytesIO()
+        with tarfile.open(fileobj=buffer,mode='w') as archive:
+            data = (self.root / 't3/userdata/statev2.sqlite').read_bytes()
+            entry = tarfile.TarInfo('t3/userdata/statev2.sqlite'); entry.size = len(data)
+            archive.addfile(entry,io.BytesIO(data))
+        with self.assertRaises(vm_history.HistoryNotSeparable):
+            vm_history.check_tar(buffer.getvalue())
+
+    def test_unknown_nullable_secret_column_still_blocks_history(self):
+        con = sqlite3.connect(self.root / 't3/userdata/statev2.sqlite')
+        con.execute('CREATE TABLE unknown_config (secret TEXT)'); con.commit(); con.close()
+        with self.assertRaises(vm_history.HistoryNotSeparable):
+            vm_history.build_split(self.root, self.scratch)
+
+
+    def test_webhook_secret_default_is_not_exported_even_with_no_rows(self):
+        con = sqlite3.connect(self.root / 't3/userdata/statev2.sqlite')
+        con.execute("CREATE TABLE scheduled_tasks (webhook_token TEXT DEFAULT 'dummy-opaque-default', webhook_secret TEXT)")
+        con.commit(); con.close()
+        with self.assertRaises(vm_history.HistoryNotSeparable):
+            vm_history.build_split(self.root, self.scratch)
+
+    def test_concurrent_webhook_write_cannot_enter_validated_snapshot(self):
+        from unittest.mock import patch
+        self._scheduled_tasks()
+        db = self.root / 't3/userdata/statev2.sqlite'
+        con = sqlite3.connect(db); con.execute('PRAGMA journal_mode=WAL'); con.close()
+        original = vm_history.assert_secret_columns_empty
+        changed = False
+        def race(con, table):
+            nonlocal changed
+            original(con, table)
+            if table == 'scheduled_tasks' and not changed:
+                writer = sqlite3.connect(db)
+                writer.execute("UPDATE scheduled_tasks SET webhook_token='dummy-concurrent-secret'")
+                writer.commit(); writer.close(); changed = True
+        with patch.object(vm_history, 'assert_secret_columns_empty', side_effect=race):
+            vm_history.sanitize_sqlite(db, self.tmp / 'copy.sqlite')
+        copy = sqlite3.connect(self.tmp / 'copy.sqlite')
+        self.assertEqual(copy.execute('SELECT webhook_token FROM scheduled_tasks').fetchone(), (None,))
+        copy.close()
+        self.assertTrue(changed)
+
+
 def json_tables(pairing: dict) -> str:
     return str(pairing["auth_tables"])
 
