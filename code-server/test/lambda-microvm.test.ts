@@ -427,6 +427,7 @@ describe('OMP Cloud IDE infrastructure', () => {
       { logicalId: 'MicrovmImage', name: 'omp-cloud-ide', memory: 2048 },
       { logicalId: 'MicrovmImage4gb', name: 'omp-cloud-ide-4gb', memory: 4096 },
       { logicalId: 'MicrovmImage8gb', name: 'omp-cloud-ide-8gb', memory: 8192 },
+      { logicalId: 'MicrovmImaget32gb', name: 't3poc-task', memory: 2048 },
     ]);
     expect(new Set(images.map((image) => image.artifact)).size).toBe(1);
 
@@ -501,6 +502,7 @@ describe('OMP Cloud IDE infrastructure', () => {
               'arn:aws:lambda:ap-northeast-1:123456789012:microvm-image:omp-cloud-ide',
               'arn:aws:lambda:ap-northeast-1:123456789012:microvm-image:omp-cloud-ide-4gb',
               'arn:aws:lambda:ap-northeast-1:123456789012:microvm-image:omp-cloud-ide-8gb',
+              'arn:aws:lambda:ap-northeast-1:123456789012:microvm-image:t3poc-task',
             ],
           }),
           Match.objectLike({
@@ -510,6 +512,7 @@ describe('OMP Cloud IDE infrastructure', () => {
               'arn:aws:lambda:ap-northeast-1:123456789012:microvm-image:omp-cloud-ide',
               'arn:aws:lambda:ap-northeast-1:123456789012:microvm-image:omp-cloud-ide-4gb',
               'arn:aws:lambda:ap-northeast-1:123456789012:microvm-image:omp-cloud-ide-8gb',
+              'arn:aws:lambda:ap-northeast-1:123456789012:microvm-image:t3poc-task',
             ],
           }),
           Match.objectLike({
@@ -524,6 +527,7 @@ describe('OMP Cloud IDE infrastructure', () => {
               'arn:aws:lambda:ap-northeast-1:123456789012:microvm-image:omp-cloud-ide',
               'arn:aws:lambda:ap-northeast-1:123456789012:microvm-image:omp-cloud-ide-4gb',
               'arn:aws:lambda:ap-northeast-1:123456789012:microvm-image:omp-cloud-ide-8gb',
+              'arn:aws:lambda:ap-northeast-1:123456789012:microvm-image:t3poc-task',
               'arn:aws:lambda:ap-northeast-1:123456789012:microvm:*',
             ],
           }),
@@ -1454,6 +1458,48 @@ describe('OMP Cloud IDE infrastructure', () => {
         expect((await forward()).headers.cookie).toBeUndefined();
       },
     );
+  });
+
+  test('T3 PoC: admin T3 VMs get the guest role, authState=false, long idle and the T3 lifetime', async () => {
+    const table = sessionTableMock();
+    const { calls } = await withAwsMocks({ ...table.overrides, GetMicrovmCommand: runningMicrovm }, async () => {
+      expect((await selectPost({ action: 'new', size: 't3-2gb' })).status).toBe('200');
+    });
+    const run = calls.find((c) => c.name === 'RunMicrovmCommand');
+    expect(run?.input.imageIdentifier).toBe('arn:aws:lambda:ap-northeast-1:123456789012:microvm-image:t3poc-task');
+    expect(run?.input.executionRoleArn).toBe(edgeConfig().GUEST_EXECUTION_ROLE_ARN);
+    expect((run?.input.idlePolicy as { maxIdleDurationSeconds: number }).maxIdleDurationSeconds).toBe(28800);
+    expect(JSON.parse(String(run?.input.runHookPayload)).authState).toBe(false);
+  });
+
+  test('T3 PoC: in-VM shim restores the client loopback Host for T3 DPoP/Origin checks', () => {
+    const shim = require('../artifact/base-image/t3-shim.cjs') as {
+      rewriteHeaders: (raw: string[]) => [string, string][];
+    };
+    const out = shim.rewriteHeaders([
+      'Host',
+      'mvm-1.lambda-microvm.ap-northeast-1.on.aws',
+      'X-T3poc-Host',
+      '127.0.0.1:8787',
+      'X-aws-proxy-auth',
+      'secret',
+      'Origin',
+      'http://127.0.0.1:8787',
+    ]);
+    expect(out).toEqual([
+      ['Host', '127.0.0.1:8787'],
+      ['Origin', 'http://127.0.0.1:8787'],
+    ]);
+    // A non-loopback X-T3poc-Host is ignored (the endpoint Host stays).
+    expect(shim.rewriteHeaders(['Host', 'mvm-1.example', 'X-T3poc-Host', 'evil.example:443'])).toEqual([
+      ['Host', 'mvm-1.example'],
+    ]);
+  });
+
+  test('T3 PoC: autopush never pushes main and skips without a token (test/autopush_test.py)', () => {
+    const result = spawnSync('python3', [path.join(__dirname, 'autopush_test.py')], { encoding: 'utf8' });
+    expect(`${result.stderr}`).toMatch(/\nOK\s*$/);
+    expect(result.status).toBe(0);
   });
 
   test('lifecycle.py persistence and run hook behave as specified (test/lifecycle_test.py)', () => {

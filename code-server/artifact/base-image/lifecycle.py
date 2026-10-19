@@ -16,6 +16,7 @@ import socket
 import sqlite3
 import sys
 import tempfile
+import subprocess
 import threading
 import time
 import urllib.parse
@@ -590,6 +591,24 @@ def run_hook(name: str, action) -> None:
                 hook_waiting.clear()
 
 
+def t3_wip_push(trigger: str) -> None:
+    """T3 task VMs: one best-effort WIP push before suspend/terminate (fail-open).
+
+    The 15-minute WIP loop in autopush.py is the real safety net; this hook is
+    bounded well inside the 45 s hook timeout and never blocks the hook.
+    """
+    if os.environ.get("CLOUD_IDE_KIND") != "t3":
+        return
+    try:
+        subprocess.run(
+            [sys.executable, str(Path(__file__).with_name("autopush.py")), "--once", "wip"],
+            timeout=float(os.environ.get("T3_HOOK_PUSH_TIMEOUT", "30")),
+            capture_output=True,
+        )
+    except Exception as error:  # noqa: BLE001 - fail-open
+        log(f"{trigger} WIP push failed: {type(error).__name__}")
+
+
 class HookHandler(BaseHTTPRequestHandler):
     server_version = "omp-cloud-ide-hooks/1"
 
@@ -613,6 +632,7 @@ class HookHandler(BaseHTTPRequestHandler):
 
         for name in ("suspend", "terminate"):
             if self.path == f"{HOOK_PREFIX}/{name}":
+                t3_wip_push(name)
                 run_hook(name, lambda deadline, trigger=name: persist_state(trigger, deadline, wait_for_lock=True))
                 self.respond(200)
                 return

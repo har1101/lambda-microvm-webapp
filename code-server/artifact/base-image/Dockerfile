@@ -13,6 +13,10 @@ ARG GH_ARM64_TAR_SHA256=06f86ec7103d41993b76cd78072f43595c34aaa56506d971d9860e67
 ARG AWS_CLI_VERSION=2.34.45
 ARG AWS_CLI_ARM64_ZIP_SHA256=bf29e06a06fb9bac2a3803931e6618a9f7c9f4c6632ec3b587184850b8f03433
 ARG NODE_VERSION=24.21.0
+# T3 PoC agents (pinned; arm64 builds verified on npm: @t3code/t3-linux-arm64).
+ARG CLAUDE_CODE_VERSION=2.1.303
+ARG CODEX_VERSION=0.163.0
+ARG T3_VERSION=0.1.0
 ARG NODE_ARM64_TAR_SHA256=6ad1325edbdb5649c379b75a237147a666c95d4f9ae8d340fef2d1575d289ad2
 ARG UV_VERSION=0.12.18
 ARG UV_ARM64_TAR_SHA256=afb6291f3f0a6b4521fc67b947822506c41dde5b60d2189dd8f3695b2ac8c9e7
@@ -61,6 +65,10 @@ RUN curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-l
       "pyright@1.1.414" \
       "bash-language-server@5.8.1" \
       "yaml-language-server@1.24.0" \
+      "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
+      "@openai/codex@${CODEX_VERSION}" \
+      "t3@${T3_VERSION}" \
+    && t3 --version && claude --version && codex --version \
     && npm cache clean --force
 
 RUN curl -fsSL "https://github.com/oven-sh/bun/releases/download/bun-v${BUN_VERSION}/bun-linux-aarch64.zip" \
@@ -146,6 +154,10 @@ COPY omp-cloud-ide-controls ${EXTENSIONS_DIR}/har1101.omp-cloud-ide-controls-0.1
 COPY lifecycle.py /opt/cloud-ide/lifecycle.py
 COPY start-cloud-ide.sh /usr/local/bin/start-cloud-ide
 COPY persist-auth-state /usr/local/bin/persist-auth-state
+COPY autopush.py /opt/cloud-ide/autopush.py
+COPY t3-shim.cjs /opt/cloud-ide/t3-shim.cjs
+COPY git-credential-shm /usr/local/bin/git-credential-shm
+COPY gh-token-login /usr/local/bin/gh-token-login
 
 COPY extensions.txt /tmp/extensions.txt
 RUN while IFS= read -r ext || [ -n "$ext" ]; do \
@@ -157,10 +169,18 @@ RUN while IFS= read -r ext || [ -n "$ext" ]; do \
 RUN echo '{"locale":"ja"}' > ${USER_DATA_DIR}/User/argv.json \
     && git config --system credential.https://github.com.helper '!gh auth git-credential' \
     && chmod 0755 /usr/local/bin/start-cloud-ide /usr/local/bin/persist-auth-state /opt/cloud-ide/lifecycle.py \
+      /opt/cloud-ide/autopush.py /usr/local/bin/git-credential-shm /usr/local/bin/gh-token-login \
+    && echo 'if [ -s /dev/shm/gh-token ]; then export GH_TOKEN="$(cat /dev/shm/gh-token)"; fi' >> /etc/bashrc \
     && chown -R vscode:vscode ${HOME}
 
 EXPOSE 8080 9000
 
 USER vscode
+
+# t3poc: commit identity + gh for *.ghe.com (gh needs GH_TOKEN, not GH_ENTERPRISE_TOKEN; token is RAM-only in /dev/shm)
+RUN git config --global user.name haruki-fukuchi \
+    && git config --global user.email haruki-fukuchi@nec.com \
+    && printf '%s\n' 'export GH_HOST=ai-native-factory-ltd.ghe.com' \
+      'if [ -s /dev/shm/gh-token ]; then export GH_TOKEN="$(cat /dev/shm/gh-token)"; fi' >> ${HOME}/.bashrc
 
 CMD ["/usr/local/bin/start-cloud-ide"]

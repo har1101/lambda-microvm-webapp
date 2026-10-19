@@ -13,12 +13,14 @@ const microvmStack = new OmpCloudIdeMicrovmStack(app, config.microvmStackName, {
   description: 'Tokyo-region Lambda MicroVM image and encrypted OAuth state',
 });
 
-const edgeStack = new OmpCloudIdeEdgeStack(app, config.edgeStackName, {
-  env: {
-    account: config.account,
-    region: config.edgeRegion,
-  },
-  description: 'CloudFront, Lambda@Edge authentication, and IDE session control plane',
-});
+if (config.deployEdge) {
+  const edgeStack = new OmpCloudIdeEdgeStack(app, config.edgeStackName, {
+    env: {
+      account: config.account,
+      region: config.edgeRegion,
+    },
+    description: 'CloudFront, Lambda@Edge authentication, and IDE session control plane',
+  });
 
-edgeStack.addStackDependency(microvmStack);
+  edgeStack.addStackDependency(microvmStack);
+}

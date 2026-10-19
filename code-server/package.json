@@ -19,7 +19,11 @@
     "bootstrap": "cdkd bootstrap --region ap-northeast-1 && cdkd bootstrap --region us-east-1",
     "lint": "biome lint .",
     "format": "biome format --write .",
-    "check": "biome check --write ."
+    "check": "biome check --write .",
+    "t3poc:bootstrap": "A=$(aws sts get-caller-identity --query Account --output text) && cdkd bootstrap --region ap-northeast-1 --state-bucket t3poc-cdkd-state-$A --asset-bucket t3poc-cdkd-assets-$A-ap-northeast-1 --container-repo t3poc-cdkd-container-assets-$A-ap-northeast-1",
+    "t3poc:diff": "export T3_POC_ONLY=1 AWS_REGION=ap-northeast-1 CDKD_STATE_BUCKET=t3poc-cdkd-state-$(aws sts get-caller-identity --query Account --output text) && cdkd diff T3pocMicrovmStack --state-bucket $CDKD_STATE_BUCKET",
+    "t3poc:deploy": "export T3_POC_ONLY=1 AWS_REGION=ap-northeast-1 CDKD_STATE_BUCKET=t3poc-cdkd-state-$(aws sts get-caller-identity --query Account --output text) && cdkd deploy T3pocMicrovmStack --full-wait --state-bucket $CDKD_STATE_BUCKET",
+    "t3poc:destroy": "export T3_POC_ONLY=1 AWS_REGION=ap-northeast-1 CDKD_STATE_BUCKET=t3poc-cdkd-state-$(aws sts get-caller-identity --query Account --output text) && cdkd destroy T3pocMicrovmStack --state-bucket $CDKD_STATE_BUCKET"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.5.1",
