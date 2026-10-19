@@ -475,7 +475,7 @@ function productionDeps(opts) {
     holdMs: 120_000,
     readState,
     writeState,
-    log: (message) => console.log(message),
+    log: (message) => console.log(`${new Date().toISOString()} ${message}`),
     keychain: (service) => macKeychain(service),
     async accountId() {
       const identity = await new STSClient({ region: REGION }).send(new GetCallerIdentityCommand({}));
@@ -604,14 +604,16 @@ export function createConnectionProvider(api, getToken) {
   return () => api.exclusive(async () => ({ endpoint: api.session.endpoint, token: await getToken() }));
 }
 
-async function relay(api, opts) {
+export async function relay(api, opts, transport = {}) {
   const port = Number(opts.port ?? 8787);
-  const getToken = createProxyTokenCache(() => api.session);
+  const getToken = transport.getToken ?? createProxyTokenCache(() => api.session);
   const timer = setInterval(() => {
     api.tick().catch((error) => api.log(error.message));
   }, 15_000);
   timer.unref?.();
   const server = createRelay({
+    request: transport.request,
+    connect: transport.connect,
     clientHost: `127.0.0.1:${port}`,
     ensureReady: async () => {
       api.session.inflight += 1;
@@ -633,9 +635,11 @@ async function relay(api, opts) {
     getToken,
     getConnection: createConnectionProvider(api, getToken),
   });
+  server.once('close', () => clearInterval(timer));
   server.listen(port, '127.0.0.1', () => {
     api.log(`relay: http://127.0.0.1:${port} (lazy; first request boots the MicroVM); Ctrl+C to stop`);
   });
+  return server;
 }
 
 export function pairingScript(cmd) {
