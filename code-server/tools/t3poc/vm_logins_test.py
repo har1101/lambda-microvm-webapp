@@ -43,6 +43,22 @@ class LoginTest(unittest.TestCase):
         files=fixture('claude');files['.claude.json']=b'{"hasCompletedOnboarding":false}'
         with self.assertRaises(login.LoginRejected): login.minimal_files('claude',files)
 
+    def test_claude_oauth_before_interactive_onboarding_roundtrips(self):
+        for onboarding in (None, False, True):
+            files = fixture('claude')
+            state = {'oauthAccount': {'accountUuid': 'synthetic-account'}}
+            if onboarding is not None:
+                state['hasCompletedOnboarding'] = onboarding
+            files['.claude.json'] = login.json_bytes(state)
+            root = self.root / str(onboarding)
+            root.mkdir()
+            blob = login.pack(login.minimal_files('claude', files))
+            login.extract_login(root, blob, {root}, 'claude')
+            self.assertEqual(login.snapshot('claude', root), blob)
+            self.assertEqual(login.object_json((root / '.claude.json').read_bytes()), state)
+        files['.claude.json'] = login.json_bytes({**state, 'hasCompletedOnboarding': 'true'})
+        with self.assertRaises(login.LoginRejected): login.minimal_files('claude', files)
+
     def test_tar_slip_links_duplicates_and_oversize(self):
         for name, type_ in [('../auth.json',tarfile.REGTYPE),('/auth.json',tarfile.REGTYPE),('auth.json',tarfile.SYMTYPE),('auth.json',tarfile.LNKTYPE)]:
             buf=io.BytesIO()

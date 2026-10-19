@@ -59,7 +59,11 @@ def minimal_files(kind, files):
         raise LoginRejected()
     state = object_json(files['.claude.json'])
     account = state.get('oauthAccount')
-    if state.get('hasCompletedOnboarding') is not True or not isinstance(account, dict) or not nonempty(account.get('accountUuid')):
+    if not isinstance(account, dict) or not nonempty(account.get('accountUuid')):
+        raise LoginRejected()
+    # Headless OAuth login can succeed before interactive onboarding completes.
+    # Preserve its actual value (or absence), rather than inventing completion.
+    if 'hasCompletedOnboarding' in state and not isinstance(state['hasCompletedOnboarding'], bool):
         raise LoginRejected()
     minimal = {key: state[key] for key in STATE_KEYS if key in state}
     minimal['oauthAccount'] = {key: account[key] for key in ACCOUNT_KEYS if key in account}
