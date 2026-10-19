@@ -69,7 +69,7 @@ def path_excluded(rel: str) -> bool:
     lowered = name.lower()
     if any(part in lowered for part in SECRET_NAME_PARTS):
         return True
-    if lowered.endswith((".sqlite-wal", ".sqlite-shm", ".db-wal", ".db-shm")):
+    if lowered.endswith((".sqlite-wal", ".sqlite-shm", ".db-wal", ".db-shm", ".sqlite-journal", ".db-journal")):
         return True
     return False
 
@@ -158,6 +158,18 @@ def runtime_owner_only(src: Path, rel: str) -> bool:
     for suffix in ("-wal", "-journal"):
         journal = Path(str(src) + suffix)
         if journal.exists() and journal.stat().st_size:
+            # On a fresh server T3 holds an uncommitted coordination-table
+            # creation: zero-byte DB + SQLite's 512-byte initial rollback
+            # header. There are no committed pages/auth tables to lose. A hot
+            # journal, records, previous pages, or any WAL still fails closed.
+            if suffix == "-journal" and src.stat().st_size == 0 and journal.stat().st_size == 512:
+                with journal.open("rb") as stream:
+                    header = stream.read(28)
+                if (len(header) == 28 and header[:12] == bytes(12)
+                        and header[16:20] == bytes(4)
+                        and int.from_bytes(header[20:24], "big") == 512
+                        and int.from_bytes(header[24:28], "big") in (512, 1024, 2048, 4096, 8192, 16384, 32768, 65536)):
+                    continue
             raise HistoryNotSeparable("owner database has an uncheckpointed journal")
     con = sqlite3.connect(src.resolve().as_uri() + "?mode=ro&immutable=1", uri=True)
     try:
