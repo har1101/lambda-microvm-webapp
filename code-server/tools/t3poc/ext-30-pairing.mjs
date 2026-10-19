@@ -53,7 +53,8 @@ export function register(api) {
     let previous = null;
     try {
       previous = JSON.parse((await keychain.get(PAIRING_ACCOUNT)).toString('utf8'));
-    } catch {
+    } catch (error) {
+      if (error.code !== 'KEYCHAIN_NOT_FOUND') throw error;
       previous = null;
     }
     if (!shouldReplace(previous, bundle)) {
@@ -68,7 +69,8 @@ export function register(api) {
     let raw = null;
     try {
       raw = await keychain.get(PAIRING_ACCOUNT);
-    } catch {
+    } catch (error) {
+      if (error.code !== 'KEYCHAIN_NOT_FOUND') throw error;
       raw = null;
     }
     if (!raw) return;
@@ -90,7 +92,8 @@ export function register(api) {
     let has = false;
     try {
       has = Boolean(await keychain.get(PAIRING_ACCOUNT));
-    } catch {
+    } catch (error) {
+      if (error.code !== 'KEYCHAIN_NOT_FOUND') throw error;
       has = false;
     }
     if (has) return;

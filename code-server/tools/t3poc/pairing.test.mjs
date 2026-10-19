@@ -63,3 +63,64 @@ test('pairing snapshot failure is a warning after WIP and does not block safe te
   await stop(api);
   assert.deepEqual(order, ['wip', 'pairing', 'terminate']);
 });
+
+test('transient Keychain read failure cannot overwrite or skip existing pairing', async () => {
+  const { register } = await import('./ext-30-pairing.mjs');
+  let writes = 0,
+    mints = 0;
+  const api = {
+    deps: {
+      keychain: () => ({
+        get: async () => {
+          throw Error('temporarily unavailable');
+        },
+        set: async () => {
+          writes++;
+        },
+      }),
+      mintPairing: async () => {
+        mints++;
+      },
+    },
+    hooks: { prepareDisk: [], onVmReady: [], beforeSwap: [], beforeStop: [], onTick: [] },
+    flags: {},
+    log() {},
+  };
+  register(api);
+  await assert.rejects(() => api.savePairing({ auth_tables: [] }), /temporarily unavailable/);
+  await assert.rejects(() => api.hooks.prepareDisk[0](api), /temporarily unavailable/);
+  await assert.rejects(() => api.hooks.onVmReady[0](api), /temporarily unavailable/);
+  assert.equal(writes, 0);
+  assert.equal(mints, 0);
+});
+test('only explicit missing Keychain item allows initial pairing save and mint', async () => {
+  const { register } = await import('./ext-30-pairing.mjs');
+  let writes = 0,
+    mints = 0;
+  const api = {
+    deps: {
+      keychain: () => ({
+        get: async () => {
+          const e = Error('missing');
+          e.code = 'KEYCHAIN_NOT_FOUND';
+          throw e;
+        },
+        set: async () => {
+          writes++;
+        },
+      }),
+      mintPairing: async () => {
+        mints++;
+      },
+    },
+    hooks: { prepareDisk: [], onVmReady: [], beforeSwap: [], beforeStop: [], onTick: [] },
+    flags: {},
+    log() {},
+  };
+  register(api);
+  await api.savePairing({ auth_tables: [] });
+  await api.hooks.prepareDisk[0](api);
+  await api.hooks.onVmReady[0](api);
+  assert.equal(writes, 1);
+  assert.equal(mints, 1);
+});
