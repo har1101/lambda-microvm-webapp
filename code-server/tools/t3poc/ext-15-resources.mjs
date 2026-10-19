@@ -17,7 +17,7 @@ export function resourceScript({ clean = false, extra = null, catalog = false } 
         : `require_space(root, ${extra})`;
   const program = `${SOURCE}\nimport json\nroot = Path('/dev/shm')\n${action}\nprint('T3POC_RAM ' + json.dumps(usage(root)))`;
   const encoded = Buffer.from(program).toString('base64');
-  return `${VM_PYTHON} -c "import base64; exec(base64.b64decode('${encoded}'))" && echo T3POC_RAM_OK\necho ${SHELL_DONE}\n`;
+  return `#${'resource-transfer '.repeat(1300)}\n${VM_PYTHON} -c "import base64; exec(base64.b64decode('${encoded}'))" && echo T3POC_RAM_OK\necho ${SHELL_DONE}\n`;
 }
 
 export function register(api) {
@@ -36,13 +36,20 @@ export function register(api) {
   let sampledAt = -Infinity;
   const configure = async (runtime) => {
     if (configuredFor === runtime.session.microvmId) return;
-    const policy = await shell({ script: resourceScript({ catalog: true }) });
-    if (!policy.includes('T3POC_RAM_OK')) throw new Error('Codex remote catalog policy failed');
     const stopped = await shell({ script: STOP_T3 });
     if (!stopped.includes('T3POC_T3_STOPPED')) throw new Error('T3 resource policy could not stop server');
     runtime.flags.t3Stopped = true;
-    const cleaned = await shell({ script: resourceScript({ clean: true }) });
-    if (!cleaned.includes('T3POC_RAM_OK')) throw new Error('T3 resource log cleanup failed');
+    try {
+      const policy = await shell({ script: resourceScript({ catalog: true }) });
+      if (!policy.includes('T3POC_RAM_OK')) throw new Error('Codex remote catalog policy failed');
+      const cleaned = await shell({ script: resourceScript({ clean: true }) });
+      if (!cleaned.includes('T3POC_RAM_OK')) throw new Error('T3 resource log cleanup failed');
+    } catch (error) {
+      const restarted = await shell({ script: RESOURCE_START });
+      if (!restarted.includes('T3POC_T3_STARTED')) throw new Error('T3 resource policy recovery failed');
+      runtime.flags.t3Stopped = false;
+      throw error;
+    }
     configuredFor = runtime.session.microvmId;
   };
   api.hooks.prepareDisk.push(configure);
