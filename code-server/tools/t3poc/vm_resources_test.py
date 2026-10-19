@@ -4,6 +4,8 @@ import io
 import os
 import re
 import tempfile
+import shutil
+import tomllib
 import types
 import unittest
 from pathlib import Path
@@ -47,6 +49,34 @@ class Resources(unittest.TestCase):
         self.assertEqual(auth.read_bytes(), b'synthetic-original')
         (logs/'server.trace.ndjson').symlink_to(auth)
         with self.assertRaises(ValueError): resources.clean_logs(self.root)
+        self.assertEqual(auth.read_bytes(), b'synthetic-original')
+
+    def test_real_codex_disables_catalog_and_preserves_auth_history_and_other_config(self):
+        self.assertIsNotNone(shutil.which('codex'))
+        codex = self.root / 'codex'; codex.mkdir()
+        (codex / 'config.toml').write_text('model = "gpt-6.1-sol"\n[features]\nremote_plugin = true\n')
+        for name in ['auth.json', 'sessions/history.jsonl', 'cache/remote_plugin_catalog/keep.json']:
+            path = codex / name; path.parent.mkdir(parents=True, exist_ok=True); path.write_bytes(b'synthetic-original')
+        resources.disable_remote_catalog(self.root)
+        config = tomllib.loads((codex / 'config.toml').read_text())
+        self.assertFalse(config['features']['remote_plugin'])
+        self.assertEqual(config['model'], 'gpt-6.1-sol')
+        for name in ['auth.json', 'sessions/history.jsonl', 'cache/remote_plugin_catalog/keep.json']:
+            self.assertEqual((codex / name).read_bytes(), b'synthetic-original')
+        resources.disable_remote_catalog(self.root)
+        self.assertFalse(tomllib.loads((codex / 'config.toml').read_text())['features']['remote_plugin'])
+
+    def test_catalog_policy_rejects_links_before_invoking_codex(self):
+        codex = self.root / 'codex'; codex.mkdir()
+        auth = codex / 'auth.json'; auth.write_bytes(b'synthetic-original')
+        config = codex / 'config.toml'; config.symlink_to(auth)
+        with patch('vm_resources.subprocess.run') as run:
+            with self.assertRaises(OSError): resources.disable_remote_catalog(self.root)
+            run.assert_not_called()
+        config.unlink(); os.link(auth, config)
+        with patch('vm_resources.subprocess.run') as run:
+            with self.assertRaises(ValueError): resources.disable_remote_catalog(self.root)
+            run.assert_not_called()
         self.assertEqual(auth.read_bytes(), b'synthetic-original')
 
     def failing_fdopen(self):
