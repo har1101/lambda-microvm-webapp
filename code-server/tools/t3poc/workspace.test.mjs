@@ -132,3 +132,69 @@ test('S3 write failure restarts old T3 and does not report backup success', asyn
   );
   assert.deepEqual(calls, ['stop', 'upload', 'start']);
 });
+
+test('workspace restore clones the base, stops T3 for pending linked worktrees, then restarts T3', async () => {
+  const { cloneRepos } = await import('./workspace.mjs');
+  const { STOP_T3, START_T3 } = await import('./vm-shell.mjs');
+  for (const fail of [false, true]) {
+    const calls = [];
+    const task = cloneRepos({
+      deps: {
+        repos: 'org/repo',
+        shell: async ({ script }) => {
+          if (script === STOP_T3) {
+            calls.push('stop');
+            return 'T3POC_T3_STOPPED';
+          }
+          if (script === START_T3) {
+            calls.push('start');
+            return 'T3POC_T3_STARTED';
+          }
+          if (script.includes('gh repo clone')) {
+            calls.push('clone');
+            return 'T3POC_CLONE_OK';
+          }
+          if (!calls.includes('probe')) {
+            calls.push('probe');
+            return 'T3POC_WORKTREES_PENDING';
+          }
+          calls.push('restore');
+          assert.match(script, / restore/);
+          return fail ? 'T3POC_BACKUP_ABORT' : 'T3POC_WORKTREES_OK';
+        },
+      },
+      log() {},
+    });
+    if (fail) await assert.rejects(task, /worktree restore failed/);
+    else await task;
+    assert.deepEqual(calls, ['clone', 'probe', 'stop', 'restore', 'start']);
+  }
+});
+
+test('real git worktrees survive loss of the base checkout and RAM', () => {
+  const result = spawnSync('python3.14', ['-m', 'unittest', 'vm_worktrees_test'], {
+    encoding: 'utf8',
+    timeout: 300_000,
+  });
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+});
+
+test('reattaching without pending worktrees leaves the running T3 process alone', async () => {
+  const { cloneRepos } = await import('./workspace.mjs');
+  const calls = [];
+  await cloneRepos({
+    deps: {
+      repos: 'org/repo',
+      shell: async ({ script }) => {
+        if (script.includes('gh repo clone')) {
+          calls.push('clone');
+          return 'T3POC_CLONE_OK';
+        }
+        calls.push('probe');
+        return 'T3POC_WORKTREES_NONE';
+      },
+    },
+    log() {},
+  });
+  assert.deepEqual(calls, ['clone', 'probe']);
+});

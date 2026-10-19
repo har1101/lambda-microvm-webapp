@@ -15,6 +15,10 @@ import re
 import shutil
 import sqlite3
 import tarfile
+import subprocess
+import vm_worktrees
+from vm_resources import require_space
+from functools import wraps
 
 from vm_fs import secure_write
 from pathlib import Path
@@ -48,6 +52,8 @@ MARKERS = (
 )
 SECRET_PATH_RE = re.compile(r"^t3/userdata/secrets/[A-Za-z0-9._-]+\.bin$")
 MAX_SCAN_BYTES = 50 * 1024 * 1024
+# Nested base64 in shell transport remains below its 64 MiB input ceiling.
+MAX_HISTORY_BYTES = 6 * 1024 * 1024
 
 
 class HistoryNotSeparable(Exception):
@@ -61,6 +67,8 @@ def path_excluded(rel: str) -> bool:
         return True
     if parts[0] in EXCLUDED_ROOTS:
         return True
+    if parts[:2] == ["t3", "worktrees"]:
+        return True  # legacy .git pointers cannot survive a re-clone
     if "secrets" in parts:
         return True
     name = parts[-1]
@@ -72,6 +80,19 @@ def path_excluded(rel: str) -> bool:
     if lowered.endswith((".sqlite-wal", ".sqlite-shm", ".db-wal", ".db-shm", ".sqlite-journal", ".db-journal")):
         return True
     return False
+
+
+def sqlite_guard(fn):
+    @wraps(fn)
+    def guarded(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except sqlite3.Error as exc:
+            # Lock contention remains retryable and keeps the existing API.
+            if getattr(exc, 'sqlite_errorcode', None) in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
+                raise
+            raise HistoryNotSeparable('unreadable SQLite payload') from None
+    return guarded
 
 
 def is_pairing_secret(rel: str) -> bool:
@@ -87,6 +108,17 @@ def scan_bytes(data: bytes, where: str) -> None:
         raise HistoryNotSeparable(f"{where} is too large to separate from secrets")
     if _marker_hit(data):
         raise HistoryNotSeparable(f"{where} contains a credential marker")
+
+
+def scan_worktree_bytes(data: bytes, where: str) -> None:
+    scan_bytes(data, where)
+    # A project's SQLite file must not bypass history's auth-table/column
+    # checks merely because it is encoded as a Git blob or working file.
+    if data.startswith(b'SQLite format 3\x00'):
+        try:
+            _assert_sqlite_has_no_auth(data, where)
+        except sqlite3.Error:
+            raise HistoryNotSeparable(f'{where} has an unreadable SQLite payload') from None
 
 
 def qident(name: str) -> str:
@@ -180,6 +212,7 @@ def runtime_owner_only(src: Path, rel: str) -> bool:
     return True
 
 
+@sqlite_guard
 def sanitize_sqlite(src: Path, dest: Path) -> list[dict]:
     """Copy non-auth tables to `dest`. Return auth-table payloads for the keychain."""
     src_con = readonly_snapshot(src)
@@ -243,12 +276,30 @@ def sanitize_sqlite(src: Path, dest: Path) -> list[dict]:
         src_con.close()
 
 
+def state_paths(root: Path):
+    # Prune source/build trees before walking them, including ignored artifacts.
+    if (root / 't3').is_symlink():
+        raise HistoryNotSeparable('symlink under the state root cannot be separated')
+    for folder, dirs, files in os.walk(root / 't3', followlinks=False):
+        base = type(root)(folder)
+        if base == root / 't3':
+            dirs[:] = [d for d in dirs if d not in ('worktrees', 'worktree-state')]
+        for name in dirs:
+            if (base / name).is_symlink():
+                raise HistoryNotSeparable('symlink under the state root cannot be separated')
+        for name in sorted(files):
+            path = base / name
+            if path.is_file() or path.is_symlink():
+                yield path
+
+
+@sqlite_guard
 def pairing_only(root: Path) -> dict:
     """Auth tables and secret files only. Does not read history rows into the bundle."""
     secrets = []
     auth_tables: list[dict] = []
     environment_id = None
-    for path in sorted(p for p in root.rglob("*") if p.is_file() or p.is_symlink()):
+    for path in sorted(state_paths(root)):
         rel = path.relative_to(root).as_posix()
         if not rel.startswith("t3/"):
             continue
@@ -274,12 +325,16 @@ def pairing_only(root: Path) -> dict:
     return {"secrets": secrets, "auth_tables": auth_tables, "environment_id": environment_id}
 
 
-def build_split(root: Path, scratch: Path) -> tuple[bytes, dict]:
+def build_split(root: Path, scratch: Path, workspace: Path = Path("/home/vscode/workspace")) -> tuple[bytes, dict]:
     """Return (history tar, pairing bundle). Raises HistoryNotSeparable and writes no tar."""
+    require_space(root, 2 * MAX_HISTORY_BYTES)
     scratch.mkdir(parents=True, exist_ok=True)
     pairing = {"secrets": [], "auth_tables": [], "environment_id": None}
-    entries: list[tuple[str, bytes]] = []
-    for path in sorted(p for p in root.rglob("*") if p.is_file() or p.is_symlink()):
+    try:
+        entries = vm_worktrees.capture(root, workspace, scan_worktree_bytes)
+    except (ValueError, OSError, subprocess.SubprocessError) as exc:
+        raise HistoryNotSeparable("thread worktree snapshot rejected: " + str(exc)) from None
+    for path in sorted(state_paths(root)):
         rel = path.relative_to(root).as_posix()
         if not rel.startswith("t3/"):
             continue
@@ -301,6 +356,9 @@ def build_split(root: Path, scratch: Path) -> tuple[bytes, dict]:
         if path.name.endswith(".sqlite"):
             if runtime_owner_only(path, rel):
                 continue
+            if path.stat().st_size > MAX_HISTORY_BYTES:
+                raise HistoryNotSeparable('SQLite exceeds RAM backup budget')
+            require_space(root, 2 * MAX_HISTORY_BYTES)
             dest = scratch / (rel.replace("/", "_") + ".sanitized")
             pairing["auth_tables"].extend(sanitize_sqlite(path, dest))
             blob = dest.read_bytes()
@@ -309,6 +367,8 @@ def build_split(root: Path, scratch: Path) -> tuple[bytes, dict]:
         blob = path.read_bytes()
         scan_bytes(blob, rel)
         entries.append((rel, blob))
+    if sum(len(blob) + 1024 for _, blob in entries) > MAX_HISTORY_BYTES - 10240:
+        raise HistoryNotSeparable("history archive exceeds size limit")
     buffer = io.BytesIO()
     with tarfile.open(fileobj=buffer, mode="w") as archive:
         for name, blob in entries:
@@ -323,8 +383,14 @@ def build_split(root: Path, scratch: Path) -> tuple[bytes, dict]:
 
 def check_tar(tar_bytes: bytes) -> None:
     """Reject a history archive that contains excluded paths or credential markers."""
+    if len(tar_bytes) > MAX_HISTORY_BYTES:
+        raise HistoryNotSeparable("history archive exceeds size limit")
     with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r:") as archive:
+        seen = set()
         for member in archive.getmembers():
+            if member.name in seen or len(seen) >= vm_worktrees.MAX_ITEMS:
+                raise HistoryNotSeparable("duplicate or excessive archive entries")
+            seen.add(member.name)
             if member.issym() or member.islnk() or member.isdev():
                 raise HistoryNotSeparable("history archive contains a link")
             name = member.name
@@ -339,10 +405,19 @@ def check_tar(tar_bytes: bytes) -> None:
                 continue
             data = extracted.read()
             scan_bytes(data, name)
+            if name.startswith(vm_worktrees.PREFIX):
+                try:
+                    state = vm_worktrees.validate(data, scan_worktree_bytes)
+                    expected = vm_worktrees.snapshot_path(state['repo'], state['name'])
+                    if name != expected:
+                        raise ValueError('worktree manifest path mismatch')
+                except (ValueError, KeyError, TypeError) as exc:
+                    raise HistoryNotSeparable('invalid worktree snapshot') from None
             if name.endswith(".sqlite"):
                 _assert_sqlite_has_no_auth(data, name)
 
 
+@sqlite_guard
 def _assert_sqlite_has_no_auth(blob: bytes, where: str) -> None:
     # In memory only. A history archive that still has auth tables is rejected
     # before upload; the bytes are not written to disk to inspect them.
