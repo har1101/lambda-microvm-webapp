@@ -23,6 +23,9 @@ test('existing image remains identical to the base; only PoC adds pinned Python 
   assembleT3pocImage(baseDir, overlayDir, out);
   const assembled = fs.readFileSync(path.join(out, 'Dockerfile'), 'utf8');
   expect(assembled).toContain('uv python install 3.14.4');
+  expect(assembled).toContain(
+    'USER vscode\n# T3 agents use non-interactive shells; do not depend on .bashrc.\nRUN git config --global credential.https://ai-native-factory-ltd.ghe.com.helper /usr/local/bin/git-credential-shm',
+  );
   expect(assembled).toContain('/usr/local/bin/python3.14');
   expect(assembled.match(/user.name haruki-fukuchi/g)).toHaveLength(1);
   expect(assembled).toContain('COPY lifecycle.py');

@@ -117,13 +117,18 @@ async function tickInside(api) {
   if (action === 'pause') {
     if (api.now() < (api.flags.nextPauseAt ?? 0)) return;
     try {
+      const idleSince = api.session.lastActivityAt;
+      api.log(`idle pause due: idle ${api.now() - idleSince}ms, last byte ${new Date(idleSince).toISOString()}`);
       const backup = await api.backupHistory();
       if (backup?.aborted) api.log(`pause will not upload history: ${backup.reason}`);
       if (backup?.skipped) api.log('pause without history backup: module not installed');
-      if (decide(api.session, api.now()) !== 'pause') return;
+      if (decide(api.session, api.now()) !== 'pause') {
+        api.log(`pause skipped: activity during backup (idle ${api.now() - api.session.lastActivityAt}ms)`);
+        return;
+      }
       await api.deps.suspend(api.session.microvmId);
       api.session.vmState = 'SUSPENDED';
-      api.log('paused MicroVM after 5 minutes idle');
+      api.log(`paused MicroVM after 5 minutes idle (idle ${api.now() - api.session.lastActivityAt}ms)`);
       api.flags.nextPauseAt = 0;
     } catch (error) {
       api.flags.nextPauseAt = api.now() + RETRY_MS;
