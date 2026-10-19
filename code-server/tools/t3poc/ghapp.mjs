@@ -10,6 +10,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { macKeychain } from './keychain.mjs';
+import { VM_PYTHON } from './vm-shell.mjs';
 
 export const GH_HOST = 'ai-native-factory-ltd.ghe.com';
 export const ORG = 'ai-native-factory';
@@ -63,7 +64,20 @@ export async function mintInstallationToken(deps = {}) {
 
 /** Shell script that reads a base64 token from stdin. The token is not in this string. */
 export function pushScript() {
-  return ` stty -echo; read -r T; su - vscode -c 'umask 077; base64 -d > /dev/shm/gh-token.tmp && mv /dev/shm/gh-token.tmp /dev/shm/gh-token; GH_HOST=${GH_HOST} GH_TOKEN=$(cat /dev/shm/gh-token) gh api /repos/${ORG}/${REPO} -q .full_name | sed s/^/T3RES:/' <<< "$T"; unset T; stty echo; echo T3POC_SHELL_DONE`;
+  const program = `import base64, os, sys, tempfile
+value = base64.b64decode(sys.stdin.buffer.readline().strip(), validate=True)
+fd, tmp = tempfile.mkstemp(prefix=".t3poc-gh-", dir="/dev/shm")
+try:
+    with os.fdopen(fd, "wb") as out:
+        os.fchmod(out.fileno(), 0o600)
+        out.write(value)
+    os.replace(tmp, "/dev/shm/gh-token")
+finally:
+    if os.path.exists(tmp): os.unlink(tmp)
+`;
+  const quote = (value) => `'${value.replaceAll("'", "'\\''")}'`;
+  const command = `${VM_PYTHON} -c ${quote(program)} && GH_HOST=${GH_HOST} GH_TOKEN=$(cat /dev/shm/gh-token) gh api /repos/${ORG}/${REPO} -q .full_name | sed s/^/T3RES:/`;
+  return ` stty -echo; read -r T; printf '%s\\n' "$T" | su -s /bin/sh vscode -c ${quote(command)}; unset T; stty echo; echo T3POC_SHELL_DONE`;
 }
 
 export async function pushToVm({ shell, mint, log = () => {} }) {
@@ -164,14 +178,7 @@ async function main() {
   if (cmd === 'setup') await setup();
   else if (cmd === 'push') await push();
   else if (cmd === 'refresh') {
-    for (;;) {
-      try {
-        await push();
-      } catch (error) {
-        console.error(new Date().toISOString(), error.message);
-      }
-      await new Promise((resolve) => setTimeout(resolve, REFRESH_EVERY_MS));
-    }
+    throw new Error('Standalone refresh is disabled; use `t3poc relay` for suspend-aware refresh and retries.');
   } else if (cmd === 'status') {
     const minted = await mintInstallationToken();
     console.log('mint OK, expires', minted.expires_at, Object.keys(minted.permissions));
@@ -181,7 +188,10 @@ async function main() {
   }
 }
 
-const invoked = process.argv[1] && import.meta.url === pathToFileURL(fs.realpathSync(process.argv[1])).href;
+const invoked =
+  process.argv[1] &&
+  fs.existsSync(process.argv[1]) &&
+  import.meta.url === pathToFileURL(fs.realpathSync(process.argv[1])).href;
 if (invoked) {
   main().catch((error) => {
     console.error(error.message);
