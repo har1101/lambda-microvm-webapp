@@ -27,9 +27,25 @@ Lambda console → MicroVM → **Connect**.
 Logins (inside the VM, from T3; all stored only in /dev/shm):
 - Codex: T3 Settings → Providers → Codex → sign in (if the final localhost page fails, paste its full URL into the sign-in panel).
 - Claude: T3 terminal (mod+G) → `claude auth login`.
-- GitHub: T3 terminal → `gh-token-login` (fine-grained PAT, one repo, Contents + Pull requests write, shortest expiry).
+- GitHub: use the GitHub App flow below (no long-lived PAT).
 
 Only `~/.t3poc/state.json` (MicroVM id + endpoint, no secrets) is written on the Mac.
+
+## GitHub (short-lived App tokens)
+
+`ghapp.mjs` mints 1-hour installation tokens for the GitHub App on `ai-native-factory-ltd.ghe.com`,
+scoped to `ai-native-factory/t3poc-sandbox` only (Contents + Pull requests write).
+The App private key lives only in the macOS keychain (service `t3poc-ghapp`); it never reaches disk or the VM.
+
+```bash
+AWS_PROFILE=fukuchi node ghapp.mjs setup    # once: create the App via manifest, store key in keychain, then Install on t3poc-sandbox
+AWS_PROFILE=fukuchi node ghapp.mjs push     # mint a 1h token and write it to VM /dev/shm/gh-token via SHELL_INGRESS (stdin, not argv)
+AWS_PROFILE=fukuchi node ghapp.mjs refresh  # keep running: re-push every 50 min
+AWS_PROFILE=fukuchi node ghapp.mjs status   # mint test only (token discarded)
+```
+
+In the VM, `~/.bashrc` exports `GH_HOST` and `GH_TOKEN` (from `/dev/shm/gh-token`); gh needs `GH_TOKEN`
+(not `GH_ENTERPRISE_TOKEN`) for `*.ghe.com`.
 
 ## Deploying the t3poc stack (operator)
 

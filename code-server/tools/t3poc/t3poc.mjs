@@ -4,7 +4,7 @@
 // live only in this process's memory. ~/.t3poc/state.json holds only the
 // MicroVM id and endpoint.
 //
-//   t3poc start  [--max-duration-sec 28800]   RunMicrovm (ALL_INGRESS + SHELL_INGRESS + INTERNET_EGRESS)
+//   t3poc start  [--max-duration-sec 28800]   RunMicrovm (HTTP_INGRESS + SHELL_INGRESS + INTERNET_EGRESS)
 //   t3poc relay  [--port 8787]                loopback relay -> MicroVM :8080 (adds X-aws-proxy-auth, refreshes it)
 //   t3poc pair   [--port 8787]                one-time T3 pairing link with --base-url http://127.0.0.1:<port>
 //   t3poc status | stop
@@ -90,7 +90,7 @@ async function start(opts) {
       imageIdentifier: `arn:aws:lambda:${REGION}:${Account}:microvm-image:t3poc-task`,
       // Guest role: logs only, no S3/KMS. Logins stay in RAM (/dev/shm) in the VM.
       executionRoleArn: `arn:aws:iam::${Account}:role/t3poc-microvm-guest`,
-      ingressNetworkConnectors: [connector('ALL_INGRESS'), connector('SHELL_INGRESS')],
+      ingressNetworkConnectors: [connector('HTTP_INGRESS'), connector('SHELL_INGRESS')],
       egressNetworkConnectors: [connector('INTERNET_EGRESS')],
       idlePolicy: { autoResumeEnabled: true, maxIdleDurationSeconds: 28800, suspendedDurationSeconds: 28800 },
       maximumDurationInSeconds: maxDuration,
