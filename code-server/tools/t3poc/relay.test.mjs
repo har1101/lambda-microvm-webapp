@@ -136,3 +136,127 @@ test('launchd plist runs the relay and can be removed', () => {
   });
   assert.equal(removed, dest);
 });
+
+test('deleted saved VM starts once; transient API errors do not start a duplicate', async () => {
+  let starts = 0;
+  const deps = {
+    readState: () => ({ microvmId: 'gone' }),
+    writeState() {},
+    now: () => 100,
+    log() {},
+    getMicrovm: async () => {
+      throw Object.assign(new Error('gone'), { name: 'ResourceNotFoundException' });
+    },
+    startMicrovm: async () => {
+      starts++;
+      return { microvmId: 'new', endpoint: 'new.example' };
+    },
+    waitUntil: async () => {},
+  };
+  await ensureVm(createRuntime(deps));
+  assert.equal(starts, 1);
+  deps.getMicrovm = async () => {
+    throw Object.assign(new Error('no'), { name: 'AccessDeniedException' });
+  };
+  await assert.rejects(ensureVm(createRuntime(deps)), { name: 'AccessDeniedException' });
+  assert.equal(starts, 1);
+});
+
+test('120s caller hold does not cancel a slower boot or its latency measurement', async () => {
+  let release;
+  let now = 100;
+  const logs = [];
+  const gate = new Promise((r) => {
+    release = r;
+  });
+  const api = createRuntime({
+    readState: () => null,
+    writeState() {},
+    now: () => now,
+    holdMs: 10,
+    log: (m) => logs.push(m),
+    startMicrovm: async () => ({ microvmId: 'new', endpoint: 'new.example' }),
+    waitUntil: async (_id, deadline) => {
+      assert.equal(deadline, 450100);
+      await gate;
+    },
+  });
+  api.hooks.beforeRequest.push(ensureVm);
+  await assert.rejects(api.ensureReady(), /not ready/);
+  now += 130000;
+  release();
+  await api.ensureReady();
+  assert.equal(api.session.vmState, 'RUNNING');
+  assert.match(logs.join('\n'), /startup latency 130000ms/);
+});
+
+test('VM token cache re-mints on replacement and rejects a mint completed for the old VM', async () => {
+  const { createProxyTokenCache } = await import('./t3poc.mjs');
+  const session = { microvmId: 'old' };
+  const calls = [];
+  const get = createProxyTokenCache(
+    () => session,
+    async (id) => {
+      calls.push(id);
+      return { value: id, refreshAt: 999 };
+    },
+    () => 1,
+  );
+  assert.equal(await get(), 'old');
+  session.microvmId = 'new';
+  assert.equal(await get(), 'new');
+  assert.deepEqual(calls, ['old', 'new']);
+  let release;
+  const slow = createProxyTokenCache(
+    () => session,
+    async (id) => {
+      if (id === 'new')
+        await new Promise((r) => {
+          release = r;
+        });
+      return { value: id, refreshAt: 999 };
+    },
+    () => 1,
+  );
+  const pending = slow();
+  await new Promise((r) => setImmediate(r));
+  session.microvmId = 'newer';
+  release();
+  assert.equal(await pending, 'newer');
+});
+
+test('launchd XML escapes all externally supplied values', () => {
+  const xml = renderLaunchAgent({
+    home: '/tmp/a&b',
+    nodePath: '<node>',
+    scriptPath: 'a"b',
+    port: '1<2',
+    awsProfile: 'a&b',
+  });
+  assert.match(xml, /a&amp;b/);
+  assert.match(xml, /&lt;node&gt;/);
+  assert.match(xml, /a&quot;b/);
+  assert.match(xml, /1&lt;2/);
+});
+
+test('lazy relay adopts a newer manually started VM after its cached VM terminates', async () => {
+  const { createRuntime } = await import('./t3poc.mjs');
+  const { ensureVm } = await import('./ext-15-lazy.mjs');
+  const seen = [];
+  const api = createRuntime({
+    readState: () => ({ microvmId: 'new', endpoint: 'new.example', diskPrepared: true }),
+    writeState() {},
+    log() {},
+    getMicrovm: async (id) => {
+      seen.push(id);
+      return { state: id === 'old' ? 'TERMINATED' : 'RUNNING' };
+    },
+    startMicrovm: async () => {
+      throw Error('must adopt recorded VM');
+    },
+  });
+  api.attach({ microvmId: 'old', endpoint: 'old.example', vmState: 'RUNNING' });
+  await ensureVm(api);
+  assert.equal(api.session.microvmId, 'new');
+  assert.deepEqual(seen, ['old', 'new']);
+});

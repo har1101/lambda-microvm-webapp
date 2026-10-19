@@ -6,7 +6,7 @@ export function register(api) {
 }
 
 export async function ensureVm(api) {
-  const deadline = api.now() + (api.deps.holdMs ?? RELAY_HOLD_MS);
+  const deadline = api.now() + (api.deps.bootMs ?? 450_000);
   const existing = api.session.microvmId
     ? {
         microvmId: api.session.microvmId,
@@ -17,7 +17,13 @@ export async function ensureVm(api) {
       }
     : api.readState();
   if (existing?.microvmId) {
-    const current = await api.deps.getMicrovm(existing.microvmId);
+    let current;
+    try {
+      current = await api.deps.getMicrovm(existing.microvmId);
+    } catch (error) {
+      if (error.name !== 'ResourceNotFoundException') throw error;
+      current = null;
+    }
     if (current && !TERMINAL.has(current.state)) {
       if (!['RUNNING', 'SUSPENDED', 'SUSPENDING'].includes(current.state)) {
         await api.deps.waitUntil(existing.microvmId, deadline);
@@ -25,16 +31,25 @@ export async function ensureVm(api) {
       const latest = ['RUNNING', 'SUSPENDED', 'SUSPENDING'].includes(current.state)
         ? current
         : await api.deps.getMicrovm(existing.microvmId);
+      if (existing.diskPrepared === false && existing.startedAt != null && latest.state === 'RUNNING') {
+        api.log(`startup latency ${api.now() - existing.startedAt}ms (RunMicrovm -> RUNNING)`);
+      }
       api.attach({ ...existing, vmState: latest.state });
       // Only a boot that never finished disk prep may rewrite /dev/shm.
       api.flags.prepareDisk = existing.diskPrepared === false;
-      api.flags.historyRestored = false;
+      if (existing.diskPrepared === false && !api.flags.prepareDisk) api.flags.historyRestored = false;
       if (latest.state === 'RUNNING') {
         await api.emitVmReady();
         if (existing.diskPrepared === false) api.writeState();
       }
       return;
     }
+  }
+  const recorded = api.readState();
+  if (recorded?.microvmId && recorded.microvmId !== existing?.microvmId) {
+    api.attach({ ...recorded, vmState: recorded.vmState ?? 'STARTING' });
+    api.flags.historyRestored = false;
+    return ensureVm(api);
   }
   const started = api.now();
   const run = await api.deps.startMicrovm({ allowExisting: false });

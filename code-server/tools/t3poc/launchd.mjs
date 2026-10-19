@@ -5,7 +5,18 @@ import path from 'node:path';
 export const LAUNCHD_LABEL = 'com.t3poc.relay';
 
 export function renderLaunchAgent({ nodePath, scriptPath, port, home, awsProfile }) {
-  const log = `${home}/.t3poc/relay.log`;
+  const xmlEscape = (value) =>
+    String(value)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&apos;');
+  const log = xmlEscape(`${home}/.t3poc/relay.log`);
+  nodePath = xmlEscape(nodePath);
+  scriptPath = xmlEscape(scriptPath);
+  port = xmlEscape(port);
+  awsProfile = xmlEscape(awsProfile);
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
