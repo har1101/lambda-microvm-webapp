@@ -5,3 +5,5 @@ RUN UV_PYTHON_INSTALL_DIR=/opt/t3poc-python UV_PYTHON_BIN_DIR=/usr/local/bin \
     && /usr/local/bin/python3.14 -c 'import sys, sqlite3; assert sys.version_info[:3] == (3, 14, 4); assert hasattr(sqlite3.Connection, "deserialize")' \
     && rm -rf /tmp/t3poc-uv-cache
 USER vscode
+# T3 agents use non-interactive shells; do not depend on .bashrc.
+RUN git config --global credential.https://ai-native-factory-ltd.ghe.com.helper /usr/local/bin/git-credential-shm
