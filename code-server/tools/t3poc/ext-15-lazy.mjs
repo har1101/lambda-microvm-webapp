@@ -1,4 +1,5 @@
 export const RELAY_HOLD_MS = 120_000;
+export const RUNNING_CHECK_MS = 15_000;
 const TERMINAL = new Set(['TERMINATED', 'TERMINATING', 'FAILED']);
 
 export function register(api) {
@@ -18,8 +19,17 @@ export async function ensureVm(api) {
     : api.readState();
   if (existing?.microvmId) {
     let current;
+    const check = api.flags.runningCheck;
+    const fresh =
+      api.session.vmState === 'RUNNING' &&
+      check?.microvmId === existing.microvmId &&
+      api.now() - check.at < RUNNING_CHECK_MS &&
+      (!existing.expiresAt || api.now() < existing.expiresAt);
+    delete api.flags.runningCheck;
     try {
-      current = await api.deps.getMicrovm(existing.microvmId);
+      current = fresh ? { state: 'RUNNING' } : await api.deps.getMicrovm(existing.microvmId);
+      if (current?.state === 'RUNNING')
+        api.flags.runningCheck = { microvmId: existing.microvmId, at: fresh ? check.at : api.now() };
     } catch (error) {
       if (error.name !== 'ResourceNotFoundException') throw error;
       current = null;
