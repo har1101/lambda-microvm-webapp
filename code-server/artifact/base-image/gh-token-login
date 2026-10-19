@@ -1,0 +1,8 @@
+#!/bin/sh
+# Paste a short-lived fine-grained PAT; kept in RAM only (/dev/shm), never on disk/S3.
+umask 077
+printf 'GitHub token (input hidden): '
+stty -echo; read -r tok; stty echo; echo
+[ -n "$tok" ] || { echo "empty token"; exit 1; }
+printf '%s' "$tok" > /dev/shm/gh-token
+echo "saved to /dev/shm/gh-token (RAM). New shells export GH_TOKEN automatically."
