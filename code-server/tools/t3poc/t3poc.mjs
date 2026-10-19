@@ -348,12 +348,15 @@ export function upstreamHeaders(incoming, endpoint, token, clientHost) {
   return out;
 }
 
+import { forwardWebResponse, serveWebStyle, webRequestHeaders } from './webui.mjs';
+
 export function isLoopback(addr) {
   return addr === '127.0.0.1' || addr === '::1' || addr === '::ffff:127.0.0.1';
 }
 
 export function createRelay({
-  getEndpoint,
+  endpoint: initialEndpoint,
+  getEndpoint = async () => initialEndpoint,
   getToken,
   getConnection = async () => ({ endpoint: await getEndpoint(), token: await getToken() }),
   clientHost,
@@ -373,12 +376,16 @@ export function createRelay({
       res.writeHead(403);
       return res.end();
     }
+    if (serveWebStyle(req, res)) return;
     let counted = false;
     let finished = false;
     let upReq;
     let upRes;
+    let retryTimer;
+    let retries = 0;
     const finish = () => {
       finished = true;
+      clearTimeout(retryTimer);
       if (counted) {
         counted = false;
         onDone();
@@ -421,35 +428,66 @@ export function createRelay({
     }
     if (finished || res.destroyed) return;
     req.on('data', activity);
-    upReq = request(
-      {
-        host: endpoint,
-        port: upstreamPort,
-        servername: endpoint,
-        method: req.method,
-        path: req.url,
-        headers: upstreamHeaders(req.headers, endpoint, token, clientHost),
-      },
-      (response) => {
-        upRes = response;
-        upRes.on('error', () => {
-          finish();
-          res.destroy();
-        });
-        if (finished || res.destroyed) {
-          upRes.destroy();
-          return;
-        }
-        upRes.on('data', activity);
-        res.writeHead(upRes.statusCode, upRes.headers);
-        upRes.pipe(res);
-      },
-    );
-    upReq.on('error', (error) => {
-      if (finished || res.destroyed) return;
-      if (!res.headersSent) res.writeHead(502, { 'content-type': 'text/plain' });
-      res.end(`t3poc: upstream error ${error.code ?? error.name}\n`);
-    });
+    const send = () => {
+      upReq = request(
+        {
+          host: endpoint,
+          port: upstreamPort,
+          servername: endpoint,
+          method: req.method,
+          path: req.url,
+          headers: webRequestHeaders(req, upstreamHeaders(req.headers, endpoint, token, clientHost)),
+        },
+        (response) => {
+          upRes = response;
+          upRes.on('error', () => {
+            finish();
+            res.destroy();
+          });
+          if (finished || res.destroyed) {
+            upRes.destroy();
+            return;
+          }
+          // A cold module graph can briefly exhaust ingress capacity. Only
+          // replay bodyless reads after a 429; writes and upgrades are untouched.
+          const retryAfter = upRes.headers['retry-after'];
+          const delay =
+            retryAfter == null
+              ? 500 * 2 ** retries
+              : /^\d+(?:\.\d+)?$/.test(String(retryAfter))
+                ? Number(retryAfter) * 1000
+                : Date.parse(String(retryAfter)) - Date.now();
+          if (
+            req.method === 'GET' &&
+            !req.headers['content-length'] &&
+            !req.headers['transfer-encoding'] &&
+            upRes.statusCode === 429 &&
+            retries < 4 &&
+            Number.isFinite(delay) &&
+            delay <= 5000
+          ) {
+            retries++;
+            upRes.resume();
+            retryTimer = setTimeout(
+              () => {
+                if (!finished && !res.destroyed) send().end();
+              },
+              Math.max(100, delay),
+            );
+            return;
+          }
+          upRes.on('data', activity);
+          forwardWebResponse(req, res, upRes);
+        },
+      );
+      upReq.on('error', (error) => {
+        if (finished || res.destroyed) return;
+        if (!res.headersSent) res.writeHead(502, { 'content-type': 'text/plain' });
+        res.end(`t3poc: upstream error ${error.code ?? error.name}\n`);
+      });
+      return upReq;
+    };
+    send();
     if (finished) upReq.destroy();
     else req.pipe(upReq);
   });
