@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { RESOURCE_START, register, resourceScript } from './ext-15-resources.mjs';
-import { START_T3 } from './vm-shell.mjs';
+import { START_T3, STOP_T3 } from './vm-shell.mjs';
 
 function fixture() {
   const calls = [];
@@ -74,15 +74,19 @@ test('RAM monitor logs only numeric usage and threshold warnings once a minute',
   assert.deepEqual(messages, ['RAM WARNING used=60 total=64 free=4 worktrees=9']);
 });
 
-test('catalog policy is verified before stopping T3, and failure preserves the running server', async () => {
+test('policy stops producers before configuration and restarts T3 if configuration fails', async () => {
   const { api, calls } = fixture();
   await api.hooks.onVmReady[0](api);
-  assert.equal(calls[0].script, resourceScript({ catalog: true }));
+  assert.equal(calls[0].script, STOP_T3);
+  assert.equal(calls[1].script, resourceScript({ catalog: true }));
+  assert.ok(Buffer.byteLength(resourceScript({ catalog: true })) > 16384);
   const requests = [];
   const runtime = {
     deps: {
       shell: async (request) => {
         requests.push(request);
+        if (request.script === STOP_T3) return 'T3POC_T3_STOPPED';
+        if (request.script === RESOURCE_START) return 'T3POC_T3_STARTED';
         return 'T3POC_SHELL_DONE';
       },
     },
@@ -94,6 +98,9 @@ test('catalog policy is verified before stopping T3, and failure preserves the r
   };
   register(runtime);
   await assert.rejects(runtime.hooks.onVmReady[0](runtime), /catalog policy failed/);
-  assert.equal(requests.length, 1);
-  assert.equal(requests[0].script, resourceScript({ catalog: true }));
+  assert.deepEqual(
+    requests.map((x) => x.script),
+    [STOP_T3, resourceScript({ catalog: true }), RESOURCE_START],
+  );
+  assert.equal(runtime.flags.t3Stopped, false);
 });
