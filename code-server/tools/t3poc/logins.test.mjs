@@ -14,6 +14,6 @@ test('login injection is off unless the flag is set, and only targets /dev/shm',
 });
 
 test('login tar extraction stays under /dev/shm and rejects escapes', () => {
-  const result = spawnSync('python3', ['vm_logins_test.py'], { encoding: 'utf8' });
+  const result = spawnSync('python3.14', ['vm_logins_test.py'], { encoding: 'utf8' });
   assert.equal(result.status, 0, result.stdout + result.stderr);
 });

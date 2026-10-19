@@ -41,5 +41,32 @@ class LoginTarTest(unittest.TestCase):
         )
 
 
+class LoginRegressionTest(unittest.TestCase):
+    def test_root_symlink_never_writes_to_disk(self):
+        tmp=Path(tempfile.mkdtemp()); outside=tmp/'disk'; outside.mkdir()
+        dest=tmp/'claude'; dest.symlink_to(outside,target_is_directory=True)
+        with self.assertRaises((OSError,ValueError)):
+            vm_logins.extract_login(dest,tar_bytes({'auth.json':b'dummy'}),{dest})
+        self.assertEqual(list(outside.iterdir()),[])
+
+    def test_nested_symlink_never_writes_to_disk(self):
+        tmp=Path(tempfile.mkdtemp());outside=tmp/'disk';outside.mkdir();dest=tmp/'claude';dest.mkdir()
+        (dest/'nested').symlink_to(outside,target_is_directory=True)
+        with self.assertRaises((OSError,ValueError)):
+            vm_logins.extract_login(dest,tar_bytes({'nested/auth.json':b'dummy'}),{dest})
+        self.assertEqual(list(outside.iterdir()),[])
+
+    def test_explicit_chown_makes_files_readable_by_guest(self):
+        import os
+        from unittest.mock import patch
+        import vm_fs
+        dest=Path(tempfile.mkdtemp())/'claude'
+        with patch.object(vm_fs,'guest_owner',return_value=(os.getuid(),os.getgid())), patch.object(vm_fs.os,'fchown',wraps=os.fchown) as chown:
+            vm_logins.extract_login(dest,tar_bytes({'auth.json':b'dummy'}),{dest})
+            self.assertGreaterEqual(chown.call_count,2)
+        self.assertEqual((dest/'auth.json').read_bytes(),b'dummy')
+        self.assertEqual((dest/'auth.json').stat().st_mode & 0o777,0o600)
+
+
 if __name__ == "__main__":
     unittest.main()

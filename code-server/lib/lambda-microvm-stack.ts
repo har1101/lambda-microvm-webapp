@@ -24,6 +24,7 @@ import {
   ingressConnectorArn,
   NAME_PREFIX,
 } from './config';
+import { t3pocAssetOptions } from './t3poc-image';
 
 const microvmSourceArn = `arn:aws:lambda:${config.microvmRegion}:${config.account}:microvm-image:*` as const;
 const microvmInstanceArn = `arn:aws:lambda:${config.microvmRegion}:${config.account}:microvm:*` as const;
@@ -77,9 +78,17 @@ export class OmpCloudIdeMicrovmStack extends cdk.Stack {
       removalPolicy: cdk.RemovalPolicy.RETAIN,
     });
 
+    const artifactDir = config.artifactDir;
+    const t3pocImage = artifactDir === 'artifact/t3poc-image';
     const codeArtifact = new s3assets.Asset(this, 'CodeArtifact', {
-      path: path.join(__dirname, '..', config.artifactDir),
+      path: path.join(__dirname, '..', artifactDir),
       exclude: ['**/__pycache__/**', '**/*.pyc'],
+      ...(t3pocImage
+        ? t3pocAssetOptions(
+            path.join(__dirname, '..', 'artifact', 'base-image'),
+            path.join(__dirname, '..', 'artifact', 't3poc-image'),
+          )
+        : {}),
     });
 
     const buildRole = new iam.Role(this, 'MicrovmBuildRole', {

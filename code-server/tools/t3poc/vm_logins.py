@@ -7,6 +7,8 @@ import os
 import tarfile
 from pathlib import Path
 
+from vm_fs import secure_mkdir, secure_write
+
 ALLOWED = {Path("/dev/shm/claude"), Path("/dev/shm/codex")}
 
 
@@ -15,37 +17,30 @@ class LoginRejected(Exception):
 
 
 def extract_login(dest: Path, blob: bytes, allowed: set[Path] | None = None) -> None:
-    permitted = {path.resolve() for path in (allowed or ALLOWED)}
-    root = dest.resolve()
+    permitted = {Path(os.path.abspath(path)) for path in (allowed or ALLOWED)}
+    root = Path(os.path.abspath(dest))
     if root not in permitted:
-        raise LoginRejected("dest rejected")
-    root.mkdir(parents=True, exist_ok=True)
-    with tarfile.open(fileobj=io.BytesIO(blob), mode="r:*") as archive:
+        raise LoginRejected('dest rejected')
+    validate_login(blob)
+    with tarfile.open(fileobj=io.BytesIO(blob), mode='r:*') as archive:
         for member in archive.getmembers():
-            if member.issym() or member.islnk() or member.isdev():
-                raise LoginRejected("tar member rejected")
-            if member.name.startswith("/") or ".." in Path(member.name).parts:
-                raise LoginRejected("tar member rejected")
-            target = (root / member.name).resolve()
-            if target != root and not str(target).startswith(f"{root}{os.sep}"):
-                raise LoginRejected("tar member rejected")
             if member.isdir():
-                target.mkdir(parents=True, exist_ok=True)
-                continue
-            if not member.isfile():
-                raise LoginRejected("tar member rejected")
-            target.parent.mkdir(parents=True, exist_ok=True)
-            extracted = archive.extractfile(member)
-            if extracted is None:
-                raise LoginRejected("tar member rejected")
-            target.write_bytes(extracted.read())
-            os.chmod(target, 0o600)
+                secure_mkdir(root, member.name)
+            else:
+                extracted = archive.extractfile(member)
+                if extracted is None:
+                    raise LoginRejected('tar member rejected')
+                secure_write(root, member.name, extracted.read())
 
 
 def validate_login(blob: bytes) -> None:
     """Reject slip/links without writing the archive anywhere."""
     with tarfile.open(fileobj=io.BytesIO(blob), mode="r:*") as archive:
+        total = 0
         for member in archive.getmembers():
+            total += member.size
+            if total > 50 * 1024 * 1024 or not (member.isfile() or member.isdir()):
+                raise LoginRejected('tar member rejected')
             if member.issym() or member.islnk() or member.isdev():
                 raise LoginRejected("tar member rejected")
             if member.name.startswith("/") or ".." in Path(member.name).parts:
@@ -67,8 +62,8 @@ def main(argv: list[str]) -> int:
             extract_login(dest, blob)
             print("T3POC_LOGIN_OK")
             return 0
-    except LoginRejected as exc:
-        print(f"T3POC_LOGIN_REJECTED {exc}")
+    except (LoginRejected, OSError, ValueError) as exc:
+        print(f"T3POC_LOGIN_REJECTED {type(exc).__name__}")
         return 2
     print("usage: vm_logins.py validate | extract DEST TAR", flush=True)
     return 2
