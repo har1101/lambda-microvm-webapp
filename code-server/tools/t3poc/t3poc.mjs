@@ -374,30 +374,54 @@ export function createRelay({
       return res.end();
     }
     let counted = false;
+    let finished = false;
+    let upReq;
+    let upRes;
     const finish = () => {
-      if (!counted) return;
-      counted = false;
-      onDone();
+      finished = true;
+      if (counted) {
+        counted = false;
+        onDone();
+      }
+      // A disconnected client must not leave a streaming response running.
+      // Its subsequent bytes would otherwise refresh the VM's idle clock.
+      if (!upRes?.readableEnded) {
+        // Completed HTTP responses may already have returned their socket to
+        // the keep-alive pool. Never destroy a pooled socket on normal close.
+        if (!upRes?.complete) upReq?.destroy();
+        upRes?.destroy();
+      }
     };
+    const activity = () => {
+      if (!finished && !res.destroyed) onActivity();
+    };
+    // Register before readiness/token awaits: the client can disappear there.
+    res.once('close', finish);
     try {
       await track();
       counted = true;
+      if (finished || res.destroyed) {
+        finish();
+        return;
+      }
     } catch (error) {
+      if (finished || res.destroyed) return;
       res.writeHead(503, { 'content-type': 'text/plain' });
       return res.end(`t3poc: not ready: ${error.message}\n`);
     }
-    res.on('close', finish);
     let token;
     let endpoint;
     try {
       ({ endpoint, token } = await getConnection());
     } catch (error) {
       finish();
+      if (res.destroyed) return;
       if (!res.headersSent) res.writeHead(502, { 'content-type': 'text/plain' });
       return res.end(`t3poc: could not mint MicroVM token: ${error.name}\n`);
     }
-    req.on('data', () => onActivity());
-    const upReq = request(
+    if (finished || res.destroyed) return;
+    req.on('data', activity);
+    upReq = request(
       {
         host: endpoint,
         port: upstreamPort,
@@ -406,34 +430,65 @@ export function createRelay({
         path: req.url,
         headers: upstreamHeaders(req.headers, endpoint, token, clientHost),
       },
-      (upRes) => {
-        upRes.on('data', () => onActivity());
+      (response) => {
+        upRes = response;
+        upRes.on('error', () => {
+          finish();
+          res.destroy();
+        });
+        if (finished || res.destroyed) {
+          upRes.destroy();
+          return;
+        }
+        upRes.on('data', activity);
         res.writeHead(upRes.statusCode, upRes.headers);
         upRes.pipe(res);
       },
     );
     upReq.on('error', (error) => {
+      if (finished || res.destroyed) return;
       if (!res.headersSent) res.writeHead(502, { 'content-type': 'text/plain' });
       res.end(`t3poc: upstream error ${error.code ?? error.name}\n`);
     });
-    req.pipe(upReq);
+    if (finished) upReq.destroy();
+    else req.pipe(upReq);
   });
   server.on('upgrade', async (req, socket, head) => {
     if (!isLoopback(req.socket.remoteAddress)) return socket.destroy();
     let counted = false;
+    let finished = false;
+    let upstream;
     const finish = () => {
-      if (!counted) return;
-      counted = false;
-      onDone();
+      finished = true;
+      if (counted) {
+        counted = false;
+        onDone();
+      }
+      upstream?.destroy();
     };
+    const activity = () => {
+      if (!finished && !socket.destroyed) onActivity();
+    };
+    socket.once('close', finish);
+    socket.on('error', () => {
+      finish();
+      socket.destroy();
+    });
+    socket.once('end', () => {
+      finish();
+      socket.destroy();
+    });
     try {
       await track();
       counted = true;
+      if (finished || socket.destroyed) {
+        finish();
+        return;
+      }
     } catch {
       return socket.destroy();
     }
-    socket.on('close', finish);
-    socket.on('data', () => onActivity());
+    socket.on('data', activity);
     let token;
     let endpoint;
     try {
@@ -442,9 +497,11 @@ export function createRelay({
       finish();
       return socket.destroy();
     }
-    const upstream = connect(
+    if (finished || socket.destroyed) return;
+    upstream = connect(
       { host: endpoint, port: upstreamPort, servername: endpoint, ALPNProtocols: ['http/1.1'] },
       () => {
+        if (finished || socket.destroyed) return upstream.destroy();
         const headers = upstreamHeaders(req.headers, endpoint, token, clientHost);
         const lines = [`${req.method} ${req.url} HTTP/1.1`];
         for (const [key, value] of Object.entries(headers))
@@ -455,9 +512,10 @@ export function createRelay({
         socket.pipe(upstream);
       },
     );
-    upstream.on('data', () => onActivity());
+    upstream.on('data', activity);
+    upstream.on('close', () => socket.destroy());
     upstream.on('error', () => socket.destroy());
-    socket.on('error', () => upstream.destroy());
+    if (finished) upstream.destroy();
   });
   return server;
 }
