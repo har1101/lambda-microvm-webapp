@@ -165,6 +165,39 @@ class RegressionTest(ExclusionTest):
         finally:
             lock.close()
 
+    def test_fresh_owner_initial_rollback_journal_does_not_block_live_snapshot(self):
+        owner = self.root / 't3/userdata/server-owner.sqlite'
+        lock = sqlite3.connect(owner)
+        lock.execute('BEGIN EXCLUSIVE')
+        lock.execute('CREATE TABLE owner_lock (id INTEGER)')
+        try:
+            self.assertEqual(owner.stat().st_size, 0)
+            self.assertEqual(Path(str(owner) + '-journal').stat().st_size, 512)
+            self.assertIn('PAIRING-SECRET', json_tables(vm_history.pairing_only(self.root)))
+            blob, bundle = vm_history.build_split(self.root, self.scratch)
+            self.assertIn('PAIRING-SECRET', json_tables(bundle))
+            self.assertNotIn('t3/userdata/server-owner.sqlite', _tar_names(blob))
+            self.assertNotIn('t3/userdata/server-owner.sqlite-journal', _tar_names(blob))
+        finally:
+            lock.close()
+
+    def test_owner_journal_with_prior_pages_records_or_hot_header_is_not_ignored(self):
+        owner = self.root / 't3/userdata/server-owner.sqlite'
+        owner.touch()
+        journal = Path(str(owner) + '-journal')
+        clean = bytearray(512)
+        clean[20:24] = (512).to_bytes(4, 'big')
+        clean[24:28] = (4096).to_bytes(4, 'big')
+        for index in (0, 8, 16):
+            header = clean.copy(); header[index] = 1; journal.write_bytes(header)
+            with self.assertRaises(vm_history.HistoryNotSeparable):
+                vm_history.pairing_only(self.root)
+        journal.write_bytes(clean + bytes(1))
+        with self.assertRaises(vm_history.HistoryNotSeparable):
+            vm_history.build_split(self.root, self.scratch)
+        self.assertTrue(vm_history.path_excluded('t3/userdata/server-owner.sqlite-journal'))
+        self.assertTrue(vm_history.path_excluded('t3/userdata/statev2.sqlite-journal'))
+
     def test_owner_with_auth_tables_or_uncheckpointed_journal_fails_closed(self):
         owner = self.root / 't3/userdata/server-owner.sqlite'
         con = sqlite3.connect(owner)
