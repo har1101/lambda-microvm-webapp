@@ -40,7 +40,11 @@ test('failed token write cannot be confirmed by a successful API using the old t
   const out = spawnSync(
     '/bin/bash',
     ['-c', `function gh(){ echo ai-native-factory/t3poc-sandbox; }; export -f gh; ${local}`],
-    { input: Buffer.from('new-dummy').toString('base64') + '\n', encoding: 'utf8' },
+    {
+      input: `${Buffer.from('new-dummy').toString('base64')}\n`,
+      encoding: 'utf8',
+      env: { ...process.env, GIT_CONFIG_GLOBAL: path.join(dir, 'gitconfig'), GIT_CONFIG_NOSYSTEM: '1' },
+    },
   );
   assert.equal(out.stdout.includes('T3RES:ai-native-factory/t3poc-sandbox'), false);
   assert.equal(fs.readFileSync(path.join(dir, 'gh-token'), 'utf8'), 'old-dummy');
@@ -48,7 +52,11 @@ test('failed token write cannot be confirmed by a successful API using the old t
   const successful = spawnSync(
     '/bin/bash',
     ['-c', `function gh(){ echo ai-native-factory/t3poc-sandbox; }; export -f gh; ${local}`],
-    { input: `${Buffer.from('new-dummy').toString('base64')}\n`, encoding: 'utf8' },
+    {
+      input: `${Buffer.from('new-dummy').toString('base64')}\n`,
+      encoding: 'utf8',
+      env: { ...process.env, GIT_CONFIG_GLOBAL: path.join(dir, 'gitconfig'), GIT_CONFIG_NOSYSTEM: '1' },
+    },
   );
   assert.equal(successful.stdout.includes('T3RES:ai-native-factory/t3poc-sandbox'), true, successful.stderr);
 });
