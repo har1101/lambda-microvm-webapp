@@ -2,7 +2,7 @@ import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { pythonInvocation } from './vm-shell.mjs';
+import { LOCAL_PYTHON, pythonInvocation, START_T3, STOP_T3 } from './vm-shell.mjs';
 
 const PY_PATH = path.join(path.dirname(fileURLToPath(import.meta.url)), 'vm_history.py');
 const PY = fs.readFileSync(PY_PATH, 'utf8');
@@ -42,7 +42,7 @@ export function parseEmit(text) {
 }
 
 export function assertHistoryTar(bytes) {
-  const result = spawnSync('python3', [PY_PATH, 'check-tar'], { input: bytes });
+  const result = spawnSync(LOCAL_PYTHON, [PY_PATH, 'check-tar'], { input: bytes });
   const out = `${result.stdout ?? ''}`;
   if (result.status !== 0 || out.includes('T3POC_BACKUP_ABORT')) {
     const reason = out.match(/T3POC_BACKUP_ABORT ([^\r\n]+)/)?.[1] ?? 'history tar rejected';
@@ -53,6 +53,22 @@ export function assertHistoryTar(bytes) {
 }
 
 export async function backupHistory(api) {
+  const stopped = await api.deps.shell({ script: STOP_T3 });
+  if (!stopped.includes('T3POC_T3_STOPPED')) throw new Error('T3 did not stop for a consistent backup');
+  let result;
+  let failure;
+  try {
+    result = await backupStoppedHistory(api);
+  } catch (error) {
+    failure = error;
+  }
+  const restarted = await api.deps.shell({ script: START_T3 });
+  if (!restarted.includes('T3POC_T3_STARTED')) throw new Error('T3 restart failed after backup');
+  if (failure) throw failure;
+  return result;
+}
+
+async function backupStoppedHistory(api) {
   const out = await api.deps.shell({ script: pythonInvocation(PY, 'emit') });
   const parsed = parseEmit(out);
   if (parsed.aborted) {

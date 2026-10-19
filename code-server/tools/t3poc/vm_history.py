@@ -15,6 +15,8 @@ import re
 import shutil
 import sqlite3
 import tarfile
+
+from vm_fs import secure_write
 from pathlib import Path
 
 # Paths relative to the scan root (the VM's /dev/shm). A match is omitted from
@@ -32,6 +34,10 @@ MARKERS = (
     b"BEGIN PRIVATE KEY",
     b"BEGIN RSA PRIVATE KEY",
     b"ghp_",
+    b"ghs_",
+    b"ghu_",
+    b"ghr_",
+    b"sk-proj-",
     b"github_pat_",
     b"sk-ant-",
 )
@@ -160,6 +166,23 @@ def sanitize_sqlite(src: Path, dest: Path) -> list[dict]:
                     dest_con.executemany(
                         f"INSERT INTO {qident(table)} VALUES ({placeholders})", rows
                     )
+            if src_con.execute("SELECT 1 FROM sqlite_master WHERE name='sqlite_sequence'").fetchone():
+                for table, seq in src_con.execute("SELECT name, seq FROM sqlite_sequence"):
+                    if table in keep:
+                        dest_con.execute("DELETE FROM sqlite_sequence WHERE name=?", (table,))
+                        dest_con.execute("INSERT INTO sqlite_sequence(name, seq) VALUES (?, ?)", (table, seq))
+            for kind, name, table, sql in src_con.execute(
+                "SELECT type, name, tbl_name, sql FROM sqlite_master WHERE type IN ('index','trigger','view') AND sql IS NOT NULL"
+            ):
+                if kind != 'view' and table not in keep:
+                    continue
+                if any(_is_auth_table(word) for word in re.findall(r'[A-Za-z_][A-Za-z0-9_]*', sql)):
+                    continue
+                dest_con.execute(sql)
+            user_version = src_con.execute('PRAGMA user_version').fetchone()[0]
+            application_id = src_con.execute('PRAGMA application_id').fetchone()[0]
+            dest_con.execute(f'PRAGMA user_version = {user_version}')
+            dest_con.execute(f'PRAGMA application_id = {application_id}')
             dest_con.commit()
         finally:
             dest_con.close()
@@ -173,7 +196,10 @@ def pairing_only(root: Path) -> dict:
     secrets = []
     auth_tables: list[dict] = []
     environment_id = None
-    for path in sorted(p for p in root.rglob("*") if p.is_file()):
+    for path in sorted(p for p in root.rglob("*") if p.is_file() or p.is_symlink()):
+        rel = path.relative_to(root).as_posix()
+        if not rel.startswith("t3/"):
+            continue
         if path.is_symlink():
             raise HistoryNotSeparable("symlink under the state root cannot be separated")
         rel = path.relative_to(root).as_posix()
@@ -195,37 +221,18 @@ def pairing_only(root: Path) -> dict:
     return {"secrets": secrets, "auth_tables": auth_tables, "environment_id": environment_id}
 
 
-def collect_pairing(root: Path, scratch: Path) -> dict:
-    secrets = []
-    auth_tables: list[dict] = []
-    environment_id = None
-    for path in sorted(p for p in root.rglob("*") if p.is_file()):
-        if path.is_symlink():
-            raise HistoryNotSeparable("symlink under the state root cannot be separated")
-        rel = path.relative_to(root).as_posix()
-        if is_pairing_secret(rel):
-            data = path.read_bytes()
-            secrets.append({"path": rel, "b64": base64.b64encode(data).decode()})
-            continue
-        if rel == "t3/userdata/environment-id":
-            environment_id = path.read_text()
-        if path.name.endswith(".sqlite") and not path_excluded(rel):
-            sanitized = scratch / f"{path.name}.scan"
-            auth_tables.extend(sanitize_sqlite(path, sanitized))
-    return {"secrets": secrets, "auth_tables": auth_tables, "environment_id": environment_id}
-
-
 def build_split(root: Path, scratch: Path) -> tuple[bytes, dict]:
     """Return (history tar, pairing bundle). Raises HistoryNotSeparable and writes no tar."""
     scratch.mkdir(parents=True, exist_ok=True)
     pairing = {"secrets": [], "auth_tables": [], "environment_id": None}
     entries: list[tuple[str, bytes]] = []
-    for path in sorted(p for p in root.rglob("*") if p.is_file()):
+    for path in sorted(p for p in root.rglob("*") if p.is_file() or p.is_symlink()):
+        rel = path.relative_to(root).as_posix()
+        if not rel.startswith("t3/"):
+            continue
         if path.is_symlink():
             raise HistoryNotSeparable("symlink under the state root cannot be separated")
         rel = path.relative_to(root).as_posix()
-        if rel == "t3poc-run.py" or rel.startswith("t3poc-scratch/"):
-            continue
         if is_pairing_secret(rel):
             data = path.read_bytes()
             pairing["secrets"].append({"path": rel, "b64": base64.b64encode(data).decode()})
@@ -303,15 +310,21 @@ def apply_pairing(root: Path, pairing: dict) -> None:
         rel = item.get("path", "")
         if not is_pairing_secret(rel):
             raise HistoryNotSeparable("pairing secret path rejected")
-        dest = root / rel
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_bytes(base64.b64decode(item["b64"]))
-        os.chmod(dest, 0o600)
+        secure_write(root, rel, base64.b64decode(item["b64"]))
     db_path = root / "t3/userdata/statev2.sqlite"
     tables = pairing.get("auth_tables") or []
     if tables:
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        con = sqlite3.connect(db_path)
+        con = sqlite3.connect(':memory:')
+        if db_path.exists():
+            # Reject symlinks on every component before opening an existing DB.
+            from vm_fs import _directories
+            parent = _directories(root, ('t3', 'userdata'), None)
+            try:
+                fd = os.open('statev2.sqlite', os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent)
+                with os.fdopen(fd, 'rb') as stream:
+                    con.deserialize(stream.read())
+            finally:
+                os.close(parent)
         try:
             for table in tables:
                 name = table.get("name", "")
@@ -335,16 +348,14 @@ def apply_pairing(root: Path, pairing: dict) -> None:
                     placeholders = ",".join("?" for _ in rows[0])
                     con.executemany(f"INSERT INTO {qident(name)} VALUES ({placeholders})", rows)
             con.commit()
+            secure_write(root, 't3/userdata/statev2.sqlite', con.serialize())
         finally:
             con.close()
     environment_id = pairing.get("environment_id")
     if environment_id is not None:
         if not re.fullmatch(r"[A-Za-z0-9._:-]{1,200}", environment_id):
             raise HistoryNotSeparable("environment-id rejected")
-        dest = root / "t3/userdata/environment-id"
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_text(environment_id)
-        os.chmod(dest, 0o600)
+        secure_write(root, 't3/userdata/environment-id', environment_id.encode())
 
 
 def restore_history(root: Path, tar_bytes: bytes) -> None:
@@ -353,12 +364,9 @@ def restore_history(root: Path, tar_bytes: bytes) -> None:
         for member in archive.getmembers():
             if not member.isfile():
                 continue
-            dest = root / member.name
-            dest.parent.mkdir(parents=True, exist_ok=True)
             extracted = archive.extractfile(member)
             assert extracted is not None
-            dest.write_bytes(extracted.read())
-            os.chmod(dest, 0o600)
+            secure_write(root, member.name, extracted.read())
 
 
 def _emit(root: Path) -> None:
@@ -390,7 +398,7 @@ def _payload(argv: list[str]) -> bytes:
 
 def main(argv: list[str]) -> int:
     cmd = argv[1] if len(argv) > 1 else ""
-    root = Path(os.environ.get("T3POC_SCAN_ROOT", "/dev/shm"))
+    root = Path("/dev/shm")
     try:
         if cmd == "emit":
             _emit(root)
@@ -412,8 +420,8 @@ def main(argv: list[str]) -> int:
             apply_pairing(root, json.loads(_payload(argv)))
             print("T3POC_PAIRING_OK")
             return 0
-    except HistoryNotSeparable as exc:
-        print(f"T3POC_BACKUP_ABORT {exc}")
+    except (HistoryNotSeparable, OSError, ValueError, sqlite3.Error) as exc:
+        print(f"T3POC_BACKUP_ABORT {type(exc).__name__}")
         return 2
     print("usage: vm_history.py emit|emit-pairing|check-tar|restore|apply-pairing", flush=True)
     return 2

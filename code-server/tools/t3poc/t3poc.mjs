@@ -69,7 +69,10 @@ function writeState(state) {
     startedAt: state.startedAt,
   };
   if (state.diskPrepared === true || state.diskPrepared === false) safe.diskPrepared = state.diskPrepared;
-  fs.writeFileSync(STATE_FILE, JSON.stringify(safe, null, 2), { mode: 0o600 });
+  if (Array.isArray(state.cleanupMicrovmIds)) safe.cleanupMicrovmIds = state.cleanupMicrovmIds;
+  const tmp = `${STATE_FILE}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(safe, null, 2), { mode: 0o600 });
+  fs.renameSync(tmp, STATE_FILE);
 }
 
 const mvm = () => new LambdaMicrovmsClient({ region: REGION });
@@ -85,6 +88,7 @@ export function publicState(session) {
   // diskPrepared is a boolean flag, never a credential. Absent means "already
   // prepared" so an older state file is not restored over a live VM.
   if (session.diskPrepared === true || session.diskPrepared === false) safe.diskPrepared = session.diskPrepared;
+  if (Array.isArray(session.cleanupMicrovmIds)) safe.cleanupMicrovmIds = [...session.cleanupMicrovmIds];
   return safe;
 }
 
@@ -97,6 +101,7 @@ export function createRuntime(deps) {
     vmState: 'ABSENT',
     lastActivityAt: deps.now ? deps.now() : Date.now(),
     swapping: false,
+    // Diagnostic connection count only; idle policy deliberately uses bytes.
     inflight: 0,
   };
   const hooks = {
@@ -106,10 +111,16 @@ export function createRuntime(deps) {
     onTick: [],
     beforeSwap: [],
     beforeStop: [],
+    onResume: [],
   };
   const flags = { t3Stopped: false, historyRestored: false, prepareDisk: false, pairingSnapshotAt: 0 };
   let readyFor = null;
+  let failedReadyFor = null;
+  let readyRetryAt = 0;
   let inflightReady = null;
+  let lifecycle = Promise.resolve();
+  let ticking = null;
+  let preparing = null;
   const api = {
     deps,
     session,
@@ -122,42 +133,90 @@ export function createRuntime(deps) {
       Object.assign(session, next);
     },
     writeState() {
-      deps.writeState(publicState(session));
+      if (!flags.deferState) deps.writeState(publicState(session));
+    },
+    async recoverCleanup(force = false) {
+      if (!force && api.now() < (flags.nextCleanupAt ?? 0)) throw new Error('MicroVM cleanup retry deferred');
+      const saved = deps.readState();
+      const journal = session.microvmId ? session : saved;
+      for (const id of [...(journal?.cleanupMicrovmIds ?? [])]) {
+        if (id === journal.microvmId) throw new Error('invalid MicroVM cleanup journal');
+        try {
+          await deps.terminate(id);
+        } catch (error) {
+          if (error.name !== 'ResourceNotFoundException') {
+            flags.nextCleanupAt = api.now() + 60_000;
+            throw error;
+          }
+        }
+        flags.nextCleanupAt = 0;
+        journal.cleanupMicrovmIds = journal.cleanupMicrovmIds.filter((value) => value !== id);
+        deps.writeState(publicState(journal));
+      }
+    },
+    exclusive(fn) {
+      const next = lifecycle.then(fn);
+      lifecycle = next.catch(() => {});
+      return next;
     },
     async emitVmReady() {
+      if (preparing) return preparing;
+      preparing = api.prepareVm().finally(() => {
+        preparing = null;
+      });
+      return preparing;
+    },
+    async prepareVm() {
       if (!session.microvmId || readyFor === session.microvmId) return;
       const id = session.microvmId;
-      if (flags.prepareDisk) {
-        for (const fn of hooks.prepareDisk) await fn(api);
+      if (failedReadyFor === id && api.now() < readyRetryAt)
+        throw new Error('VM readiness retry deferred for 60 seconds');
+      try {
+        if (flags.prepareDisk && session.diskPrepared !== true) {
+          for (const fn of hooks.prepareDisk) await fn(api);
+        }
+        if (flags.t3Stopped) {
+          const shell = await import('./vm-shell.mjs');
+          const started = await deps.shell({ script: shell.START_T3 });
+          if (!started.includes('T3POC_T3_STARTED')) throw new Error('T3 restart failed');
+          flags.t3Stopped = false;
+        }
+        // Disk restoration has its own durable checkpoint. A later token or
+        // clone failure must never restore pairing over a live VM again.
+        session.diskPrepared = true;
+        flags.prepareDisk = false;
+        api.writeState();
+        for (const fn of hooks.onVmReady) await fn(api);
+        readyFor = id;
+        failedReadyFor = null;
+      } catch (error) {
+        failedReadyFor = id;
+        readyRetryAt = api.now() + 60_000;
+        throw error;
       }
-      if (flags.t3Stopped) {
-        const shell = await import('./vm-shell.mjs');
-        await deps.shell({ script: shell.START_T3 });
-        flags.t3Stopped = false;
-      }
-      for (const fn of hooks.onVmReady) await fn(api);
-      readyFor = id;
-      session.diskPrepared = true;
     },
     async ensureReady() {
       // The boot keeps running after a caller's 120s hold expires, so the next
       // request waits on the same MicroVM instead of starting a second one.
       if (!inflightReady) {
-        inflightReady = (async () => {
-          for (const fn of hooks.beforeRequest) await fn(api);
-          if (!session.endpoint) {
-            const saved = deps.readState();
-            if (!saved?.microvmId) throw new Error('no MicroVM recorded; run `t3poc start` first');
-            api.attach({ ...saved, vmState: saved.vmState ?? 'RUNNING' });
-          }
-          if (session.vmState === 'RUNNING' && session.microvmId) {
-            const prepared = session.diskPrepared === true;
-            await api.emitVmReady();
-            if (!prepared && session.diskPrepared === true) api.writeState();
-          }
-        })().finally(() => {
-          inflightReady = null;
-        });
+        inflightReady = api
+          .exclusive(async () => {
+            await api.recoverCleanup();
+            for (const fn of hooks.beforeRequest) await fn(api);
+            if (!session.endpoint) {
+              const saved = deps.readState();
+              if (!saved?.microvmId) throw new Error('no MicroVM recorded; run `t3poc start` first');
+              api.attach({ ...saved, vmState: saved.vmState ?? 'RUNNING' });
+            }
+            if (session.vmState === 'RUNNING' && session.microvmId) {
+              const prepared = session.diskPrepared === true;
+              await api.emitVmReady();
+              if (!prepared && session.diskPrepared === true) api.writeState();
+            }
+          })
+          .finally(() => {
+            inflightReady = null;
+          });
       }
       const hold = deps.holdMs ?? 120_000;
       let timer;
@@ -196,7 +255,27 @@ export function createRuntime(deps) {
       }
     },
     async tick() {
-      for (const fn of hooks.onTick) await fn(api);
+      if (!ticking)
+        ticking = (async () => {
+          await api.exclusive(async () => {
+            await api.recoverCleanup();
+            if (!session.microvmId) {
+              const saved = deps.readState();
+              if (saved?.microvmId) {
+                try {
+                  const current = await deps.getMicrovm(saved.microvmId);
+                  api.attach({ ...saved, vmState: current.state });
+                } catch (error) {
+                  if (error.name !== 'ResourceNotFoundException') throw error;
+                }
+              }
+            }
+          });
+          for (const fn of hooks.onTick) await fn(api);
+        })().finally(() => {
+          ticking = null;
+        });
+      return ticking;
     },
   };
   return api;
@@ -227,6 +306,33 @@ async function proxyToken(microvmId, send = (command) => mvm().send(command)) {
   };
 }
 
+/** Auth tokens are scoped to a VM; never reuse one after a session switch. */
+export function createProxyTokenCache(getSession, mint = proxyToken, now = Date.now) {
+  const tokens = new Map();
+  const pending = new Map();
+  return async () => {
+    for (;;) {
+      const id = getSession().microvmId;
+      let token = tokens.get(id);
+      if (!token || now() >= token.refreshAt) {
+        if (!pending.has(id))
+          pending.set(
+            id,
+            Promise.resolve().then(() => mint(id)),
+          );
+        try {
+          token = await pending.get(id);
+        } finally {
+          pending.delete(id);
+        }
+        tokens.clear();
+        tokens.set(id, token);
+      }
+      if (getSession().microvmId === id) return token.value;
+    }
+  };
+}
+
 export function upstreamHeaders(incoming, endpoint, token, clientHost) {
   const out = {};
   for (const [key, value] of Object.entries(incoming)) {
@@ -249,6 +355,7 @@ export function isLoopback(addr) {
 export function createRelay({
   getEndpoint,
   getToken,
+  getConnection = async () => ({ endpoint: await getEndpoint(), token: await getToken() }),
   clientHost,
   ensureReady = async () => {},
   onActivity = () => {},
@@ -283,8 +390,7 @@ export function createRelay({
     let token;
     let endpoint;
     try {
-      endpoint = await getEndpoint();
-      token = await getToken();
+      ({ endpoint, token } = await getConnection());
     } catch (error) {
       finish();
       if (!res.headersSent) res.writeHead(502, { 'content-type': 'text/plain' });
@@ -331,8 +437,7 @@ export function createRelay({
     let token;
     let endpoint;
     try {
-      endpoint = await getEndpoint();
-      token = await getToken();
+      ({ endpoint, token } = await getConnection());
     } catch {
       finish();
       return socket.destroy();
@@ -395,7 +500,10 @@ function productionDeps(opts) {
       if (!allowExisting && existing?.microvmId) {
         const current = await mvm()
           .send(new GetMicrovmCommand({ microvmIdentifier: existing.microvmId }))
-          .catch(() => null);
+          .catch((error) => {
+            if (error.name === 'ResourceNotFoundException') return null;
+            throw error;
+          });
         if (current && !['TERMINATED', 'TERMINATING', 'FAILED'].includes(current.state)) {
           throw new Error(`MicroVM ${existing.microvmId} is still ${current.state}; run \`t3poc stop\` first`);
         }
@@ -465,12 +573,13 @@ function sessionIdFrom(input) {
 // productionDeps.shell needs the live session endpoint. Patch it once the runtime exists.
 function bindShell(deps, api) {
   const inner = deps.shell.bind(deps);
-  deps.shell = (input) =>
-    inner({
-      endpoint: api.session.endpoint,
-      microvmId: api.session.microvmId,
-      ...input,
-    });
+  let pending = Promise.resolve();
+  deps.shell = (input) => {
+    const target = { endpoint: api.session.endpoint, microvmId: api.session.microvmId, ...input };
+    const next = pending.then(() => inner(target));
+    pending = next.catch(() => {});
+    return next;
+  };
 }
 
 async function start(api, opts) {
@@ -491,13 +600,13 @@ async function start(api, opts) {
   void opts;
 }
 
+export function createConnectionProvider(api, getToken) {
+  return () => api.exclusive(async () => ({ endpoint: api.session.endpoint, token: await getToken() }));
+}
+
 async function relay(api, opts) {
   const port = Number(opts.port ?? 8787);
-  let current = null;
-  const getToken = async () => {
-    if (!current || Date.now() >= current.refreshAt) current = await proxyToken(api.session.microvmId);
-    return current.value;
-  };
+  const getToken = createProxyTokenCache(() => api.session);
   const timer = setInterval(() => {
     api.tick().catch((error) => api.log(error.message));
   }, 15_000);
@@ -522,10 +631,15 @@ async function relay(api, opts) {
     },
     getEndpoint: async () => api.session.endpoint,
     getToken,
+    getConnection: createConnectionProvider(api, getToken),
   });
   server.listen(port, '127.0.0.1', () => {
     api.log(`relay: http://127.0.0.1:${port} (lazy; first request boots the MicroVM); Ctrl+C to stop`);
   });
+}
+
+export function pairingScript(cmd) {
+  return `su -s /bin/sh vscode -c "${cmd}" 2>&1\n`;
 }
 
 async function pair(api, opts) {
@@ -568,7 +682,7 @@ async function pair(api, opts) {
   };
   const timer = setTimeout(() => done(null), 30_000);
   ws.on('open', () => {
-    ws.send(`su -s /bin/sh vscode -c "${cmd}" 2>&1 || ${cmd} 2>&1\n`);
+    ws.send(pairingScript(cmd));
   });
   ws.on('message', (data) => {
     out += data.toString();
@@ -594,13 +708,44 @@ async function status(api) {
   );
 }
 
-async function stop(api) {
+export async function stop(api) {
   const saved = api.readState();
   if (!saved?.microvmId) throw new Error('no MicroVM recorded; run `t3poc start` first');
-  api.attach({ ...saved, vmState: 'RUNNING' });
-  for (const fn of api.hooks.beforeStop) await fn(api);
-  await api.deps.terminate(saved.microvmId);
-  fs.rmSync(STATE_FILE, { force: true });
+  await api.exclusive(async () => {
+    api.attach(saved);
+    let current;
+    try {
+      current = await api.deps.getMicrovm(saved.microvmId);
+    } catch (error) {
+      if (error.name !== 'ResourceNotFoundException') throw error;
+      current = { state: 'TERMINATED' };
+    }
+    api.attach({ vmState: current.state });
+    if (!['TERMINATED', 'TERMINATING', 'FAILED'].includes(current.state)) {
+      if (['SUSPENDED', 'SUSPENDING'].includes(current.state)) {
+        await api.deps.resume(saved.microvmId);
+        await api.deps.waitUntil(saved.microvmId, api.now() + 120_000);
+        api.session.vmState = 'RUNNING';
+        for (const fn of api.hooks.onResume) {
+          try {
+            await fn(api);
+          } catch {
+            api.log('resume hook failed during stop; attempting WIP with the available token');
+          }
+        }
+      }
+      // Preserve workspace changes before any optional pairing snapshot.
+      // pushWip still throws on failure: never terminate after a failed push.
+      await api.wipPush();
+      for (const fn of api.hooks.beforeStop) await fn(api);
+      await api.deps.terminate(saved.microvmId);
+    }
+    // Cleanup failure must not prevent stopping the primary. Keep the journal
+    // on failure so a subsequent stop can reclaim outstanding replacement IDs.
+    await api.recoverCleanup(true);
+    if (api.deps.removeState) await api.deps.removeState();
+    else fs.rmSync(STATE_FILE, { force: true });
+  });
   api.log(`terminating ${saved.microvmId} (RAM-only logins are discarded with it)`);
 }
 

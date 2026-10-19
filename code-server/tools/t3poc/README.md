@@ -40,7 +40,7 @@ node t3poc.mjs uninstall
 
 After 5 minutes with no relay traffic the MicroVM is paused (Suspend, not terminate). The next request resumes it. Paused time still counts toward the 8h lifetime. At 7.5h the relay WIP-pushes, backs up T3 history, starts a new MicroVM, restores, and switches the relay to it.
 
-GitHub: on VM ready the relay pushes a 1h installation token into `/dev/shm/gh-token` and refreshes it every 50 minutes (`ext-50-gh.mjs`). `ghapp.mjs refresh` remains available on its own.
+GitHub: on VM ready the relay pushes a 1h installation token into `/dev/shm/gh-token` and refreshes it every 50 minutes (`ext-50-gh.mjs`). `ghapp.mjs refresh` is disabled; use the relay for suspend-aware refresh and one-minute retries.
 
 Pairing material (userdata/secrets and auth_* tables) is snapshotted into the macOS keychain (`t3poc-pairing`) and restored into a new VM so the existing T3 Desktop environment keeps working. It is not written to disk or S3.
 
@@ -64,7 +64,7 @@ The App private key lives only in the macOS keychain (service `t3poc-ghapp`); it
 ```bash
 AWS_PROFILE=fukuchi node ghapp.mjs setup    # once: create the App via manifest, store key in keychain, then Install on t3poc-sandbox
 AWS_PROFILE=fukuchi node ghapp.mjs push     # mint a 1h token and write it to VM /dev/shm/gh-token via SHELL_INGRESS (stdin, not argv)
-AWS_PROFILE=fukuchi node ghapp.mjs refresh  # keep running: re-push every 50 min
+# Keep t3poc relay running for token refresh; standalone refresh is disabled.
 AWS_PROFILE=fukuchi node ghapp.mjs status   # mint test only (token discarded)
 ```
 
@@ -84,3 +84,11 @@ npm run t3poc:diff      # must show changes to T3pocMicrovmStack only
 npm run t3poc:deploy
 npm run t3poc:destroy   # teardown
 ```
+
+
+Operational decisions: idle means five minutes since the last relayed byte, including silent open WebSockets and HTTP requests. Such connections may be suspended while awaiting output. WIP push or history backup failure blocks stop/swap to avoid losing state; resolve the failure and retry. WIP runs first. Pairing snapshot failure is a warning and retains the last successful Keychain bundle; re-pair if needed. During stop, token refresh failure is a warning, while an actual WIP push failure still prevents termination. Failed replacement cleanup retains its journal and cannot prevent primary termination; retry stop to reclaim the remaining VM. Failed pause/swap and readiness hooks retry no sooner than one minute. An unfinished replacement ID is journaled alongside the old primary, and reclaimed before subsequent lifecycle work. Disk restoration is checkpointed separately from token/clone/login hooks.
+
+Guest Python is pinned to 3.14.4 in the PoC overlay only. Shared base git identity and GH shell settings are intentionally retained byte-for-byte to preserve existing stack assets. START_T3 confirms shell launch, not service health. Ownership and actual port readiness still need real-VM checks. An empty workspace has no repositories to snapshot and is a successful WIP no-op. RAM writes use atomic rename; persistence requires successful history upload.
+
+
+Pause retains RAM: history upload/separation failure is logged and does not prevent Suspend; stop/swap require successful WIP/history preservation. If stop is requested while the VM is still booting and its shell cannot save WIP yet, stop fails closed; retry once RUNNING. For emergency manual termination, open the AWS Lambda console → MicroVMs, verify the recorded VM ID, and choose Terminate. This bypasses preservation and discards RAM-only state; use only after assessing that loss. No console operation was performed during this change.
