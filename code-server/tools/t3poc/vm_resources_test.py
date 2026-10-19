@@ -5,6 +5,7 @@ import os
 import re
 import tempfile
 import shutil
+import subprocess
 import tomllib
 import types
 import unittest
@@ -54,28 +55,55 @@ class Resources(unittest.TestCase):
     def test_real_codex_disables_catalog_and_preserves_auth_history_and_other_config(self):
         self.assertIsNotNone(shutil.which('codex'))
         codex = self.root / 'codex'; codex.mkdir()
-        (codex / 'config.toml').write_text('model = "gpt-6.1-sol"\n[features]\nremote_plugin = true\n')
-        for name in ['auth.json', 'sessions/history.jsonl', 'cache/remote_plugin_catalog/keep.json']:
+        (codex / 'config.toml').write_text('model = "gpt-6.1-sol"\n[features]\nremote_plugin = true\nplugins = true\n')
+        for name in ['auth.json', 'sessions/history.jsonl', 'cache/codex_apps_tools/keep.json']:
             path = codex / name; path.parent.mkdir(parents=True, exist_ok=True); path.write_bytes(b'synthetic-original')
-        resources.disable_remote_catalog(self.root)
+        resources.disable_remote_catalog(self.root, self.root / 'public-disk')
         config = tomllib.loads((codex / 'config.toml').read_text())
         self.assertFalse(config['features']['remote_plugin'])
+        self.assertFalse(config['features']['plugins'])
+        result = subprocess.run(['codex', '--disable', 'plugins', '--disable', 'remote_plugin', 'features', 'list'], env={**os.environ, 'CODEX_HOME': str(codex)}, capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0)
+        self.assertTrue(any(line.split()[0] == 'plugins' and line.split()[-1] == 'false' for line in result.stdout.splitlines() if line.split()))
+        self.assertTrue((codex / 'cache/remote_plugin_catalog').is_symlink())
         self.assertEqual(config['model'], 'gpt-6.1-sol')
-        for name in ['auth.json', 'sessions/history.jsonl', 'cache/remote_plugin_catalog/keep.json']:
+        for name in ['auth.json', 'sessions/history.jsonl', 'cache/codex_apps_tools/keep.json']:
             self.assertEqual((codex / name).read_bytes(), b'synthetic-original')
-        resources.disable_remote_catalog(self.root)
+        resources.disable_remote_catalog(self.root, self.root / 'public-disk')
         self.assertFalse(tomllib.loads((codex / 'config.toml').read_text())['features']['remote_plugin'])
+
+    def test_public_catalog_relocation_is_narrow_idempotent_and_rejects_unsafe_paths(self):
+        codex = self.root / 'codex'; codex.mkdir(mode=0o700)
+        cache = codex / 'cache'; cache.mkdir(mode=0o700)
+        public = self.root / 'public-disk'
+        auth = codex / 'auth.json'; auth.write_bytes(b'synthetic-auth')
+        history = codex / 'sessions'; history.mkdir(); (history / 'keep').write_bytes(b'synthetic-history')
+        resources.setup_public_catalog_cache(self.root, public)
+        link = cache / 'remote_plugin_catalog'
+        self.assertTrue(link.is_symlink())
+        self.assertEqual(link.resolve(), public.resolve())
+        (link / 'catalog.json').write_bytes(b'public-catalog')
+        resources.setup_public_catalog_cache(self.root, public)
+        self.assertEqual((public / 'catalog.json').read_bytes(), b'public-catalog')
+        self.assertFalse((codex / '.tmp').is_symlink())
+        self.assertEqual(auth.read_bytes(), b'synthetic-auth')
+        self.assertEqual((history / 'keep').read_bytes(), b'synthetic-history')
+        link.unlink(); link.symlink_to(history, target_is_directory=True)
+        with self.assertRaises(ValueError): resources.setup_public_catalog_cache(self.root, public)
+        link.unlink(); link.mkdir(); (link / 'unknown.json').write_bytes(b'do-not-move')
+        with self.assertRaises(ValueError): resources.setup_public_catalog_cache(self.root, public)
+        self.assertEqual((link / 'unknown.json').read_bytes(), b'do-not-move')
 
     def test_catalog_policy_rejects_links_before_invoking_codex(self):
         codex = self.root / 'codex'; codex.mkdir()
         auth = codex / 'auth.json'; auth.write_bytes(b'synthetic-original')
         config = codex / 'config.toml'; config.symlink_to(auth)
-        with patch('vm_resources.subprocess.run') as run:
-            with self.assertRaises(OSError): resources.disable_remote_catalog(self.root)
+        with patch('subprocess.run') as run:
+            with self.assertRaises(OSError): resources.disable_remote_catalog(self.root, self.root / 'public-disk')
             run.assert_not_called()
         config.unlink(); os.link(auth, config)
-        with patch('vm_resources.subprocess.run') as run:
-            with self.assertRaises(ValueError): resources.disable_remote_catalog(self.root)
+        with patch('subprocess.run') as run:
+            with self.assertRaises(ValueError): resources.disable_remote_catalog(self.root, self.root / 'public-disk')
             run.assert_not_called()
         self.assertEqual(auth.read_bytes(), b'synthetic-original')
 
@@ -98,6 +126,31 @@ class Resources(unittest.TestCase):
             with self.assertRaises(OSError): secure_write(self.root, 'snapshot', b'new partial snapshot')
         self.assertEqual(target.read_bytes(), b'old complete snapshot')
         self.assertEqual(sorted(p.name for p in self.root.iterdir()), ['snapshot'])
+
+    def test_only_plugin_clone_temps_are_cleaned_without_following_links(self):
+        folder = self.root / 'codex/.tmp'; folder.mkdir(parents=True)
+        clone = folder / 'plugins-clone-fixture'; (clone / '.git/objects').mkdir(parents=True)
+        (clone / '.git/objects/pack').write_bytes(b'regenerable-pack')
+        keep = folder / 'other'; keep.mkdir(); (keep / 'auth.json').write_bytes(b'synthetic-keep')
+        outside = self.root / 'history'; outside.mkdir(); (outside / 'keep').write_bytes(b'synthetic-history')
+        (clone / 'outside-link').symlink_to(outside, target_is_directory=True)
+        resources.clean_plugin_clone_temps(self.root)
+        self.assertFalse(clone.exists())
+        self.assertEqual((outside / 'keep').read_bytes(), b'synthetic-history')
+        self.assertEqual((keep / 'auth.json').read_bytes(), b'synthetic-keep')
+        (folder / 'plugins-clone-link').symlink_to(outside, target_is_directory=True)
+        with self.assertRaises(ValueError): resources.clean_plugin_clone_temps(self.root)
+        self.assertEqual((outside / 'keep').read_bytes(), b'synthetic-history')
+
+    def test_policy_partial_enospc_preserves_config_auth_and_history(self):
+        codex = self.root / 'codex'; codex.mkdir(mode=0o700)
+        config = codex / 'config.toml'; config.write_bytes(b'model = "gpt-6.1-sol"\n')
+        auth = codex / 'auth.json'; auth.write_bytes(b'synthetic-original')
+        with patch('os.fdopen', self.failing_fdopen()):
+            with self.assertRaises(OSError): resources.disable_remote_catalog(self.root, self.root / 'public-disk')
+        self.assertEqual(config.read_bytes(), b'model = "gpt-6.1-sol"\n')
+        self.assertEqual(auth.read_bytes(), b'synthetic-original')
+        self.assertFalse(any(p.name.startswith('.catalog-config-') for p in codex.iterdir()))
 
     def test_real_gh_token_writer_preserves_previous_token_on_enospc(self):
         source = (Path(__file__).parent/'ghapp.mjs').read_text()
