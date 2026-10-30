@@ -1640,6 +1640,10 @@ describe('OMP Cloud IDE infrastructure', () => {
     );
     // scripts/update-tool-versions.mjs rewrites these lines to the latest releases on predeploy.
     expect(dockerfile).toMatch(/^ARG OMP_VERSION=\d+\.\d+\.\d+$/m);
+    expect(dockerfile).toMatch(/^ARG OMP_LINUX_ARM64_SHA256=[0-9a-f]{64}$/m);
+    // `omp update` can only replace a standalone binary the vscode user owns, not a root-owned bun global install.
+    expect(dockerfile).toContain(['install -D -m 0755 /tmp/omp $', '{HOME}/.local/bin/omp'].join(''));
+    expect(dockerfile).not.toContain('pi-coding-agent');
     expect(dockerfile).toMatch(/^ARG CODE_SERVER_VERSION=\d+\.\d+\.\d+$/m);
     expect(dockerfile).toContain('useradd --uid 1000');
     expect(dockerfile).toContain('USER vscode');

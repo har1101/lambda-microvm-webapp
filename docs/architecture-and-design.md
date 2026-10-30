@@ -753,7 +753,7 @@ Image定義にも`INTERNET_EGRESS`を指定している。Dockerfileの実行中
 | code-server | 4.139.1(deploy時に最新へ更新) | coder/code-server GitHub Releases(RPM) | SHA-256(deploy時にrelease assetの`digest`から更新) |
 | Node.js | 24.21.0 | nodejs.org | SHA-256(`SHASUMS256.txt`) |
 | Bun | 1.3.14 | oven-sh/bun GitHub Releases | SHA-256(releaseの`SHASUMS256.txt`) |
-| OMP(`@oh-my-pi/pi-coding-agent`) | 18.4.0(deploy時に最新へ更新) | npm(`bun install --global`) | versionのみ(npm registryのintegrity) |
+| OMP | 18.14.0(deploy時に最新へ更新) | can1357/oh-my-pi GitHub Releases(`omp-linux-arm64`単体バイナリ、`~/.local/bin/omp`) | SHA-256(deploy時にrelease assetの`digest`から更新) |
 | GitHub CLI | 2.96.0 | cli/cli GitHub Releases | SHA-256(releaseの`checksums.txt`) |
 | AWS CLI | 2.34.45 | awscli.amazonaws.com | SHA-256(公式はPGP署名のみのため、取得したファイルから算出したtrust-on-first-use) |
 | uv / uvx | 0.12.18 | astral-sh/uv GitHub Releases | SHA-256(releaseの`.sha256`) |
@@ -765,7 +765,9 @@ Image定義にも`INTERNET_EGRESS`を指定している。Dockerfileの実行中
 | bash-language-server | 5.8.1 | npm | versionのみ |
 | yaml-language-server | 1.24.0 | npm | versionのみ |
 
-直接ダウンロードする成果物は、DockerfileのSHA-256 ARG(`CODE_SERVER_ARM64_RPM_SHA256`など)と`sha256sum -c`で検証する。`scripts/update-tool-versions.mjs`はcode-serverのversionと一緒に`CODE_SERVER_ARM64_RPM_SHA256`も書き換え、release assetに`digest`がなければ失敗する。このほか`dnf`でgit、python3、pip、jq、tree、zip系などを入れている。`dnf`のパッケージ、VS Code拡張、ベースイメージ(digest)、npmの依存先(LSPのtransitive dependencyを含む)はversionやchecksumを固定していない。SBOM生成や脆弱性scanもない。
+直接ダウンロードする成果物は、DockerfileのSHA-256 ARG(`CODE_SERVER_ARM64_RPM_SHA256`など)と`sha256sum -c`で検証する。`scripts/update-tool-versions.mjs`はcode-serverとOMPのversionと一緒に`CODE_SERVER_ARM64_RPM_SHA256`と`OMP_LINUX_ARM64_SHA256`も書き換え、release assetに`digest`がなければ失敗する。このほか`dnf`でgit、python3、pip、jq、tree、zip系などを入れている。`dnf`のパッケージ、VS Code拡張、ベースイメージ(digest)、npmの依存先(LSPのtransitive dependencyを含む)はversionやchecksumを固定していない。SBOM生成や脆弱性scanもない。
+
+OMPは`bun install --global`ではなく単体バイナリを`vscode`所有の`~/.local/bin/omp`に置き、`PATH`の先頭に入れている。rootが所有するbunのglobal installだと、`omp update`はlauncherを置き換えられずに失敗する。この配置なら起動中のMicroVMで`omp update`がその場でバイナリを差し替える。更新はそのMicroVMのディスクにだけ残り、新しいMicroVMはImageに焼いたversionから始まる。
 
 ### 9.4 起動プロセス
 

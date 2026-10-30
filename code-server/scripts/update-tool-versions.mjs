@@ -1,5 +1,5 @@
-// Rewrites the pinned code-server and OMP versions in the MicroVM Dockerfile to
-// the latest releases. Runs as `predeploy`: a changed Dockerfile changes the
+// Rewrites the pinned code-server and OMP versions (and their SHA-256s) in the
+// MicroVM Dockerfile to the latest GitHub releases. Runs as `predeploy`: a changed Dockerfile changes the
 // CodeArtifact asset hash, which makes cdkd rebuild the MicroVM image. When
 // nothing is newer the file is left untouched and the image is not rebuilt.
 import { readFileSync, writeFileSync } from 'node:fs';
@@ -18,16 +18,17 @@ async function getJson(url) {
   return response.json();
 }
 
-async function latestCodeServer() {
-  const release = await getJson('https://api.github.com/repos/coder/code-server/releases/latest');
+// Latest GitHub release of `repo` and the SHA-256 of its `assetName(version)`
+// asset. GitHub records the digest of every uploaded release asset; the image
+// build verifies the download against it.
+async function latestReleaseAsset(repo, assetName) {
+  const release = await getJson(`https://api.github.com/repos/${repo}/releases/latest`);
   const version = release.tag_name.replace(/^v/, '');
-  // The Dockerfile installs the arm64 RPM; refuse a release that does not ship it.
-  const name = `code-server-${version}-arm64.rpm`;
+  const name = assetName(version);
   const asset = release.assets.find((a) => a.name === name);
   if (!asset) {
-    throw new Error(`code-server ${version} has no ${name} release asset`);
+    throw new Error(`${repo} ${version} has no ${name} release asset`);
   }
-  // GitHub records the SHA-256 of every uploaded release asset; the image build verifies it.
   const sha256 = /^sha256:([0-9a-f]{64})$/.exec(asset.digest ?? '')?.[1];
   if (!sha256) {
     throw new Error(`${name}: release asset has no sha256 digest (${JSON.stringify(asset.digest)})`);
@@ -35,16 +36,17 @@ async function latestCodeServer() {
   return { version, sha256 };
 }
 
-async function latestOmp() {
-  const pkg = await getJson('https://registry.npmjs.org/@oh-my-pi%2fpi-coding-agent/latest');
-  return pkg.version;
-}
-
-const [codeServer, omp] = await Promise.all([latestCodeServer(), latestOmp()]);
+const [codeServer, omp] = await Promise.all([
+  // The Dockerfile installs the arm64 RPM; refuse a release that does not ship it.
+  latestReleaseAsset('coder/code-server', (version) => `code-server-${version}-arm64.rpm`),
+  // The Dockerfile installs the standalone glibc arm64 binary.
+  latestReleaseAsset('can1357/oh-my-pi', () => 'omp-linux-arm64'),
+]);
 const targets = {
   CODE_SERVER_VERSION: [codeServer.version, /^\d+\.\d+\.\d+$/],
   CODE_SERVER_ARM64_RPM_SHA256: [codeServer.sha256, /^[0-9a-f]{64}$/],
-  OMP_VERSION: [omp, /^\d+\.\d+\.\d+$/],
+  OMP_VERSION: [omp.version, /^\d+\.\d+\.\d+$/],
+  OMP_LINUX_ARM64_SHA256: [omp.sha256, /^[0-9a-f]{64}$/],
 };
 
 let dockerfile = readFileSync(DOCKERFILE, 'utf8');

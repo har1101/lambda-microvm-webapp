@@ -2,12 +2,13 @@ FROM public.ecr.aws/lambda/microvms:al2023-minimal
 
 # Every directly downloaded artifact is verified against a pinned SHA-256.
 # `npm run update-versions` rewrites CODE_SERVER_VERSION/CODE_SERVER_ARM64_RPM_SHA256
-# and OMP_VERSION; update the other pairs together by hand.
-ARG CODE_SERVER_VERSION=4.140.0
-ARG CODE_SERVER_ARM64_RPM_SHA256=daabc9c85f464d208c9a1a6491087b4e715ae467ba6ba2b8655399466e94c2aa
+# and OMP_VERSION/OMP_LINUX_ARM64_SHA256; update the other pairs together by hand.
+ARG CODE_SERVER_VERSION=4.144.0
+ARG CODE_SERVER_ARM64_RPM_SHA256=8675b91cf8bbba29d81fa4a7cbd3dcfce2d4a5416a1be38edcbebb63a5c9dbfe
 ARG BUN_VERSION=1.3.14
 ARG BUN_ARM64_ZIP_SHA256=a27ffb63a8310375836e0d6f668ae17fa8d8d18b88c37c821c65331973a19a3b
-ARG OMP_VERSION=18.4.10
+ARG OMP_VERSION=18.14.0
+ARG OMP_LINUX_ARM64_SHA256=dba8d170499709bc87359e02e677821aa76a6ef998ca0254578fe4ea07aff5bc
 ARG GH_VERSION=2.96.0
 ARG GH_ARM64_TAR_SHA256=06f86ec7103d41993b76cd78072f43595c34aaa56506d971d9860e67140bf909
 ARG AWS_CLI_VERSION=2.34.45
@@ -73,10 +74,6 @@ RUN curl -fsSL "https://github.com/oven-sh/bun/releases/download/bun-v${BUN_VERS
 ENV BUN_INSTALL=/opt/bun
 ENV PATH=${BUN_INSTALL}/bin:/usr/local/bin:/usr/bin:/bin
 
-RUN mkdir -p ${BUN_INSTALL} \
-    && bun install --global "@oh-my-pi/pi-coding-agent@${OMP_VERSION}" \
-    && omp --version
-
 # OMP drives puppeteer-core. Chrome for Testing publishes linux-arm64 builds
 # (since 153), but puppeteer would download them on first use; pre-install the
 # pinned headless shell instead. Its shared libraries and fonts come from AL2023
@@ -130,6 +127,19 @@ ENV USER=vscode
 ENV USER_DATA_DIR=${HOME}/.vscode
 ENV EXTENSIONS_DIR=${HOME}/.local/share/code-server/extensions
 ENV PI_CODING_AGENT_DIR=${HOME}/.omp/agent
+ENV PATH=${HOME}/.local/bin:${PATH}
+
+# OMP is the standalone release binary in a directory the vscode user owns, the
+# installer's default location, so `omp update` can replace it in place inside a
+# running MicroVM. (A root-owned `bun install --global` launcher cannot be
+# updated by `omp update`.) Restarting OMP picks up the new version; a new
+# MicroVM starts from the version pinned here.
+RUN curl -fsSL "https://github.com/can1357/oh-my-pi/releases/download/v${OMP_VERSION}/omp-linux-arm64" \
+      -o /tmp/omp \
+    && echo "${OMP_LINUX_ARM64_SHA256}  /tmp/omp" | sha256sum -c - \
+    && install -D -m 0755 /tmp/omp ${HOME}/.local/bin/omp \
+    && rm -f /tmp/omp \
+    && omp --version
 
 RUN mkdir -p \
       ${HOME}/workspace \
